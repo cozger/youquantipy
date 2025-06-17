@@ -7,8 +7,7 @@ from pylsl import StreamInfo, StreamOutlet
 class Participant:
     """
     Handles data acquisition (blendshapes, pose landmarks) and LSL streaming for a participant.
-    LSL outlet setup is deferred until setup_stream() is called, so that participant ID
-    and stream name can be finalized.
+    LSL outlet setup is deferred until setup_stream() is called.
     """
     def __init__(
         self,
@@ -22,20 +21,20 @@ class Participant:
         self.enable_raw_facemesh = enable_raw_facemesh
         self.fps = fps
 
-        # Placeholders for LSL outlet and identifiers
+        # Placeholders
         self.outlet = None
         self.participant_id = None
         self.stream_name = None
         self.source_id = None
 
-        # Initialize Mediapipe Holistic (pose + facemesh)
+        # Load Mediapipe Holistic
         self.holistic = mp.solutions.holistic.Holistic(
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
             refine_face_landmarks=True
         )
 
-        # Initialize FaceLandmarker (blendshapes)
+        # Load FaceLandmarker
         with open(self.model_path, 'rb') as f:
             base_options = python.BaseOptions(model_asset_buffer=f.read())
         blend_opts = vision.FaceLandmarkerOptions(
@@ -50,18 +49,14 @@ class Participant:
 
     def setup_stream(self, participant_id: str, stream_name: str):
         """
-        Sets up the LSL outlet with the given participant ID and stream name.
-        Must be called before starting stream_loop.
+        Initializes the LSL outlet with finalized participant ID and stream name.
         """
         self.participant_id = participant_id
         self.stream_name = stream_name
         self.source_id = f"{participant_id}_uid"
 
-        # Determine channel count:
-        # Blendshapes: 52
-        # Raw facemesh: 468 landmarks × 3 coords = 1434 (if enabled)
-        # Pose: 33 landmarks × 4 values = 132
-        mesh_ch = 478 * 3 if self.enable_raw_facemesh else 0
+        # Calculate channel count
+        mesh_ch = (468 * 3) if self.enable_raw_facemesh else 0
         total_ch = 52 + mesh_ch + (33 * 4)
 
         info = StreamInfo(
@@ -76,62 +71,46 @@ class Participant:
 
     def read_frame(self):
         """
-        Reads a frame from the camera, processes with Holistic and FaceLandmarker,
-        and returns a combined feature vector:
-        - blendshapes (52 values)
-        - optional facemesh coords (478*3 values)
-        - pose landmarks (33*4 values)
-
-        If a detection model returns fewer values (e.g. no face detected),
-        we "zero pad" the list to ensure a constant-length output for streaming.
+        Reads a frame, processes landmarks and blendshapes,
+        returns [blend(52), mesh(468*3), pose(132)] if enabled.
         """
         success, frame = self.cap.read()
         if not success:
             return None
 
-        # Convert to RGB for Mediapipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hol_res = self.holistic.process(rgb)
 
-        # Blendshape detection
+        # Blendshapes
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
         blend_res = self.face_landmarker.detect(mp_img)
-
-        # Extract blendshape scores
-        blend_scores = []
-        if blend_res.face_blendshapes:
-            for cat in blend_res.face_blendshapes[0]:
-                blend_scores.append(cat.score)
-        # If fewer than 52 categories detected, pad with zeros
+        blend_scores = [cat.score for cat in (blend_res.face_blendshapes[0] if blend_res.face_blendshapes else [])]
+        # pad if needed
         if len(blend_scores) < 52:
             blend_scores.extend([0.0] * (52 - len(blend_scores)))
 
-        # Extract raw facemesh coords (if enabled)
+        # Raw facemesh coords
         mesh_vals = []
         if self.enable_raw_facemesh:
             if hol_res.face_landmarks:
                 for lm in hol_res.face_landmarks.landmark:
                     mesh_vals.extend([lm.x, lm.y, lm.z])
             else:
-                # No face detected: pad all mesh coords with zeros
-                mesh_vals = [0.0] * (478 * 3)
+                mesh_vals = [0.0] * (468 * 3)
 
-        # Extract pose landmarks
+        # Pose landmarks
         pose_vals = []
         if hol_res.pose_landmarks:
             for lm in hol_res.pose_landmarks.landmark:
                 pose_vals.extend([lm.x, lm.y, lm.z, lm.visibility])
         else:
-            # No pose detected: pad with zeros
             pose_vals = [0.0] * (33 * 4)
 
-        # Combined sample has fixed length of 52 + (478*3 if enabled) + 132
         return blend_scores + mesh_vals + pose_vals
 
     def stream_loop(self):
         """
-        Continuously reads frames and pushes samples to the LSL outlet.
-        Requires setup_stream() to be called first.
+        Loop: read frames and push to LSL outlet. Requires setup_stream call.
         """
         if not self.outlet:
             raise RuntimeError("LSL outlet not initialized. Call setup_stream() first.")
@@ -143,8 +122,23 @@ class Participant:
 
     def release(self):
         """
-        Releases camera and Mediapipe resources.
+        Releases camera and Mediapipe resources. Idempotent.
         """
-        self.cap.release()
-        self.holistic.close()
-        self.face_landmarker.close()
+        # Release camera
+        if hasattr(self, 'cap') and self.cap:
+            self.cap.release()
+            self.cap = None
+        # Close holistic
+        if hasattr(self, 'holistic') and self.holistic:
+            try:
+                self.holistic.close()
+            except ValueError:
+                pass
+            self.holistic = None
+        # Close face_landmarker
+        if hasattr(self, 'face_landmarker') and self.face_landmarker:
+            try:
+                self.face_landmarker.close()
+            except Exception:
+                pass
+            self.face_landmarker = None
