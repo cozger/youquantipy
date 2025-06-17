@@ -16,7 +16,8 @@ def run_participant(config, model_path):
         camera_index=config["video_source"],
         model_path=model_path,
         stream_name=config["landmark_stream_name"],
-        source_id=f"{config['landmark_stream_name']}_uid"
+        source_id=f"{config['landmark_stream_name']}_uid",
+        enable_raw_facemesh=enable_full_mesh
     )
     p.run()
 
@@ -101,6 +102,10 @@ def collect_participant_info():
 def main():
     # Path to your Mediapipe blendshape model
     model_path = r"D:\Projects\MovieSynchrony\face_landmarker.task"
+    full_mesh = input("Enable full FaceMesh output in addition to blendshapes? (y/N): ")\
+                    .strip().lower() == 'y'
+    
+
 
     configs = collect_participant_info()
 
@@ -116,7 +121,7 @@ def main():
         )
         proc = Process(
         target=run_participant,
-        args=(cfg, model_path),
+        args=(cfg, model_path,full_mesh),
     )
 
         proc.start()
