@@ -236,6 +236,7 @@ class YouQuantiPyGUI(tk.Tk):
             pid = info['entry'].get().strip() or f"P{i+1}"
             stream_name = f"{pid}_landmarks"
             part = info['participant']
+            # setup LSL
             part.setup_stream(pid, stream_name)
             stop_evt = threading.Event()
             t = threading.Thread(target=self.data_loop, args=(i,), daemon=True)
@@ -246,27 +247,40 @@ class YouQuantiPyGUI(tk.Tk):
 
     def stop_stream(self):
         self.streaming = False
+        # signal previews and data threads to stop
         for info in self.frames:
             info['stop_evt'].set()
             if info.get('data_stop_evt'):
                 info['data_stop_evt'].set()
+        # cleanup in main loop
         self.after(50, self._cleanup_threads)
 
     def _cleanup_threads(self):
-        alive = False
+        # wait until all threads have exited
+        still_alive = False
         for info in self.frames:
             t = info.get('thread')
             dt = info.get('data_thread')
             if (t and t.is_alive()) or (dt and dt.is_alive()):
-                alive = True
+                still_alive = True
                 break
-        if alive:
+        if still_alive:
             self.after(50, self._cleanup_threads)
-        else:
-            for info in self.frames:
-                if info.get('participant'):
-                    info['participant'].release()
-                info['meta_label'].config(text="ID: -, Stream: -")
+            return
+        # now safe to release resources including LSL outlets
+        for info in self.frames:
+            part = info.get('participant')
+            if part:
+                # release camera and Mediapipe
+                part.release()
+                # close LSL outlet if exists
+                if hasattr(part, 'outlet') and part.outlet:
+                    try:
+                        part.outlet.close()
+                    except Exception:
+                        pass
+                    part.outlet = None
+            info['meta_label'].config(text="ID: -, Stream: -")
 
 if __name__ == '__main__':
     app = YouQuantiPyGUI()
