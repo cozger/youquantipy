@@ -1,4 +1,5 @@
 import cv2
+import time
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -34,13 +35,28 @@ class Participant:
             refine_face_landmarks=True
         )
 
-        # Load FaceLandmarker
+        # Prepare a buffer for the latest blendshape scores
+        self.last_blend_scores = [0.0] * 52
+
+        # Result callback for LIVE_STREAM mode
+        def _on_result(result, output_image, timestamp_ms):
+            # extract blendshape scores (pad/truncate to 52)
+            shapes = result.face_blendshapes[0] if result.face_blendshapes else []
+            scores = [cat.score for cat in shapes]
+            if len(scores) < 52:
+                scores += [0.0] * (52 - len(scores))
+            else:
+                scores = scores[:52]
+            self.last_blend_scores = scores
+
+        # Load FaceLandmarker in LIVE_STREAM mode
         with open(self.model_path, 'rb') as f:
             base_options = python.BaseOptions(model_asset_buffer=f.read())
         blend_opts = vision.FaceLandmarkerOptions(
             base_options=base_options,
             output_face_blendshapes=True,
-            running_mode=vision.RunningMode.IMAGE
+            running_mode=vision.RunningMode.LIVE_STREAM,
+            result_callback=_on_result
         )
         self.face_landmarker = vision.FaceLandmarker.create_from_options(blend_opts)
 
@@ -71,32 +87,33 @@ class Participant:
 
     def read_frame(self):
         """
-        Reads a frame, processes landmarks and blendshapes,
-        returns [blend(52), mesh(468*3), pose(132)] if enabled.
+        Reads a frame, enqueues it for async blendshape detection,
+        and returns [blend(52), mesh(468*3), pose(132)].
         """
         success, frame = self.cap.read()
         if not success:
             return None
 
+        # RGB for holistic
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hol_res = self.holistic.process(rgb)
 
-        # Blendshapes
+        # Enqueue for async blendshape detection
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-        blend_res = self.face_landmarker.detect(mp_img)
-        blend_scores = [cat.score for cat in (blend_res.face_blendshapes[0] if blend_res.face_blendshapes else [])]
-        # pad if needed
-        if len(blend_scores) < 52:
-            blend_scores.extend([0.0] * (52 - len(blend_scores)))
+        self.face_landmarker.detect_async(
+            mp_img,
+            timestamp_ms=int(time.time() * 1e3)
+        )
+        # Grab latest from callback
+        blend_scores = self.last_blend_scores
 
-        # Raw facemesh coords
-        mesh_vals = []
-        if self.enable_raw_facemesh:
-            if hol_res.face_landmarks:
-                for lm in hol_res.face_landmarks.landmark:
-                    mesh_vals.extend([lm.x, lm.y, lm.z])
-            else:
-                mesh_vals = [0.0] * (468 * 3)
+        # extract full 468×3 mesh for tracking/visualization
+        if hol_res.face_landmarks:
+            mesh_vals = []
+            for lm in hol_res.face_landmarks.landmark:
+                mesh_vals.extend([lm.x, lm.y, lm.z])
+        else:
+            mesh_vals = [0.0] * (468 * 3)
 
         # Pose landmarks
         pose_vals = []
@@ -106,8 +123,17 @@ class Participant:
         else:
             pose_vals = [0.0] * (33 * 4)
 
-        return blend_scores + mesh_vals + pose_vals
+        # build the full sample for LSL only if requested
+        if self.enable_raw_facemesh:
+            sample = blend_scores + mesh_vals + pose_vals
+        else:
+            sample = blend_scores + pose_vals
 
+        # stash mesh_vals for GUI or other processing
+        self.last_full_mesh = mesh_vals
+
+        return sample
+    
     def stream_loop(self):
         """
         Loop: read frames and push to LSL outlet. Requires setup_stream call.
