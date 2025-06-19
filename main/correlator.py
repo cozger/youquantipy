@@ -1,6 +1,7 @@
 import time
 import numpy as np
 from collections import deque
+import threading
 from pylsl import StreamInfo, StreamOutlet
 
 class ChannelCorrelator:
@@ -10,9 +11,9 @@ class ChannelCorrelator:
     Outputs a 52-channel float vector of comodulation magnitudes.
     """
     def __init__(self,
-                 window_size=30,
-                 fps=60,
-                 delta_threshold=0.005,
+                 window_size=5,
+                 fps=30,
+                 delta_threshold=0.01,
                  similarity_threshold=0.8):
         self.w = window_size
         self.fps = fps
@@ -22,11 +23,13 @@ class ChannelCorrelator:
         self.states     = np.zeros(52, dtype=bool)
         self.hold_vals  = np.zeros(52, dtype=float)
         # Exit threshold to release state latching
-        self.exit_threshold = delta_threshold * 0.98
+        self.exit_threshold = delta_threshold * 1
         # Buffers for rolling means
         self.buff1 = deque(maxlen=self.w)
         self.buff2 = deque(maxlen=self.w)
-
+        self.sum1 = np.zeros(52, dtype=float)
+        self.sum2 = np.zeros(52, dtype=float)
+        self._lock = threading.Lock()
                 # outlet will be created when you press Start
         self.outlet = None
         self.last_out = None
@@ -37,40 +40,39 @@ class ChannelCorrelator:
         then compute comodulation magnitudes when both participants change in synchrony.
         Returns a length-52 float array of comodulation magnitudes.
         """
-        # Add latest frames
+        with self._lock:
+            # 1) Compute baseline from incremental sums
+            if len(self.buff1) >= self.w:
+                baseline1 = self.sum1 / self.w
+                baseline2 = self.sum2 / self.w
+            else:
+                baseline1 = np.zeros_like(vec1)
+                baseline2 = np.zeros_like(vec2)
 
-                # Compute current baselines BEFORE appending
-        if len(self.buff1) >= self.w:
-            baseline1 = np.stack(self.buff1, axis=0).mean(axis=0)
-            baseline2 = np.stack(self.buff2, axis=0).mean(axis=0)
-        else:
-            baseline1 = np.zeros_like(vec1)
-            baseline2 = np.zeros_like(vec2)
+            # 2) Prepare new buffered values so latched channels keep their baseline
+            buf1 = vec1.copy()
+            buf2 = vec2.copy()
+            buf1[self.states] = baseline1[self.states]
+            buf2[self.states] = baseline2[self.states]
 
-        # Prepare buffered versions so active channels don’t shift their baseline
-        buf1 = vec1.copy()
-        buf2 = vec2.copy()
-        # for any channel i that’s currently latched, keep its baseline value in the buffer
-        buf1[self.states] = baseline1[self.states]
-        buf2[self.states] = baseline2[self.states]
+            # 3) Update running sums & deques
+            if len(self.buff1) == self.w:
+                # subtract oldest
+                old1 = self.buff1[0]; old2 = self.buff2[0]
+                self.sum1 -= old1
+                self.sum2 -= old2
+            self.buff1.append(buf1)
+            self.buff2.append(buf2)
+            self.sum1 += buf1
+            self.sum2 += buf2
 
-        # Now append into the rolling windows
-        self.buff1.append(buf1)
-        self.buff2.append(buf2)
+            # 4) Wait until buffer is full
+            if len(self.buff1) < self.w:
+                return None
 
-        # Wait until buffer is full
-        if len(self.buff1) < self.w:
-            return None
-
-        # Compute rolling baseline means
-        arr1 = np.stack(self.buff1, axis=0)
-        arr2 = np.stack(self.buff2, axis=0)
-        baseline1 = arr1.mean(axis=0)
-        baseline2 = arr2.mean(axis=0)
-
-        # Compute deviations
-        delta1 = vec1 - baseline1
-        delta2 = vec2 - baseline2
+            # 5) Compute deviations from baseline
+            delta1 = vec1 - baseline1
+            delta2 = vec2 - baseline2
 
         # Detect per-channel expression change
         change1 = np.abs(delta1) > self.delta_threshold
@@ -137,7 +139,7 @@ class ChannelCorrelator:
                 vec2 = np.array(sample2[:52], dtype=float)
                 self.update(vec1, vec2)
 
-            time.sleep(1.0 / self.fps)
+            stop_evt.wait(1.0 / self.fps)
     def setup_stream(self,
                      name: str = "CoModulation",
                      source_id: str = "comodulator_uid"):
