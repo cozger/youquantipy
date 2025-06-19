@@ -42,7 +42,7 @@ class YouQuantiPyGUI(tk.Tk):
 
         # ─── HIDDEN TESTING MODE ──────────────────────────────────────────────
         # When True, participants share the same cv2.VideoCapture. Flip to False for real multi-camera.
-        self.testing_mode = True
+        self.testing_mode = False
         # ──────────────────────────────────────────────────────────────────────
 
         print("[DEBUG] GUI __init__")
@@ -81,6 +81,7 @@ class YouQuantiPyGUI(tk.Tk):
         tk.Checkbutton(self, text="Enable full FaceMesh", variable=self.enable_mesh).grid(row=0, column=2, padx=5)
         tk.Button(self, text="Start Data Stream", command=self.start_stream).grid(row=0, column=3, padx=10)
         tk.Button(self, text="Stop Data Stream",  command=self.stop_stream).grid(row=0, column=4, padx=10)
+        tk.Button(self, text="Reset", command=self.reset).grid(row=0, column=5, padx=10)
 
         # Preview + plot areas
         # Preview area (participants)
@@ -102,6 +103,10 @@ class YouQuantiPyGUI(tk.Tk):
         # Build per-participant frames
         self.frames = []
         self.build_frames()
+        
+        # Continuously visualize comodulation from last two participants
+        self.after(30, self.preview_comodulation)
+
 
     def on_landmarker_result(self, idx, result, output_image, timestamp_ms):
         """
@@ -291,16 +296,23 @@ class YouQuantiPyGUI(tk.Tk):
             canvas.image = imgtk
         except queue.Empty:
             pass
-        self.check_auto_start()
+        # self.check_auto_start()
         if not info['stop_evt'].is_set():
             self.after(30, self.schedule_preview, idx)
 
-    def check_auto_start(self):
-        if self.streaming or len(self.frames) < 2:
-            return
-        if all(info['detect_count'] >= self.auto_start_threshold for info in self.frames[:2]):
-            print("[DEBUG] Auto-start condition met")
-            self.start_stream()
+    def preview_comodulation(self):
+        """
+        Continuously compute and display comodulation magnitudes using
+        the correlator.update(...) method, independent of LSL streaming.
+        """
+        if len(self.frames) >= 2:
+            s1 = self.frames[0].get('last_scores')
+            s2 = self.frames[1].get('last_scores')
+            if s1 is not None and s2 is not None:
+                corr = self.correlator.update(np.array(s1), np.array(s2))
+                if corr is not None:
+                    self.update_plot(corr)
+        self.after(30, self.preview_comodulation)
 
     def update_plot(self, corr):
         c = self.bar_canvas
@@ -388,11 +400,14 @@ class YouQuantiPyGUI(tk.Tk):
         if len(valid) < 2:
             return
         self.streaming = True
+        
         for i, info in enumerate(valid[:2]):
             pid = info['entry'].get().strip() or f"P{i+1}"
             nm  = f"{pid}_landmarks"
             info['participant'].setup_stream(pid, nm)
             info['meta_label'].config(text=f"ID: {pid}, Stream: {nm}")
+        #  start the LSL outlet for the comodulator
+        self.correlator.setup_stream()
         self.data_stop_evt.clear()
         t = threading.Thread(target=self.combined_loop, daemon=True)
         self.data_thread = t
@@ -421,6 +436,29 @@ class YouQuantiPyGUI(tk.Tk):
             self.correlator.close()
 
         self.after(50, _cleanup)
+
+    def reset(self):
+        """
+        Stop all streams and visualizations, 
+        then rebuild the GUI to its initial state.
+        """
+        # 1) Stop data stream (participants + comodulator)
+        self.stop_stream()
+
+        # 2) Fully close correlator outlet and reset state
+        self.correlator.close()
+        # Re-instantiate to clear any holding state
+        self.correlator = ChannelCorrelator(window_size=60, fps=30)
+
+        # 3) Tear down all participant frames & previews
+        self.build_frames()
+
+        # 4) Clear the bar plot back to its debug rectangle
+        self.bar_canvas.delete('all')
+        self.bar_canvas.create_rectangle(10,10,110,60, fill='red', tags='debug')
+
+        # 5) Reset streaming flag
+        self.streaming = False
 
 if __name__ == '__main__':
     YouQuantiPyGUI().mainloop()

@@ -150,6 +150,14 @@ class Participant:
         """
         Releases camera and Mediapipe resources. Idempotent.
         """
+        # Close LSL outlet if it exists
+        if getattr(self, 'outlet', None):
+            try:
+                self.outlet.close()
+            except Exception:
+                pass
+            self.outlet = None
+
         # Release camera
         if hasattr(self, 'cap') and self.cap:
             self.cap.release()

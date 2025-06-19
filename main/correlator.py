@@ -10,10 +10,10 @@ class ChannelCorrelator:
     Outputs a 52-channel float vector of comodulation magnitudes.
     """
     def __init__(self,
-                 window_size=5,
+                 window_size=30,
                  fps=60,
-                 delta_threshold=0.05,
-                 similarity_threshold=0.9):
+                 delta_threshold=0.005,
+                 similarity_threshold=0.8):
         self.w = window_size
         self.fps = fps
         self.delta_threshold = delta_threshold
@@ -21,22 +21,15 @@ class ChannelCorrelator:
         # For state‐machine holding of sustained comodulation
         self.states     = np.zeros(52, dtype=bool)
         self.hold_vals  = np.zeros(52, dtype=float)
-        # Exit threshold set to half the enter threshold (adjust as you like)
+        # Exit threshold to release state latching
         self.exit_threshold = delta_threshold * 0.98
         # Buffers for rolling means
         self.buff1 = deque(maxlen=self.w)
         self.buff2 = deque(maxlen=self.w)
 
-        # Prepare LSL outlet for comodulation stream
-        info = StreamInfo(
-            name="CoModulation",
-            type="Comodulation",
-            channel_count=52,
-            nominal_srate=self.fps,
-            channel_format="float32",
-            source_id="comodulator_uid"
-        )
-        self.outlet = StreamOutlet(info)
+                # outlet will be created when you press Start
+        self.outlet = None
+        self.last_out = None
 
     def update(self, vec1: np.ndarray, vec2: np.ndarray):
         """
@@ -89,31 +82,38 @@ class ChannelCorrelator:
         # Compute comodulation magnitude: average of absolute deltas where both change and in sync
         mask = change1 & change2 & similarity
         magnitudes = (np.abs(delta1) + np.abs(delta2)) / 2.0
-        comod = magnitudes # * mask.astype(float) removing masking.
+        comod = magnitudes  * mask.astype(float)
           # ── State‐machine: enter when above delta_threshold, exit when below exit_threshold ──
         out = np.zeros_like(comod)
         enter = self.delta_threshold
         exit_ = self.exit_threshold
+
         for i, val in enumerate(comod):
-            if not self.states[i] and val > enter:
-                # new smile‐sync starts
-                self.states[i]    = True
-                self.hold_vals[i] = val
-            elif self.states[i] and val < exit_:
-                # smile‐sync ends
-                self.states[i]    = False
-                self.hold_vals[i] = 0.0
-            # if still in sync state and val spikes higher, update peak
-            if self.states[i] and val > self.hold_vals[i]:
-                self.hold_vals[i] = val
+            if self.states[i]:
+                # EXIT if either (a) the mask says they’re no longer co-moving, or
+                # (b) the magnitude has truly fallen below the exit threshold.
+                if (not mask[i]) or (val < exit_):
+                    self.states[i]    = False
+                    self.hold_vals[i] = 0.0
+                else:
+                    # still in a co-moving state, so keep or bump the peak
+                    if val > self.hold_vals[i]:
+                        self.hold_vals[i] = val
+
+            else:
+                # ENTER only if the mask says “both moved enough and are similar”
+                if mask[i] and (val > enter):
+                    self.states[i]    = True
+                    self.hold_vals[i] = val
+
             out[i] = self.hold_vals[i]
 
-        # Push comodulation magnitudes vector to LSL
-        try:
-            self.outlet.push_sample(out.tolist())
-        except Exception:
-            pass
-
+        # Push only if we've called setup_stream()
+        if self.outlet:
+            try:
+                self.outlet.push_sample(out.tolist())
+            except Exception:
+                pass
         return out
 
     def run(self, p1, p2, stop_evt):
@@ -138,12 +138,24 @@ class ChannelCorrelator:
                 self.update(vec1, vec2)
 
             time.sleep(1.0 / self.fps)
+    def setup_stream(self,
+                     name: str = "CoModulation",
+                     source_id: str = "comodulator_uid"):
+        """Call this once when Start is pressed."""
+        info = StreamInfo(
+            name=name,
+            type="Comodulation",
+            channel_count=52,
+            nominal_srate=self.fps,
+            channel_format="float32",
+            source_id=source_id
+        )
+        self.outlet = StreamOutlet(info)
 
     def close(self):
-        """
-        Close the comodulation LSL outlet cleanly.
-        """
-        try:
-            self.outlet.close()
-        except Exception:
-            pass
+        if self.outlet:
+            try:
+                self.outlet.close()
+            except Exception:
+                pass
+            self.outlet = None
