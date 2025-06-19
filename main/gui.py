@@ -12,7 +12,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from participant import Participant  # data-stream class :contentReference[oaicite:5]{index=5}
+from participant import Participant
 from correlator import ChannelCorrelator
 
 # Path to your Mediapipe face_landmarker.task
@@ -24,12 +24,19 @@ def list_video_devices(max_devices=10):
     devices = []
     for i in range(min(len(names), max_devices)):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+    # Try to lock to 1920×1080, then read back what really stuck
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         if not cap.isOpened():
             continue
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Read back actual width/height
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Warn if camera refused the full HD request
+        if (actual_w, actual_h) != (1920, 1080):
+            print(f"[GUI] Warning: Device {i} locked to {actual_w}×{actual_h}")
+        # Use the actual values downstream
+        w, h = actual_w, actual_h
         devices.append((i, names[i], w, h))
         cap.release()
     return devices
@@ -39,11 +46,12 @@ class YouQuantiPyGUI(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        self.testing_mode = True  # share same capture in testing
 
-        # ─── HIDDEN TESTING MODE ──────────────────────────────────────────────
-        # When True, participants share the same cv2.VideoCapture. Flip to False for real multi-camera.
-        self.testing_mode = False
-        # ──────────────────────────────────────────────────────────────────────
+        # —— Load face_landmarker model only once ——
+        with open(MODEL_PATH, 'rb') as f:
+            self.model_buf = f.read()
+
 
         print("[DEBUG] GUI __init__")
         self.title("YouQuantiPy Multi-Participant Stream")
@@ -52,23 +60,22 @@ class YouQuantiPyGUI(tk.Tk):
             self.grid_columnconfigure(col, weight=1)
         self.grid_rowconfigure(2, weight=0)
 
-        # Shared Holistic for drawing preview
+        # Shared Holistic for drawing
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_styles  = mp.solutions.drawing_styles
         self.holistic   = mp.solutions.holistic.Holistic(
-            model_complexity=2, 
+            model_complexity=2,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
             refine_face_landmarks=True
         )
 
-        # Correlator for two-participant synchrony plot
+        # Synchrony plot correlator
         self.correlator = ChannelCorrelator(window_size=60, fps=30)
         self.data_stop_evt = threading.Event()
         self.data_thread = None
         self.streaming = False
 
-        # Auto-start params
         self.blend_labels = None
         self.auto_start_threshold = 30
 
@@ -78,40 +85,26 @@ class YouQuantiPyGUI(tk.Tk):
         tk.Spinbox(self, from_=1, to=6, textvariable=self.participant_count,
                    command=self.build_frames, width=5).grid(row=0, column=1, sticky="w", padx=5)
         self.enable_mesh = tk.BooleanVar(value=False)
+        self.multi_face_mode = tk.BooleanVar(value=False)
         tk.Checkbutton(self, text="Enable full FaceMesh", variable=self.enable_mesh).grid(row=0, column=2, padx=5)
+        tk.Checkbutton(self, text="Enable Multi-Face Mode", variable=self.multi_face_mode).grid(row=1, column=2, padx=5, pady=5)
         tk.Button(self, text="Start Data Stream", command=self.start_stream).grid(row=0, column=3, padx=10)
         tk.Button(self, text="Stop Data Stream",  command=self.stop_stream).grid(row=0, column=4, padx=10)
         tk.Button(self, text="Reset", command=self.reset).grid(row=0, column=5, padx=10)
 
-        # Preview + plot areas
-        # Preview area (participants)
+        # Layout frames for previews
         self.container = ttk.Frame(self)
-        self.container.grid(row=1, column=0, columnspan=4, pady=10, sticky='ew')
+        self.container.grid(row=2, column=0, columnspan=4, pady=10, sticky='ew')
         self.container.grid_columnconfigure(tuple(range(4)), weight=1)
-
-        # Comodulation bar plots on the right
         self.bar_canvas = tk.Canvas(self, bg='white', width=200)
         self.bar_canvas.grid(row=1, column=4, rowspan=2, sticky='ns', padx=(10,0))
-        # keep column 4 from expanding
         self.grid_columnconfigure(4, weight=0)
 
-
-
-
-        self.bar_canvas.create_rectangle(10,10,110,60, fill='red', tags='debug')
-
-        # Build per-participant frames
         self.frames = []
         self.build_frames()
-        
-        # Continuously visualize comodulation from last two participants
         self.after(30, self.preview_comodulation)
 
-
     def on_landmarker_result(self, idx, result, output_image, timestamp_ms):
-        """
-        Live-stream callback for participant idx.
-        """
         info = self.frames[idx]
         if result.face_blendshapes:
             scores = [cat.score for cat in result.face_blendshapes[0]]
@@ -119,71 +112,73 @@ class YouQuantiPyGUI(tk.Tk):
             scores = []
         scores += [0.0] * (52 - len(scores))
         info['last_scores'] = scores
-
         if self.blend_labels is None and result.face_blendshapes:
             self.blend_labels = [cat.category_name for cat in result.face_blendshapes[0]]
-
         info['detect_count'] = info.get('detect_count', 0) + (1 if any(scores) else 0)
 
     def build_frames(self):
         print("[DEBUG] build_frames called")
-        # Clean up existing
+        # teardown
         for i, info in enumerate(self.frames):
             info['stop_evt'].set()
-            if info.get('thread'):      info['thread'].join()
-            if info.get('data_thread'): info['data_thread'].join()
+            if info.get('thread'): info['thread'].join()
             if info.get('participant') and not (self.testing_mode and i>0):
                 info['participant'].release()
             info['frame'].destroy()
         self.frames.clear()
 
-        cams = list_video_devices()
-        cam_vals = [f"{i}: {name} ({w}x{h})" for i,name,w,h in cams]
+        self.cams = list_video_devices()
+        cam_vals = [f"{i}: {name} ({w}x{h})" for i,name,w,h in self.cams]
 
         for i in range(self.participant_count.get()):
             frame = ttk.LabelFrame(self.container, text=f"Participant {i+1}")
             frame.grid(row=0, column=i, padx=5, sticky='n')
             frame.grid_columnconfigure(0, weight=1)
-
             tk.Label(frame, text="ID:").pack(anchor='w')
-            ent    = tk.Entry(frame, width=15); ent.pack()
+            ent = tk.Entry(frame, width=15); ent.pack()
             canvas = tk.Canvas(frame, width=400, height=300); canvas.pack(pady=5)
-            meta   = tk.Label(frame, text="ID: -, Stream: -"); meta.pack(pady=(0,5))
+            meta = tk.Label(frame, text="ID: -, Stream: -"); meta.pack(pady=(0,5))
             tk.Label(frame, text="Camera:").pack()
             cmb = ttk.Combobox(frame, values=cam_vals, state='readonly', width=30)
             if cam_vals: cmb.current(0)
             cmb.pack(pady=(0,5))
 
-            stop_evt    = threading.Event()
+            stop_evt = threading.Event()
             frame_queue = queue.Queue(maxsize=1)
 
             def on_select(event=None, idx=i):
                 print(f"[DEBUG] on_select(idx={idx})")
                 try:
                     info = self.frames[idx]
-                    cam_idx = int(info['combo'].get().split(':')[0])
-                    part = Participant(cam_idx, MODEL_PATH, self.enable_mesh.get())
-                    # share cap in testing mode
+                    # parse combobox for camera
+                    sel = info['combo'].get()
+                    cam_idx = int(sel.split(':')[0])
+                    cam_info = next((c for c in self.cams if c[0]==cam_idx), None)
+                    cam_w = cam_h = None
+                    if cam_info:
+                        _,_,cam_w,cam_h = cam_info
+                    part = Participant(cam_idx, MODEL_PATH, self.enable_mesh.get(), 
+                                       multi_face_mode=self.multi_face_mode.get(),
+                                       fps= 30)
+                    if cam_w and cam_h:
+                        part.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
+                        part.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
                     if self.testing_mode and idx>0 and self.frames[0]['participant']:
                         part.cap = self.frames[0]['participant'].cap
 
-                    # set up a dedicated FaceLandmarker for this participant
-                    with open(MODEL_PATH, 'rb') as f:
-                        buf = f.read()
-                    base_opts = python.BaseOptions(model_asset_buffer=buf)
+                    base_opts = python.BaseOptions(model_asset_buffer=self.model_buf)
+
                     opts = vision.FaceLandmarkerOptions(
                         base_options=base_opts,
                         output_face_blendshapes=True,
                         running_mode=vision.RunningMode.LIVE_STREAM,
-                        # capture idx in the callback
-                        result_callback=lambda rst, img, ts, idx=idx: self.on_landmarker_result(idx, rst, img, ts)
+                        result_callback=lambda rst,img,ts,idx=idx: self.on_landmarker_result(idx, rst, img, ts)
                     )
                     part.face_landmarker = vision.FaceLandmarker.create_from_options(opts)
-
-                    # cleanup old preview
+                    # stop old thread
                     info['stop_evt'].set()
                     if info.get('thread'): info['thread'].join()
-
+                    # update info dict
                     info.update(
                         participant=part,
                         face_landmarker=part.face_landmarker,
@@ -192,93 +187,94 @@ class YouQuantiPyGUI(tk.Tk):
                         detect_count=0,
                         last_scores=[0.0]*52
                     )
-                    # start preview
+                    # start preview thread
                     t = threading.Thread(target=self.preview_loop, args=(idx,), daemon=True)
-                    info['thread'] = t; t.start()
-                    # schedule the Tkinter display loop
-                    self.after(30, self.schedule_preview, idx)
+                    info['thread'] = t
+                    t.start()
+                    # schedule first preview draw, store its after-id
+                    info['after_id'] = self.after(30, self.schedule_preview, idx)
+
                 except Exception as e:
                     print(f"[ERROR] on_select idx={idx}: {e}")
 
             cmb.bind('<<ComboboxSelected>>', on_select)
-
             self.frames.append({
                 'frame': frame, 'canvas': canvas, 'entry': ent,
                 'combo': cmb, 'meta_label': meta,
                 'participant': None, 'face_landmarker': None,
                 'stop_evt': stop_evt, 'thread': None, 'frame_queue': frame_queue,
-                'data_thread': None, 'detect_count': 0, 'last_scores': [0.0]*52
+                'detect_count': 0, 'last_scores':[0.0]*52
             })
-            if cam_vals:
-                self.after(100, on_select)
+            on_select()
 
     def preview_loop(self, idx):
         print(f"[DEBUG] preview_loop started for participant {idx}")
         info = self.frames[idx]
-        p    = info['participant']
-        fl   = info['face_landmarker']
+        p = info['participant']
+        fl = info['face_landmarker']
         stop = info['stop_evt']
-        q    = info['frame_queue']
-
+        q = info['frame_queue']
+        
         while not stop.is_set():
             success, frame = p.cap.read()
             if not success:
                 continue
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # draw Holistic landmarks
-            hol = p.holistic.process(rgb)
             disp = frame.copy()
-                        # draw full 468-point mesh
-            self.mp_drawing.draw_landmarks(
-                disp, hol.face_landmarks,
-                mp.solutions.holistic.FACEMESH_TESSELATION,  # full mesh triangles
-                None,
-                self.mp_styles.get_default_face_mesh_tesselation_style()
-            )
+            mesh_vals = []
+            pose_vals = []
+            
+            if p.multi_face_mode:
+                mesh_res = p.face_mesh.process(rgb)
+                for lm_list in (mesh_res.multi_face_landmarks or []):
+                    self.mp_drawing.draw_landmarks(
+                        disp, lm_list,
+                        mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                        None,
+                        self.mp_styles.get_default_face_mesh_tesselation_style()
+                    )
+                if mesh_res.multi_face_landmarks:
+                    first_face = mesh_res.multi_face_landmarks[0]
+                    mesh_vals = [coord for lm in first_face.landmark for coord in (lm.x, lm.y, lm.z)]
+                else:
+                    mesh_vals = [0.0]*(468*3)
+                pose_vals = [0.0]*(33*4)
+            else:
+                hol = self.holistic.process(rgb)
+                self.mp_drawing.draw_landmarks(
+                    disp, hol.face_landmarks,
+                    mp.solutions.holistic.FACEMESH_TESSELATION,
+                    None,
+                    self.mp_styles.get_default_face_mesh_tesselation_style()
+                )
+                self.mp_drawing.draw_landmarks(
+                    disp, hol.pose_landmarks,
+                    mp.solutions.holistic.POSE_CONNECTIONS,
+                    self.mp_styles.get_default_pose_landmarks_style()
+                )
+                if hol.face_landmarks:
+                    mesh_vals = [coord for lm in hol.face_landmarks.landmark for coord in (lm.x, lm.y, lm.z)]
+                else:
+                    mesh_vals = [0.0]*(468*3)
+                if hol.pose_landmarks:
+                    pose_vals = [coord for lm in hol.pose_landmarks.landmark for coord in (lm.x, lm.y, lm.z, lm.visibility)]
+                else:
+                    pose_vals = [0.0]*(33*4)
 
-            self.mp_drawing.draw_landmarks(
-                disp, hol.pose_landmarks, mp.solutions.holistic.POSE_CONNECTIONS,
-                self.mp_styles.get_default_pose_landmarks_style()
-            )
-
-
-              # ---- Live-stream FaceLandmarker API ----
+            ts = int(time.monotonic()*1e3)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-            # use a monotonic clock so timestamps always strictly increase
-            ts = int(time.monotonic() * 1e3)
             fl.detect_async(mp_img, timestamp_ms=ts)
 
-          # ---- Extract and cache mesh & pose for combined_loop ----
-            # mesh: always extract the full 468-point mesh
-            if hol.face_landmarks:
-                mesh_vals = [
-                    coord
-                    for lm in hol.face_landmarks.landmark
-                    for coord in (lm.x, lm.y, lm.z)
-                ]
-            else:
-                mesh_vals = [0.0] * (468 * 3)
             info['last_mesh_vals'] = mesh_vals
-
-            if hol.pose_landmarks:
-                pose_vals = [
-                    coord
-                    for lm in hol.pose_landmarks.landmark
-                    for coord in (lm.x, lm.y, lm.z, lm.visibility)
-                ]
-            else:
-                pose_vals = [0.0] * (33 * 4)
             info['last_pose_vals'] = pose_vals
 
-
-            # draw blendshape bars
             scores = info.get('last_scores', [0.0]*52)
             h, w, _ = disp.shape
-            bar_h = h // 52
+            bar_h = h//52
             for j, s in enumerate(scores):
-                y0, y1 = j * bar_h, (j + 1) * bar_h
-                cv2.rectangle(disp, (0, y0), (int(s * 150), y1), (0, 255, 0), -1)
-
+                y0, y1 = j*bar_h, (j+1)*bar_h
+                cv2.rectangle(disp, (0,y0), (int(s*150), y1), (0,255,0), -1)
+            
             if not q.full():
                 q.put(disp)
             stop.wait(0.03)
@@ -292,13 +288,16 @@ class YouQuantiPyGUI(tk.Tk):
             imgtk = ImageTk.PhotoImage(
                 Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)).resize((400,300))
             )
+            # clear old image before drawing new
+            canvas.delete('all')
             canvas.create_image(0,0,anchor='nw',image=imgtk)
             canvas.image = imgtk
         except queue.Empty:
             pass
         # self.check_auto_start()
         if not info['stop_evt'].is_set():
-            self.after(30, self.schedule_preview, idx)
+            # schedule next preview and overwrite the stored after-id
+            info['after_id'] = self.after(30, self.schedule_preview, idx)
 
     def preview_comodulation(self):
         """
@@ -315,6 +314,12 @@ class YouQuantiPyGUI(tk.Tk):
         self.after(30, self.preview_comodulation)
 
     def update_plot(self, corr):
+        c = self.bar_canvas
+        now = time.time()
+        if hasattr(self, '_last_plot') and now - self._last_plot < 0.1:
+            return
+        self._last_plot = now
+
         c = self.bar_canvas
         c.delete('all')
         W, H = c.winfo_width(), c.winfo_height()
@@ -391,7 +396,7 @@ class YouQuantiPyGUI(tk.Tk):
             if corr is not None:
                 self.after_idle(lambda c=corr.copy(): self.update_plot(c))
 
-            time.sleep(1.0 / fps)
+            stop.wait(1.0 / fps)
 
     def start_stream(self):
         if self.streaming:
@@ -417,8 +422,19 @@ class YouQuantiPyGUI(tk.Tk):
         if not self.streaming:
             return
         self.streaming = False
+           # 1) Signal all preview threads to stop
         for info in self.frames:
             info['stop_evt'].set()
+            # 2) Cancel any pending preview callbacks
+            if 'after_id' in info:
+                self.after_cancel(info['after_id'])
+            # 3) Join the thread
+            if info.get('thread') and info['thread'].is_alive():
+                info['thread'].join(timeout=1)
+        # 4) Cancel the comodulation updater
+        if hasattr(self, '_comod_after_id'):
+            self.after_cancel(self._comod_after_id)
+        # 5) Stop the LSL data loop as before
         self.data_stop_evt.set()
 
         def _cleanup():
@@ -450,7 +466,7 @@ class YouQuantiPyGUI(tk.Tk):
         # Re-instantiate to clear any holding state
         self.correlator = ChannelCorrelator(window_size=60, fps=30)
 
-        # 3) Tear down all participant frames & previews
+        #Re-run build_frames, resetting threads & callbacks
         self.build_frames()
 
         # 4) Clear the bar plot back to its debug rectangle
