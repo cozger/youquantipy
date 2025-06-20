@@ -34,6 +34,7 @@ class Participant:
         self.async_results = OrderedDict()
         self.last_blend_scores = [0.0] * 52
         self.last_detected_faces = []
+        self.blend_labels = None
 
 
         # Load model buffer once
@@ -46,6 +47,10 @@ class Participant:
             with self._lock:
                 self.async_results[timestamp_ms] = res
                 self._detect_busy = False
+                if self.blend_labels is None and res.face_blendshapes:
+                    self.blend_labels = [
+                        cat.category_name for cat in res.face_blendshapes[0]
+                    ]
 
         # Callback for single-face blendshapes
         def _on_blendshape_result(res, image, timestamp_ms):
@@ -55,6 +60,10 @@ class Participant:
             with self._lock:
                 self.last_blend_scores = scores
                 self._detect_busy = False
+                if self.blend_labels is None and res.face_blendshapes:
+                  self.blend_labels = [
+                    cat.category_name for cat in res.face_blendshapes[0]
+                ]
 
         # ─── select and build exactly one landmarker ─────────────────────────────
         if self.multi_face_mode:

@@ -11,10 +11,13 @@ class ChannelCorrelator:
     Outputs a 52-channel float vector of comodulation magnitudes.
     """
     def __init__(self,
-                 window_size=5,
+                 window_size=50,
                  fps=30,
-                 delta_threshold=0.01,
-                 similarity_threshold=0.8):
+                 delta_threshold=0.05,
+                 similarity_threshold=0.6):
+        # Exit threshold to release state latching
+        self.exit_threshold = delta_threshold * 0.6
+        
         self.w = window_size
         self.fps = fps
         self.delta_threshold = delta_threshold
@@ -22,8 +25,6 @@ class ChannelCorrelator:
         # For state‐machine holding of sustained comodulation
         self.states     = np.zeros(52, dtype=bool)
         self.hold_vals  = np.zeros(52, dtype=float)
-        # Exit threshold to release state latching
-        self.exit_threshold = delta_threshold * 1
         # Buffers for rolling means
         self.buff1 = deque(maxlen=self.w)
         self.buff2 = deque(maxlen=self.w)

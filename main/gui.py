@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
 from pygrabber.dshow_graph import FilterGraph
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageOps
 import threading
 import queue
 import time
@@ -19,11 +19,16 @@ from correlator import ChannelCorrelator
 
 # Path to your Mediapipe face_landmarker.task
 MODEL_PATH = r"D:\Projects\MovieSynchrony\face_landmarker.task"
+try:
+    RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:       # Pillow <10
+    RESAMPLE = Image.LANCZOS
 
 def list_video_devices(max_devices=10):
     graph = FilterGraph()
     names = graph.get_input_devices()
     devices = []
+
     for i in range(min(len(names), max_devices)):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -43,18 +48,21 @@ class YouQuantiPyGUI(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.testing_mode = False
+        # Allows for mirroring in holistic mode. Will throw an error if used in multiface
+        self.testing_mode = False 
 
         # Load face_landmarker model buffer
         with open(MODEL_PATH, 'rb') as f:
             self.model_buf = f.read()
 
         print("[DEBUG] GUI __init__")
-        self.title("YouQuantiPy Multi-Participant Stream")
+        self.title("YouQuantiPy")
         self.geometry("1200x1050")
-        for col in range(5):
-            self.grid_columnconfigure(col, weight=1)
-        self.grid_rowconfigure(2, weight=0)
+        self.grid_columnconfigure(0, weight=0)   # fixed width  (left)
+        self.grid_columnconfigure(1, weight=1)   # expands      (middle  ♦)
+        self.grid_columnconfigure(2, weight=0)   # fixed width  (right)
+        # give the first row weight so everything grows vertically
+        self.grid_rowconfigure(0, weight=1)
 
         # Drawing utilities
         self.mp_drawing = mp.solutions.drawing_utils
@@ -62,7 +70,10 @@ class YouQuantiPyGUI(tk.Tk):
 
         # Synchrony plot correlator & face tracker
         self.correlator = ChannelCorrelator(window_size=60, fps=30)
-        self.face_tracker = FaceTracker(track_threshold=50, max_missed=1500)
+        self.face_tracker = FaceTracker(track_threshold=200, max_missed=1500)
+        self.enable_mesh = tk.BooleanVar(value=False)
+        self.multi_face_mode = tk.BooleanVar(value=False)
+
 
         self.data_stop_evt = threading.Event()
         self.data_thread = None
@@ -72,37 +83,51 @@ class YouQuantiPyGUI(tk.Tk):
         # UI controls
         self.participant_count = tk.IntVar(value=2)
         self.camera_count      = tk.IntVar(value=2)
-        tk.Label(self, text="Number of participants:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.part_spin = tk.Spinbox(self, from_=1, to=6, textvariable=self.participant_count,
-                command=self.build_frames, width=5)
-        self.part_spin.grid(     row=0, column=1, sticky="w", padx=5)
-        tk.Label(self, text="Number of cameras:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.cam_spin = tk.Spinbox(self, from_=1, to=self.participant_count.get(),
-                textvariable=self.camera_count,
-                command=self.build_frames, width=5)
-        self.participant_count.trace_add('write', lambda *args: 
-        self.cam_spin.config(to=self.participant_count.get())
-            )
-        self.cam_spin.grid(      row=1, column=1, sticky="w", padx=5)
+        # Left-side control panel
+        self.control_panel = ttk.Frame(self)
+        self.control_panel.grid(row=0, column=0, rowspan=3, sticky='ns', padx=10, pady=10)
+        self.grid_columnconfigure(0, weight=0)
+        # Participant count
+        ttk.Label(self.control_panel, text="Participants:").pack(anchor='w')
+        self.part_spin = tk.Spinbox(self.control_panel, from_=1, to=6, textvariable=self.participant_count,
+                                    command=self.build_frames, width=5)
+        self.part_spin.pack(anchor='w', pady=(0,20))
 
-        self.enable_mesh = tk.BooleanVar(value=False)
-        self.multi_face_mode = tk.BooleanVar(value=False)
-        tk.Checkbutton(self, text="Enable full FaceMesh", variable=self.enable_mesh).grid(row=0, column=2, padx=5)
-        tk.Checkbutton(self,text="Enable Multi-Face Mode", variable=self.multi_face_mode,
-                command=self.on_mode_toggle
-            ).grid(row=1, column=2, padx=5, pady=5)
-        tk.Button(self, text="Start Data Stream", command=self.start_stream).grid(row=0, column=3, padx=10)
-        tk.Button(self, text="Stop Data Stream",  command=self.stop_stream).grid(row=0, column=4, padx=10)
-        tk.Button(self, text="Reset", command=self.reset).grid(row=0, column=5, padx=10)
+        # Camera count
+        ttk.Label(self.control_panel, text="Cameras:").pack(anchor='w')
+        self.cam_spin = tk.Spinbox(self.control_panel, from_=1, to=self.participant_count.get(),
+                                textvariable=self.camera_count,
+                                command=self.build_frames, width=5)
+        self.cam_spin.pack(anchor='w', pady=(0,15))
 
+        # Toggles
+        ttk.Checkbutton(self.control_panel, text="Enable full FaceMesh", variable=self.enable_mesh).pack(anchor='w')
+        ttk.Checkbutton(self.control_panel, text="Enable Multi-Face Mode",
+                        variable=self.multi_face_mode, command=self.on_mode_toggle).pack(anchor='w', pady=(0,50))
+
+        # Action Buttons
+        ttk.Button(self.control_panel, text="Start Data Stream", command=self.start_stream).pack(fill='x', pady=(2))
+        ttk.Button(self.control_panel, text="Stop Data Stream", command=self.stop_stream).pack(fill='x', pady=(2))
+        ttk.Button(self.control_panel, text="Reset", command=self.reset).pack(fill='x', pady=(2))
+       
         # Layout for previews
         self.container = ttk.Frame(self)
-        self.container.grid(row=2, column=0, columnspan=4, pady=10, sticky='ew')
-        self.container.grid_columnconfigure(tuple(range(4)), weight=1)
-        self.bar_canvas = tk.Canvas(self, bg='white', width=200)
-        self.bar_canvas.grid(row=1, column=4, rowspan=2, sticky='ns', padx=(10,0))
-        self.grid_columnconfigure(4, weight=0)
+        self.container.grid(row=0, column=1, columnspan=1, rowspan=1, pady=10, sticky='nsew')
+        self.container.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        #Comod plot frame
+        self.comod_frame = ttk.Frame(self)
+        self.comod_frame.grid(row=0, column=2, sticky='nsew', padx=(10, 0))
+        self.grid_columnconfigure(2, weight=0)
 
+        self.bar_label  = tk.Label(self.comod_frame, text="Co-Modulation",
+                            font=("Arial", 10, "bold"))
+        self.bar_label.pack(anchor='nw')
+
+        self.bar_canvas = tk.Canvas(self.comod_frame, bg='white',
+                                    width=250, height=700)
+        self.bar_canvas.pack(fill='both', expand=True)
         self.frames = []
         self.build_frames()
         self.after(30, self.preview_comodulation)
@@ -150,21 +175,31 @@ class YouQuantiPyGUI(tk.Tk):
 
         for i in range(self.camera_count.get()):
             frame = ttk.LabelFrame(self.container, text=f"Camera {i}")  
-            frame.grid(row=0, column=i, padx=5, sticky='n')
+            frame.grid(row=0, column=i, padx=5, sticky='nsew')
+            self.container.grid_columnconfigure(i, weight=1)
+            self.container.grid_rowconfigure(0, weight=1) 
             frame.grid_columnconfigure(0, weight=1)
-
-            if not self.multi_face_mode.get():                              
-               ent = tk.Entry(frame, width=15)
-               ent.pack()                                                  
+            frame.grid_rowconfigure(1, weight=1)
+            row = 0
+            if not self.multi_face_mode.get():
+                ent = ttk.Entry(frame, width=15)
+                ent.grid(row=row, column=0, sticky='w', padx=4, pady=2)
+                row += 1
             else:
-               ent = None # no per-camera name in multi-face mode
+                ent = None
 
-            canvas = tk.Canvas(frame, width=400, height=300); canvas.pack(pady=5)
-            meta = tk.Label(frame, text="ID: -, Stream: -"); meta.pack(pady=(0,5))
-            tk.Label(frame, text="Camera:").pack()
+            #Stretchy canvas
+            canvas = tk.Canvas(frame, bg='black')
+            canvas.grid(row=1, column=0, sticky='nsew', padx=2, pady=2)
+
+            #Meta label + combobox sit under the canvas
+            meta = ttk.Label(frame, text="ID: -, Stream: -")
+            meta.grid(row=2, column=0, sticky='w', padx=2, pady=(4,0))
+
             cmb = ttk.Combobox(frame, values=cam_vals, state='readonly', width=30)
             if cam_vals: cmb.current(0)
-            cmb.pack(pady=(0,5))
+            cmb.grid(row=4, column=0, sticky='we', padx=2, pady=(0,4))
+            frame.grid_columnconfigure(0, weight=1)   
 
             stop_evt = threading.Event()
             frame_queue = queue.Queue(maxsize=1)
@@ -246,8 +281,7 @@ class YouQuantiPyGUI(tk.Tk):
                 ent = ttk.Entry(row, width=20)
                 ent.pack(side='left', padx=5)
                 self.multi_entries.append(ent)
-            
-
+                
     def preview_loop(self, idx):
         print(f"[DEBUG] preview_loop started for participant {idx}")
         info = self.frames[idx]
@@ -262,54 +296,42 @@ class YouQuantiPyGUI(tk.Tk):
 
             # get width/height ONCE, up front
             h, w, _ = frame.shape
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             disp = frame.copy()
             mesh_vals = []
             pose_vals = []
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Multi face mode (FaceLandmarker) ---------------------------------
             if p.multi_face_mode:
-                # ------------------------------------------------------------------
-                # 1) ***PULL the oldest ready result BEFORE launching a new request***
-                # ------------------------------------------------------------------
-                with p._lock:                                           # <<<
-                    if p.async_results:                                 # <<<
-                        _, res = p.async_results.popitem(last=False)    # FIFO pop  # <<<
-                    else:                                               # <<<
-                        res = None                                      # <<<
+                # 1) pull oldest result
+                with p._lock:
+                    if p.async_results:
+                        _, res = p.async_results.popitem(last=False)
+                    else:
+                        res = None
 
-                if res:                                                 # <<<
-                    faces = p._parse_multiface_result(res, w, h)        # <<<
-                    p.last_detected_faces = faces                       # <<<
-                else:                                                   # <<<
-                    faces = p.last_detected_faces                       # <<<
+                if res:
+                    faces = p._parse_multiface_result(res, w, h)
+                    p.last_detected_faces = faces
+                else:
+                    faces = p.last_detected_faces
 
-                # ------------------------------------------------------------------
-                # 2) ***Now schedule the NEXT async detection***
-                # ------------------------------------------------------------------
+                # 2) schedule next detection
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                ts_send = int(time.monotonic() * 1000)
+                prev_ts = getattr(p, 'last_sent_ts', 0)
+                if ts_send <= prev_ts:
+                    ts_send = prev_ts + 1
+                p.last_sent_ts = ts_send
+                p.multiface_landmarker.detect_async(mp_img, timestamp_ms=ts_send)
 
-                ts_send = int(time.monotonic() * 1000)                  # <<<
-                prev_ts = getattr(p, 'last_sent_ts', 0)                 # <<<
-                if ts_send <= prev_ts:                                  # ensure monotonicity  # <<<
-                    ts_send = prev_ts + 1                               # <<<
-                p.last_sent_ts = ts_send                                # <<<
-
-                p.multiface_landmarker.detect_async(                    # <<<
-                    mp_img, timestamp_ms=ts_send)                       # <<<
-
-                # ------------------------------------------------------------------
-                # 3) Track, draw, stream, GUI fallbacks (unchanged logic)
-                # ------------------------------------------------------------------
+                # 3) draw + stream
                 detections = [f['centroid'] for f in faces]
-                ids        = self.face_tracker.update(detections)
-
-                # Draw landmarks and tessellation
+                ids = self.face_tracker.update(detections)
                 for fdata in faces:
-                    converted = [landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z) for pt in fdata['landmarks']]
+                    converted = [landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z)
+                                for pt in fdata['landmarks']]
                     landmark_list = landmark_pb2.NormalizedLandmarkList(landmark=converted)
-
                     self.mp_drawing.draw_landmarks(
                         disp,
                         landmark_list,
@@ -317,38 +339,40 @@ class YouQuantiPyGUI(tk.Tk):
                         None,
                         self.mp_styles.get_default_face_mesh_tesselation_style()
                     )
-
-                # Overlay IDs
                 for (cx, cy), fid in zip(detections, ids):
                     # default label
                     label = f"ID {fid}"
-                    # if in multi-face mode and our entries exist, try to read a name
+                     # only try to read a name if we have an entry for this face‐ID
                     if self.multi_face_mode.get() and hasattr(self, 'multi_entries'):
-                        idx = fid - 1
-                        if 0 <= idx < len(self.multi_entries):
-                            name = self.multi_entries[idx].get().strip()
+                        entry_idx = fid - 1
+                        if 0 <= entry_idx < len(self.multi_entries):
+                            name = self.multi_entries[entry_idx].get().strip()
                             if name:
                                 label = name
-
+    
                     cv2.putText(
                         disp,
                         label,
-                        (cx - 30, cy - 240),               # “above head” coords
+                        (cx - 30, cy - 240),  # “above head” coords
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        2.2,                                # your chosen fontScale
+                        2.2,                   # your chosen fontScale
                         (255, 255, 0),
                         3
                     )
-
-                # LSL push
-                if self.streaming:  
+                if self.streaming:
                     p.push_multiface_samples(
-                        faces        = faces,
-                        face_ids     = ids,
-                        include_mesh = self.enable_mesh.get()
+                        faces=faces,
+                        face_ids=ids,
+                        include_mesh=self.enable_mesh.get()
                     )
 
-                # GUI fallback arrays
+
+                # ——— store ALL face blends for downstream plotting/correlator ———
+                info['face_blends'] = {
+                    fid: fdata['blend']
+                    for fdata, fid in zip(faces, ids)
+                }
+                                # update fallback arrays and scores
                 if faces:
                     self.last_mesh_vals = faces[0]['mesh']
                     self.last_scores    = faces[0]['blend']
@@ -356,13 +380,17 @@ class YouQuantiPyGUI(tk.Tk):
                     self.last_mesh_vals = [0.0] * (478*3)
                     self.last_scores    = [0.0] * 52
 
-            # Holistic mode (holistic model) --------------------------------
+                scores = self.last_scores
+
+            # Holistic mode (holistic model) -----------------------------------
             else:
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts = int(time.monotonic() * 1000)
                 p.face_landmarker.detect_async(mp_img, timestamp_ms=ts)
                 p.last_requested_ts = ts
+
                 res = p.holistic.process(rgb)
+                # draw face + pose
                 self.mp_drawing.draw_landmarks(
                     disp, res.face_landmarks,
                     mp.solutions.holistic.FACEMESH_TESSELATION,
@@ -373,25 +401,34 @@ class YouQuantiPyGUI(tk.Tk):
                     mp.solutions.holistic.POSE_CONNECTIONS,
                     self.mp_styles.get_default_pose_landmarks_style()
                 )
-                if res.face_landmarks:
-                    mesh_vals = [coord for lm in res.face_landmarks.landmark for coord in (lm.x, lm.y, lm.z)]
-                else:
-                    mesh_vals = [0.0]*(468*3)
-                if res.pose_landmarks:
-                    pose_vals = [coord for lm in res.pose_landmarks.landmark for coord in (lm.x, lm.y, lm.z, lm.visibility)]
-                else:
-                    pose_vals = [0.0]*(33*4)
 
+                # extract mesh & pose values
+                if res.face_landmarks:
+                    mesh_vals = [coord for lm in res.face_landmarks.landmark
+                                for coord in (lm.x, lm.y, lm.z)]
+                else:
+                    mesh_vals = [0.0] * (468*3)
+
+                if res.pose_landmarks:
+                    pose_vals = [coord for lm in res.pose_landmarks.landmark
+                                for coord in (lm.x, lm.y, lm.z, lm.visibility)]
+                else:
+                    pose_vals = [0.0] * (33*4)
+
+                # —— NEW: pull blendshape scores from participant ——
+                scores = getattr(p, 'last_blend_scores', [0.0] * 52)
+
+            # store for correlator & GUI
             info['last_mesh_vals'] = mesh_vals
             info['last_pose_vals'] = pose_vals
+            info['last_scores']    = scores
 
-            scores = info.get('last_scores', [0.0]*52)
-
+            # draw green bar plot
             h, w, _ = disp.shape
             bar_h = h // 52
             for j, s in enumerate(scores):
-                y0, y1 = j*bar_h, (j+1)*bar_h
-                cv2.rectangle(disp, (0, y0), (int(s*150), y1), (0,255,0), -1)
+                y0, y1 = j * bar_h, (j + 1) * bar_h
+                cv2.rectangle(disp, (0, y0), (int(s * 150), y1), (0, 255, 0), -1)
 
             if not q.full():
                 q.put(disp)
@@ -400,37 +437,69 @@ class YouQuantiPyGUI(tk.Tk):
 
     def schedule_preview(self, idx):
         info   = self.frames[idx]
-        canvas = info['canvas']
+        canvas = info['canvas']       # ← define canvas first!
         q      = info['frame_queue']
+
         try:
+            # get the latest frame (non-blocking)
             disp = q.get_nowait()
-            imgtk = ImageTk.PhotoImage(
-                Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)).resize((400,300))
-            )
-            # clear old image before drawing new
+
+            # make sure geometry is up-to-date before reading width/height
+            canvas.update_idletasks()
+
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            if cw <= 1 or ch <= 1:     # window not realised yet
+                self.after(30, self.schedule_preview, idx)
+                return
+
+            # ----- choose CONTAIN (letter-box) or COVER (crop) -----
+            pil_img = Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+
+            # A) letter-box (no cropping) – uncomment if you prefer
+            fitted = ImageOps.contain(pil_img, (cw, ch), method=RESAMPLE)
+
+            # B) fill + crop (current behaviour)
+            # fitted = ImageOps.fit(pil_img, (cw, ch), method=RESAMPLE)
+            # -------------------------------------------------------
+
+            imgtk = ImageTk.PhotoImage(fitted)
+
             canvas.delete('all')
-            canvas.create_image(0,0,anchor='nw',image=imgtk)
-            canvas.image = imgtk
+            # centre the image in the canvas
+            canvas.create_image(cw // 2, ch // 2, image=imgtk, anchor='center')
+            canvas.image = imgtk            # keep a reference!
+
         except queue.Empty:
             pass
-        # self.check_auto_start()
+
         if not info['stop_evt'].is_set():
-            # schedule next preview and overwrite the stored after-id
             info['after_id'] = self.after(30, self.schedule_preview, idx)
 
+
     def preview_comodulation(self):
-        """
-        Continuously compute and display comodulation magnitudes using
-        the correlator.update(...) method, independent of LSL streaming.
-        """
-        if len(self.frames) >= 2:
-            s1 = self.frames[0].get('last_scores')
-            s2 = self.frames[1].get('last_scores')
-            if s1 is not None and s2 is not None:
+        if self.multi_face_mode.get():
+            # single-camera, multi-face: grab the first two faces’ blends
+            info = self.frames[0]
+            blends = info.get('face_blends', {})      # dict: face_id → [52 scores]
+            if len(blends) >= 2:
+                # pick two IDs in some order (e.g. sorted, or based on your spinbox entries)
+                fid1, fid2 = sorted(blends.keys())[:2]
+                s1, s2 = blends[fid1], blends[fid2]
                 corr = self.correlator.update(np.array(s1), np.array(s2))
                 if corr is not None:
                     self.update_plot(corr)
+        else:
+            # existing holistic logic
+            if len(self.frames) >= 2:
+                s1 = self.frames[0].get('last_scores')
+                s2 = self.frames[1].get('last_scores')
+                corr = self.correlator.update(np.array(s1), np.array(s2))
+                if corr is not None:
+                    self.update_plot(corr)
+
+        # schedule next call
         self.after(30, self.preview_comodulation)
+
 
     def update_plot(self, corr):
         c = self.bar_canvas
@@ -439,46 +508,51 @@ class YouQuantiPyGUI(tk.Tk):
             return
         self._last_plot = now
 
-        c = self.bar_canvas
+        # Lazy load labels
+        if getattr(self, 'blend_labels', None) is None:
+            for info in self.frames:
+                p = info.get('participant')
+                labels = getattr(p, 'blend_labels', None)
+                if labels:
+                    self.blend_labels = labels
+                    break
+
         c.delete('all')
         W, H = c.winfo_width(), c.winfo_height()
-
-        if corr is None:
+        n = len(corr)
+        if n == 0:
             c.create_text(W//2, H//2, text="No data", fill='gray')
             return
 
-        n = len(corr)
-        bar_h = max(4, H / n)
-        label_w = 100      # width reserved for labels on left
-        margin  = 5        # space between label and bar
-        bg = (255,255,255)
+        bar_h = max(10, H / n)  # Increased min height
+        font_size = int(bar_h * 0.5)  # Dynamic font size
+        font = ('Arial', max(6, font_size))
+        label_w = 100
+        margin = 5
+        bg = (255, 255, 255)
 
         for i, val in enumerate(corr):
             y0 = i * bar_h
             y1 = y0 + bar_h - 1
             x0 = label_w + margin
-            length = val * (W - label_w - 2*margin)
+            length = val * (W - label_w - 2 * margin)
             x1 = x0 + length
 
-            # blend green/red toward white
-            base = (0,255,0) if val >= 0 else (255,0,0)
-            a    = min(max(abs(val), 0.0), 1.0)
-            r = int(bg[0] + (base[0]-bg[0]) * a)
-            g = int(bg[1] + (base[1]-bg[1]) * a)
-            b = int(bg[2] + (base[2]-bg[2]) * a)
+            # Label
+            lbl = self.blend_labels[i] if self.blend_labels and i < len(self.blend_labels) else str(i)
+            cy = int(y0 + bar_h / 2)
+
+            # Color blend
+            base = (0, 255, 0) if val >= 0 else (255, 0, 0)
+            a = min(max(abs(val), 0.0), 1.0)
+            r = int(bg[0] + (base[0] - bg[0]) * a)
+            g = int(bg[1] + (base[1] - bg[1]) * a)
+            b = int(bg[2] + (base[2] - bg[2]) * a)
             color = f'#{r:02x}{g:02x}{b:02x}'
 
-            # draw the horizontal bar
+            # Draw bar and text
             c.create_rectangle(x0, y0, x1, y1, fill=color, outline='')
-
-            # blendshape label to the left
-            if self.blend_labels:
-                c.create_text(
-                    label_w - margin, y0 + bar_h/2,
-                    text=self.blend_labels[i],
-                    anchor='e',
-                    font=('Arial', 8)
-                )
+            c.create_text(label_w - margin, cy, text=lbl, anchor='e', font=font, fill='black')
 
     def combined_loop(self):
         p1, p2 = self.frames[0]['participant'], self.frames[1]['participant']
@@ -623,7 +697,6 @@ class YouQuantiPyGUI(tk.Tk):
                 info['meta_label'].config(text="ID: -, Stream: -")
 
             self.bar_canvas.delete('all')
-            self.bar_canvas.create_rectangle(10,10,110,60, fill='red', tags='debug')
             self.correlator.close()
 
         self.after(50, _cleanup)
