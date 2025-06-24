@@ -1,16 +1,18 @@
 import tkinter as tk
 from tkinter import ttk
 from pygrabber.dshow_graph import FilterGraph
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image
 import threading
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+
 import queue
 import time
+import base64
 
 import numpy as np
 import cv2
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
 
 from participant import Participant
@@ -37,11 +39,56 @@ def list_video_devices(max_devices=10):
             continue
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if (actual_w, actual_h) != (1920, 1080):
+        if (actual_w, actual_h) != (640, 480):
             print(f"[GUI] Warning: Device {i} locked to {actual_w}×{actual_h}")
         devices.append((i, names[i], actual_w, actual_h))
         cap.release()
     return devices
+
+
+def frame_to_tk(bgr, target_wh, mode="contain"):
+    """
+    Fast BGR → Tk PhotoImage.
+
+    • mode="contain"   keep the whole frame, add letter-boxing (old ImageOps.contain)
+    • mode="cover"     fill & crop centre (old ImageOps.fit)
+
+    Args
+    ----
+    bgr : np.ndarray   original frame
+    target_wh : tuple  (canvas_w, canvas_h)
+    mode : str         "contain" | "cover"
+    """
+    cw, ch = target_wh
+    h, w   = bgr.shape[:2]
+
+    # --- compute scale ----------------------------------------------------
+    if mode == "cover":           # fill, then crop centre
+        scale = max(cw / w, ch / h)
+    else:                          # default = contain / letter-box
+        scale = min(cw / w, ch / h)
+
+    if scale != 1.0:
+        bgr = cv2.resize(
+            bgr,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    # --- centre-crop for "cover" ------------------------------------------
+    if mode == "cover":
+        h, w = bgr.shape[:2]
+        x0 = (w - cw) // 2
+        y0 = (h - ch) // 2
+        bgr = bgr[y0 : y0 + ch, x0 : x0 + cw]
+    # for "contain" we keep full frame; Tk centres it later
+
+    # --- encode PNG + base64 for Tk ---------------------------------------
+    ok, png = cv2.imencode(".png", bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    if not ok:
+        return None
+
+    return tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
 
 class YouQuantiPyGUI(tk.Tk):
     BAR_HEIGHT = 150
@@ -51,6 +98,7 @@ class YouQuantiPyGUI(tk.Tk):
         # Allows for mirroring in holistic mode. Will throw an error if used in multiface
         self.testing_mode = False 
 
+        self.exec = ThreadPoolExecutor(max_workers=24)
         # Load face_landmarker model buffer
         with open(MODEL_PATH, 'rb') as f:
             self.model_buf = f.read()
@@ -83,6 +131,20 @@ class YouQuantiPyGUI(tk.Tk):
         # UI controls
         self.participant_count = tk.IntVar(value=2)
         self.camera_count      = tk.IntVar(value=2)
+        def _sync_counts(var_name, index, mode):
+            """Mirror participants⇆cameras in holistic mode."""
+            if not self.multi_face_mode.get():
+                # participant changed → update cameras
+                if var_name == self.participant_count._name:
+                    self.camera_count.set(max(1, self.participant_count.get()))
+                # camera changed → update participants
+                elif var_name == self.camera_count._name:
+                    self.participant_count.set(max(1, self.camera_count.get()))
+        # attach trace callbacks (write-only)
+        self._sync_counts = _sync_counts
+        self.participant_count.trace_add('write', self._sync_counts)
+        self.camera_count.trace_add('write',      self._sync_counts)
+        
         # Left-side control panel
         self.control_panel = ttk.Frame(self)
         self.control_panel.grid(row=0, column=0, rowspan=3, sticky='ns', padx=10, pady=10)
@@ -130,29 +192,37 @@ class YouQuantiPyGUI(tk.Tk):
         self.bar_canvas.pack(fill='both', expand=True)
         self.frames = []
         self.build_frames()
-        self.after(30, self.preview_comodulation)
+        self._comod_after_id = self.after(30, self.preview_comodulation)
+
 
     def on_mode_toggle(self):
-        """Lock or unlock spinboxes when switching modes."""
-        hol = not self.multi_face_mode.get()
-        state = 'disabled' if hol else 'normal'
-        # lock both counts in holistic mode
-        self.part_spin.config(state=state)
-        self.cam_spin .config(state=state)
-
-        # rebuild feeds & name panels immediately
+        if self.multi_face_mode.get():          # ── Multi-face
+            # lock both boxes
+            # single camera, but dynamic participants
+            self.cam_spin .config(state='disabled')
+            self.camera_count.set(1)
+            self.part_spin.config(state='normal')
+ 
+        else:                                   # ── Holistic
+            # enable and let the trace keep them equal
+            # both spinboxes enabled and mirrored
+            self.part_spin.config(state='normal')
+            self.cam_spin .config(state='normal')
+        # re-sync counts by passing in any of the traced var names
+        self._sync_counts(self.participant_count._name, None, None)
+        # rebuild frames immediately
         self.build_frames()
 
 
-    def on_landmarker_result(self, idx, result, output_image, timestamp_ms):
+    def on_landmarker_result(self, idx, result):
         info = self.frames[idx]
         if result.face_blendshapes:
             scores = [cat.score for cat in result.face_blendshapes[0]]
         else:
             scores = []
         scores += [0.0] * (52 - len(scores))
-        if p.last_blend_scores:
-            self.last_scores = list(p.last_blend_scores)
+        if hasattr(info['participant'], 'last_blend_scores'):
+            self.last_scores = list(info['participant'].last_blend_scores)
 
 
         if self.blend_labels is None and result.face_blendshapes:
@@ -161,16 +231,49 @@ class YouQuantiPyGUI(tk.Tk):
 
     def build_frames(self):
         print("[DEBUG] build_frames called")
-        # Teardown existing frames
-        for i, info in enumerate(self.frames):
-            info['stop_evt'].set()
-            if info.get('thread'): info['thread'].join()
-            if info.get('participant') and not (self.testing_mode and i>0):
-                info['participant'].release()
-            info['frame'].destroy()
+        print(f"[DEBUG] build_frames: about to tear down {len(self.frames)} frames")
+
+        # --- cancel any lingering preview callbacks before teardown ---
+        for info in self.frames:
+            aid = info.get('after_id')
+            if aid:
+                try:
+                    self.after_cancel(aid)
+                except tk.TclError:
+                    pass
+        #destroy all frames
+        for widget in self.container.winfo_children():
+            widget.destroy()
         self.frames.clear()
 
+        # Teardown existing frames
+        for i, info in enumerate(self.frames):
+            print(f"tearing down frame {i}")
+            # 1) Release the camera first so cap.read() unblocks:
+            if info.get('participant') and not (self.testing_mode and i>0):
+                info['participant'].release()
+            # 2) Signal the thread to stop
+            info['stop_evt'].set()
+            # 3) Join (optionally with a short timeout)
+            if info.get('thread'):
+                info['thread'].join(timeout=1.0)
+            # info['frame'].destroy()
+            # self.frames.clear()
+
         self.cams = list_video_devices()
+        # holistically mirror cameras to participants; multiface always 1
+        if self.multi_face_mode.get():
+            cams = 1
+        else:
+            # clamp camera_count to [1, participant_count]
+            cams = max(1, min(self.camera_count.get(), self.participant_count.get()))
+        # update the IntVar and the spinbox bounds
+        self.camera_count.set(cams)
+        if self.multi_face_mode.get():
+            self.cam_spin.config(to=1)
+        else:
+            self.cam_spin.config(to=self.participant_count.get())
+        # Build camera selection values
         cam_vals = [f"{i}: {name} ({w}x{h})" for i,name,w,h in self.cams]
 
         for i in range(self.camera_count.get()):
@@ -261,6 +364,8 @@ class YouQuantiPyGUI(tk.Tk):
                 'frame_queue': frame_queue,
                 'detect_count': 0, 'last_scores': [0.0]*52
             })
+            self.frames[-1]['face_tracker'] = FaceTracker(track_threshold=200, max_missed=1500)
+
             
         # first, remove any old panel
         if hasattr(self, 'multi_panel'):
@@ -281,215 +386,262 @@ class YouQuantiPyGUI(tk.Tk):
                 ent = ttk.Entry(row, width=20)
                 ent.pack(side='left', padx=5)
                 self.multi_entries.append(ent)
-                
-    def preview_loop(self, idx):
-        print(f"[DEBUG] preview_loop started for participant {idx}")
+    # --------------------------------------------------------------------
+    #                BACKGROUND WORKER – runs inside EXEC
+    # --------------------------------------------------------------------
+    def process_frame(self, idx, frame_bgr, multi_face_enabled):
+        """
+        Heavy work: MediaPipe detection, landmark drawing, labels & LSL push.
+        Runs in a worker thread, returns a fully rendered BGR image.
+        """
         info = self.frames[idx]
-        p = info['participant']
-        stop = info['stop_evt']
-        q = info['frame_queue']
+        p    = info['participant']
+
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        disp = frame_bgr.copy()
+        mesh_vals = []
+        pose_vals = []
+
+        # Multi face mode (FaceLandmarker) ---------------------------------
+        if p.multi_face_mode:
+            # 1) pull oldest result
+            with p._lock:
+                if p.async_results:
+                    _, res = p.async_results.popitem(last=False)
+                else:
+                    res = None
+
+            if res:
+                h, w = frame_bgr.shape[:2]
+                faces = p._parse_multiface_result(res, w, h)
+                p.last_detected_faces = faces
+            else:
+                faces = p.last_detected_faces
+
+            # 2) schedule next detection
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts_send = int(time.monotonic() * 1000)
+            prev_ts = getattr(p, 'last_sent_ts', 0)
+            if ts_send <= prev_ts:
+                ts_send = prev_ts + 1
+            p.last_sent_ts = ts_send
+            p.multiface_landmarker.detect_async(mp_img, timestamp_ms=ts_send)
+
+            # 3) draw + stream
+            detections = [f['centroid'] for f in faces]
+            tracker = info['face_tracker']
+            ids = tracker.update(detections)
+            for fdata in faces:
+                converted = [landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z)
+                            for pt in fdata['landmarks']]
+                landmark_list = landmark_pb2.NormalizedLandmarkList(landmark=converted)
+                self.mp_drawing.draw_landmarks(
+                    disp,
+                    landmark_list,
+                    mp.solutions.face_mesh.FACEMESH_TESSELATION,
+                    None,
+                    self.mp_styles.get_default_face_mesh_tesselation_style()
+                )
+            for (cx, cy), fid in zip(detections, ids):
+                # default label
+                label = f"ID {fid}"
+                # only try to read a name if we have an entry for this face‐ID
+                if multi_face_enabled and hasattr(self, 'multi_entries'):
+                    entry_idx = fid - 1
+                    if 0 <= entry_idx < len(self.multi_entries):
+                        name = self.multi_entries[entry_idx].get().strip()
+                        if name:
+                            label = name
+
+                cv2.putText(
+                    disp,
+                    label,
+                    (cx - 30, cy - 240),  # “above head” coords
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    2.2,                   # your chosen fontScale
+                    (255, 255, 0),
+                    3
+                )
+            if self.streaming:
+                p.push_multiface_samples(
+                    faces=faces,
+                    face_ids=ids,
+                    include_mesh=self.enable_mesh.get()
+                )
+
+
+            # ——— store ALL face blends for downstream plotting/correlator ———
+            info['face_blends'] = {
+                fid: fdata['blend']
+                for fdata, fid in zip(faces, ids)
+            }
+                            # update fallback arrays and scores
+            if faces:
+                self.last_mesh_vals = faces[0]['mesh']
+                self.last_scores    = faces[0]['blend']
+            else:
+                self.last_mesh_vals = [0.0] * (478*3)
+                self.last_scores    = [0.0] * 52
+
+            scores = self.last_scores
+
+        # Holistic mode (holistic model) -----------------------------------
+        else:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts = int(time.monotonic() * 1000)
+            prev_ts = getattr(p, 'last_sent_ts', 0)
+            if ts <= prev_ts:
+                ts = prev_ts + 1
+            p.last_sent_ts = ts
+            p.face_landmarker.detect_async(mp_img, timestamp_ms=ts)
+            p.last_requested_ts = ts
+
+            res = p.holistic.process(rgb)
+            # draw face + pose
+            self.mp_drawing.draw_landmarks(
+                disp, res.face_landmarks,
+                mp.solutions.holistic.FACEMESH_TESSELATION,
+                None, self.mp_styles.get_default_face_mesh_tesselation_style()
+            )
+            self.mp_drawing.draw_landmarks(
+                disp, res.pose_landmarks,
+                mp.solutions.holistic.POSE_CONNECTIONS,
+                self.mp_styles.get_default_pose_landmarks_style()
+            )
+
+            # extract mesh & pose values
+            if res.face_landmarks:
+                mesh_vals = [coord for lm in res.face_landmarks.landmark
+                            for coord in (lm.x, lm.y, lm.z)]
+            else:
+                mesh_vals = [0.0] * (468*3)
+
+            if res.pose_landmarks:
+                pose_vals = [coord for lm in res.pose_landmarks.landmark
+                            for coord in (lm.x, lm.y, lm.z, lm.visibility)]
+            else:
+                pose_vals = [0.0] * (33*4)
+
+            # —— NEW: pull blendshape scores from participant ——
+            scores = getattr(p, 'last_blend_scores', [0.0] * 52)
+
+        # store for correlator & GUI
+        info['last_mesh_vals'] = mesh_vals
+        info['last_pose_vals'] = pose_vals
+        info['last_scores']    = scores
+
+        # draw green bar plot
+        h, w, _ = disp.shape
+        bar_h = h // 52
+        for j, s in enumerate(scores):
+            y0, y1 = j * bar_h, (j + 1) * bar_h
+            cv2.rectangle(disp, (0, y0), (int(s * 150), y1), (0, 255, 0), -1)
+            
+        return disp      # BGR image ready for the GUI
+
+    def preview_loop(self, idx):
+        info   = self.frames[idx]
+        p      = info['participant']
+        q      = info['frame_queue']
+        stop   = info['stop_evt']
+
+        t0 = time.perf_counter()
+        frame_idx = 0
 
         while not stop.is_set():
-            success, frame = p.cap.read()
-            if not success:
+            ok, frame = p.cap.read()
+            if not ok:
                 continue
 
-            # get width/height ONCE, up front
-            h, w, _ = frame.shape
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            disp = frame.copy()
-            mesh_vals = []
-            pose_vals = []
+            frame_idx += 1
 
-            # Multi face mode (FaceLandmarker) ---------------------------------
-            if p.multi_face_mode:
-                # 1) pull oldest result
-                with p._lock:
-                    if p.async_results:
-                        _, res = p.async_results.popitem(last=False)
-                    else:
-                        res = None
+            # ---------- MULTI-FACE asynchronously ----------
+            if self.multi_face_mode.get():
+                # queue has size 1 ⇒ if full, replace the old Future
+                if q.full():
+                    try:
+                        q.get_nowait()        # drop oldest future
+                    except queue.Empty:
+                        pass
 
-                if res:
-                    faces = p._parse_multiface_result(res, w, h)
-                    p.last_detected_faces = faces
-                else:
-                    faces = p.last_detected_faces
+                fut = self.exec.submit(self.process_frame, idx, frame, True)
+                q.put_nowait(fut)
 
-                # 2) schedule next detection
-                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                ts_send = int(time.monotonic() * 1000)
-                prev_ts = getattr(p, 'last_sent_ts', 0)
-                if ts_send <= prev_ts:
-                    ts_send = prev_ts + 1
-                p.last_sent_ts = ts_send
-                p.multiface_landmarker.detect_async(mp_img, timestamp_ms=ts_send)
-
-                # 3) draw + stream
-                detections = [f['centroid'] for f in faces]
-                ids = self.face_tracker.update(detections)
-                for fdata in faces:
-                    converted = [landmark_pb2.NormalizedLandmark(x=pt.x, y=pt.y, z=pt.z)
-                                for pt in fdata['landmarks']]
-                    landmark_list = landmark_pb2.NormalizedLandmarkList(landmark=converted)
-                    self.mp_drawing.draw_landmarks(
-                        disp,
-                        landmark_list,
-                        mp.solutions.face_mesh.FACEMESH_TESSELATION,
-                        None,
-                        self.mp_styles.get_default_face_mesh_tesselation_style()
-                    )
-                for (cx, cy), fid in zip(detections, ids):
-                    # default label
-                    label = f"ID {fid}"
-                     # only try to read a name if we have an entry for this face‐ID
-                    if self.multi_face_mode.get() and hasattr(self, 'multi_entries'):
-                        entry_idx = fid - 1
-                        if 0 <= entry_idx < len(self.multi_entries):
-                            name = self.multi_entries[entry_idx].get().strip()
-                            if name:
-                                label = name
-    
-                    cv2.putText(
-                        disp,
-                        label,
-                        (cx - 30, cy - 240),  # “above head” coords
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        2.2,                   # your chosen fontScale
-                        (255, 255, 0),
-                        3
-                    )
-                if self.streaming:
-                    p.push_multiface_samples(
-                        faces=faces,
-                        face_ids=ids,
-                        include_mesh=self.enable_mesh.get()
-                    )
-
-
-                # ——— store ALL face blends for downstream plotting/correlator ———
-                info['face_blends'] = {
-                    fid: fdata['blend']
-                    for fdata, fid in zip(faces, ids)
-                }
-                                # update fallback arrays and scores
-                if faces:
-                    self.last_mesh_vals = faces[0]['mesh']
-                    self.last_scores    = faces[0]['blend']
-                else:
-                    self.last_mesh_vals = [0.0] * (478*3)
-                    self.last_scores    = [0.0] * 52
-
-                scores = self.last_scores
-
-            # Holistic mode (holistic model) -----------------------------------
+            # ---------- HOLISTIC synchronously --------------
             else:
-                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                ts = int(time.monotonic() * 1000)
-                p.face_landmarker.detect_async(mp_img, timestamp_ms=ts)
-                p.last_requested_ts = ts
+                disp = self.process_frame(idx, frame, False)
+                fut  = concurrent.futures.Future()
+                fut.set_result(disp)
 
-                res = p.holistic.process(rgb)
-                # draw face + pose
-                self.mp_drawing.draw_landmarks(
-                    disp, res.face_landmarks,
-                    mp.solutions.holistic.FACEMESH_TESSELATION,
-                    None, self.mp_styles.get_default_face_mesh_tesselation_style()
-                )
-                self.mp_drawing.draw_landmarks(
-                    disp, res.pose_landmarks,
-                    mp.solutions.holistic.POSE_CONNECTIONS,
-                    self.mp_styles.get_default_pose_landmarks_style()
-                )
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                q.put_nowait(fut)
 
-                # extract mesh & pose values
-                if res.face_landmarks:
-                    mesh_vals = [coord for lm in res.face_landmarks.landmark
-                                for coord in (lm.x, lm.y, lm.z)]
-                else:
-                    mesh_vals = [0.0] * (468*3)
+            # ----- optional live FPS monitor ----------------
+            if frame_idx % 30 == 0:
+                dt  = time.perf_counter() - t0
+                fps = frame_idx / dt if dt else 0
+                print(f"[Cam {idx}] q={q.qsize()}  fps≈{fps:4.1f}")
 
-                if res.pose_landmarks:
-                    pose_vals = [coord for lm in res.pose_landmarks.landmark
-                                for coord in (lm.x, lm.y, lm.z, lm.visibility)]
-                else:
-                    pose_vals = [0.0] * (33*4)
-
-                # —— NEW: pull blendshape scores from participant ——
-                scores = getattr(p, 'last_blend_scores', [0.0] * 52)
-
-            # store for correlator & GUI
-            info['last_mesh_vals'] = mesh_vals
-            info['last_pose_vals'] = pose_vals
-            info['last_scores']    = scores
-
-            # draw green bar plot
-            h, w, _ = disp.shape
-            bar_h = h // 52
-            for j, s in enumerate(scores):
-                y0, y1 = j * bar_h, (j + 1) * bar_h
-                cv2.rectangle(disp, (0, y0), (int(s * 150), y1), (0, 255, 0), -1)
-
-            if not q.full():
-                q.put(disp)
-            stop.wait(0.03)
+            stop.wait(0.001)
 
 
     def schedule_preview(self, idx):
         info   = self.frames[idx]
-        canvas = info['canvas']       # ← define canvas first!
+        canvas = info['canvas']
         q      = info['frame_queue']
 
-        try:
-            # get the latest frame (non-blocking)
-            disp = q.get_nowait()
-
-            # make sure geometry is up-to-date before reading width/height
-            canvas.update_idletasks()
-
-            cw, ch = canvas.winfo_width(), canvas.winfo_height()
-            if cw <= 1 or ch <= 1:     # window not realised yet
-                self.after(30, self.schedule_preview, idx)
-                return
-
-            # ----- choose CONTAIN (letter-box) or COVER (crop) -----
-            pil_img = Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
-
-            # A) letter-box (no cropping) – uncomment if you prefer
-            fitted = ImageOps.contain(pil_img, (cw, ch), method=RESAMPLE)
-
-            # B) fill + crop (current behaviour)
-            # fitted = ImageOps.fit(pil_img, (cw, ch), method=RESAMPLE)
-            # -------------------------------------------------------
-
-            imgtk = ImageTk.PhotoImage(fitted)
-
-            canvas.delete('all')
-            # centre the image in the canvas
-            canvas.create_image(cw // 2, ch // 2, image=imgtk, anchor='center')
-            canvas.image = imgtk            # keep a reference!
-
-        except queue.Empty:
-            pass
-
+        # arm next call immediately
         if not info['stop_evt'].is_set():
             info['after_id'] = self.after(30, self.schedule_preview, idx)
 
+        # get the *latest* completed future in the queue
+        try:
+            fut = q.get_nowait()
+            while not q.empty():
+                fut = q.get_nowait()          # discard older ones
+        except queue.Empty:
+            return                            # nothing ready
+
+        if not fut.done():
+            return                            # still processing
+
+        disp = fut.result()                   # BGR frame
+
+        # ----------- draw on canvas -----------
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+
+        img = frame_to_tk(disp, (cw, ch), mode="contain")
+        if img is None:
+            return
+
+        canvas.delete('all')
+        canvas.create_image(cw//2, ch//2, image=img, anchor='center')
+        canvas.image = img
+
 
     def preview_comodulation(self):
+        # ←–– early-out during rebuild -----------------------------------------
+        if not self.frames:        # nothing valid yet
+            self._comod_after_id = self.after(30, self.preview_comodulation)
+            return
+        # ----------------------------------------------------------------------
+
         if self.multi_face_mode.get():
-            # single-camera, multi-face: grab the first two faces’ blends
             info = self.frames[0]
-            blends = info.get('face_blends', {})      # dict: face_id → [52 scores]
+            blends = info.get('face_blends', {})
             if len(blends) >= 2:
-                # pick two IDs in some order (e.g. sorted, or based on your spinbox entries)
-                fid1, fid2 = sorted(blends.keys())[:2]
+                fid1, fid2 = sorted(blends)[:2]
                 s1, s2 = blends[fid1], blends[fid2]
                 corr = self.correlator.update(np.array(s1), np.array(s2))
                 if corr is not None:
                     self.update_plot(corr)
         else:
-            # existing holistic logic
             if len(self.frames) >= 2:
                 s1 = self.frames[0].get('last_scores')
                 s2 = self.frames[1].get('last_scores')
@@ -497,8 +649,8 @@ class YouQuantiPyGUI(tk.Tk):
                 if corr is not None:
                     self.update_plot(corr)
 
-        # schedule next call
-        self.after(30, self.preview_comodulation)
+        # reschedule and remember the ID
+        self._comod_after_id = self.after(30, self.preview_comodulation)
 
 
     def update_plot(self, corr):
@@ -589,7 +741,7 @@ class YouQuantiPyGUI(tk.Tk):
             if corr is not None:
                 self.after_idle(lambda c=corr.copy(): self.update_plot(c))
 
-            stop.wait(1.0 / fps)
+            stop.wait(0.001) 
     def start_stream(self):
         if self.streaming:
             return
@@ -599,74 +751,74 @@ class YouQuantiPyGUI(tk.Tk):
             if info['participant'] and hasattr(info['participant'], 'setup_stream')
         ]
 
-        # multi-face needs ≥1 feed, holistic needs ≥2
-        if self.multi_face_mode.get():
-            if len(valid) < 1:
-                return
-        else:
-            if len(valid) < 2:
-                return
+        # require at least one feed (camera or face)
+        if len(valid) < 1:
+            return
 
         self.streaming = True
-
         if self.multi_face_mode.get():
+            # ── MULTI-FACE MODE ──
             p = valid[0]['participant']
 
-            # clear any old outlets and build a fresh name‐map
+            # (Re)build the per-face name→stream map
             p.face_outlets.clear()
-            p.multiface_names = {}               # <<< store each face’s custom name
+            p.multiface_names = {}
             for fid, ent in enumerate(self.multi_entries, start=1):
                 p.multiface_names[fid] = ent.get().strip() or f"ID{fid}"
 
-            # update the GUI so you see exactly which streams will appear
+           # Show which face streams will open
             valid[0]['meta_label'].config(
-                text="Multi-Face Streams → " +
-                    ", ".join(ent.get().strip() or f"ID{idx+1}"
-                            for idx, ent in enumerate(self.multi_entries))
+                text="Multi-Face → " +
+                    ", ".join(p.multiface_names[fid]
+                              for fid in sorted(p.multiface_names))
             )
 
-            # now start the LSL outlet for the co-modulator
-            self.correlator.setup_stream()
+            # Always clear the co-mod stop event
             self.data_stop_evt.clear()
 
-            # in multiface mode we do *not* start combined_loop()—
-            # preview_loop() will push each face’s samples automatically
+            # If two or more faces are active, open the co-modulator outlet
+            if self.participant_count.get() >= 2:
+                # use camera's FPS as nominal rate
+                self.correlator.setup_stream(fps=p.fps)
 
 
-            valid[0]['meta_label'].config(
-                text="Multi-Face Streams → " +
-                    ", ".join(
-                        ent.get().strip() or f"ID{idx+1}"
-                        for idx, ent in enumerate(self.multi_entries)
-                    )
-            )
-
-            # start only the comodulation outlet; preview_loop will push face samples
-            self.correlator.setup_stream()
-            self.data_stop_evt.clear()
-
-            # **do NOT** start combined_loop here
         else:
             # ── HOLISTIC MODE ──
-            for i, info in enumerate(valid[:2]):
-                pid = info['entry'].get().strip() or f"P{i+1}"
-                nm  = f"{pid}_landmarks"
-                info['participant'].setup_stream(pid, nm)
+            fps_list = []
+            # 1) start each camera’s landmark stream
+            for i, info in enumerate(valid):
+                part = info['participant']
+                pid  = info['entry'].get().strip() or f"P{i+1}"
+                nm   = f"{pid}_landmarks"
+                part.setup_stream(pid, nm)
                 info['meta_label'].config(text=f"ID: {pid}, Stream: {nm}")
+                fps_list.append(part.fps)
 
-            self.correlator.setup_stream()
+            # 2) always clear the co-mod stop event
             self.data_stop_evt.clear()
 
-            # only holistic needs combined_loop to push two-feed samples
-            t = threading.Thread(target=self.combined_loop, daemon=True)
-            self.data_thread = t
-            t.start()
+            # 3) if you have ≥ 2 cameras, open co-modulator and spawn the combiner
+            if len(valid) >= 2:
+                nominal_fps = int(round(sum(fps_list) / len(fps_list)))
+                self.correlator.setup_stream(fps=nominal_fps)
+                t = threading.Thread(target=self.combined_loop, daemon=True)
+                self.data_thread = t
+                t.start()
 
 
     def stop_stream(self):
         if not self.streaming:
             return
         self.streaming = False
+
+        # --- 0) cancel all per-frame preview callbacks ---
+        for info in self.frames:
+            aid = info.get('after_id')
+            if aid:
+                try:
+                    self.after_cancel(aid)
+                except tk.TclError:
+                    pass
            # 1) Signal all preview threads to stop
         for info in self.frames:
             info['stop_evt'].set()
@@ -685,6 +837,8 @@ class YouQuantiPyGUI(tk.Tk):
             part = info.get('participant')
             if part:
                 part.stop_streaming()
+        self.exec.shutdown(wait=False, cancel_futures=True)
+        self.exec = ThreadPoolExecutor(max_workers=24)
 
         def _cleanup():
             if any((info['thread'] and info['thread'].is_alive()) or
@@ -723,6 +877,14 @@ class YouQuantiPyGUI(tk.Tk):
 
         # 5) Reset streaming flag
         self.streaming = False
+        if hasattr(self, '_comod_after_id'):
+            try:
+                self.after_cancel(self._comod_after_id)
+            except tk.TclError:
+                pass
+        #Reset executor
+        self.exec.shutdown(wait=False, cancel_futures=True)
+        self.exec = ThreadPoolExecutor(max_workers=24)
 
 if __name__ == '__main__':
     YouQuantiPyGUI().mainloop()

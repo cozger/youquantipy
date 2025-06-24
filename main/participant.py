@@ -8,7 +8,6 @@ from mediapipe.tasks.python import vision
 from pylsl import StreamInfo, StreamOutlet
 from collections import OrderedDict 
 
-
 class Participant:
     """
     Handles data acquisition (blendshapes, pose landmarks) and LSL streaming for a participant.
@@ -19,7 +18,7 @@ class Participant:
         camera_index: int,
         model_path: str,
         enable_raw_facemesh: bool = False,
-        multi_face_mode: bool = False,      # ← new arg
+        multi_face_mode: bool = False,
         fps: int = 30
     ):
         self.camera_index = camera_index
@@ -28,31 +27,32 @@ class Participant:
         self.multi_face_mode     = multi_face_mode
         self.fps = fps
 
-        # threading lock & async state
+        # Internal state and locking
         self._lock = threading.Lock()
         self._detect_busy = False
         self.async_results = OrderedDict()
         self.last_blend_scores = [0.0] * 52
         self.last_detected_faces = []
         self.blend_labels = None
+        self._frame_idx = 0
+        self._cached_result = None
+        self.face_outlets = {}
 
 
-        # Load model buffer once
+        # Load model and setup Mediapipe base options
         with open(self.model_path, 'rb') as f:
             model_buffer = f.read()
         base_opts = python.BaseOptions(model_asset_buffer=model_buffer)
 
-        # Callback for multi-face mode
+        # ─── Callback functions for results ─────────────────────────────
+
         def _on_multiface_result(res, image, timestamp_ms):
             with self._lock:
                 self.async_results[timestamp_ms] = res
                 self._detect_busy = False
                 if self.blend_labels is None and res.face_blendshapes:
-                    self.blend_labels = [
-                        cat.category_name for cat in res.face_blendshapes[0]
-                    ]
+                    self.blend_labels = [cat.category_name for cat in res.face_blendshapes[0]]
 
-        # Callback for single-face blendshapes
         def _on_blendshape_result(res, image, timestamp_ms):
             shapes = res.face_blendshapes[0] if res.face_blendshapes else []
             scores = [cat.score for cat in shapes]
@@ -61,13 +61,11 @@ class Participant:
                 self.last_blend_scores = scores
                 self._detect_busy = False
                 if self.blend_labels is None and res.face_blendshapes:
-                  self.blend_labels = [
-                    cat.category_name for cat in res.face_blendshapes[0]
-                ]
+                    self.blend_labels = [cat.category_name for cat in res.face_blendshapes[0]]
 
-        # ─── select and build exactly one landmarker ─────────────────────────────
+        # ─── Select and build the landmark processor ───────────────────
+
         if self.multi_face_mode:
-            # multi-face: return up to 4 sets of meshes + blendshapes
             options = vision.FaceLandmarkerOptions(
                 base_options=base_opts,
                 output_face_blendshapes=True,
@@ -77,7 +75,6 @@ class Participant:
             )
             self.multiface_landmarker = vision.FaceLandmarker.create_from_options(options)
         else:
-            # single-face: holistic for mesh+pose, plus blendshape-only landmarker
             self.holistic = mp.solutions.holistic.Holistic(
                 model_complexity=2,
                 min_detection_confidence=0.5,
@@ -91,17 +88,10 @@ class Participant:
                 result_callback=_on_blendshape_result
             )
             self.blendshape_landmarker = vision.FaceLandmarker.create_from_options(blend_opts)
-            # alias for compatibility with read_frame
             self.face_landmarker = self.blendshape_landmarker
 
-        # Placeholders for LSL outlets
-        self.outlet = None
-        self.participant_id = None
-        self.stream_name = None
-        self.source_id = None
-        self.face_outlets = {}
+        # ─── Setup camera using best available backend ─────────────────
 
-        # Robust VideoCapture: try DSHOW, MSMF, then default
         backends = []
         if hasattr(cv2, 'CAP_DSHOW'): backends.append(cv2.CAP_DSHOW)
         if hasattr(cv2, 'CAP_MSMF'):  backends.append(cv2.CAP_MSMF)
@@ -127,7 +117,7 @@ class Participant:
 
     def detect_faces_multiface(self, mp_img):
         """
-        Runs async multi-face detection and returns parsed faces.
+        Run async multi-face detection and return parsed results.
         """
         frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -148,23 +138,16 @@ class Participant:
         return faces
 
     def _parse_multiface_result(self, res, width, height):
-        """Convert FaceLandmarkerResult -> list[dict] usable by GUI/LSL."""
+        """
+        Convert FaceLandmarkerResult to a list of dictionaries usable by GUI/LSL.
+        """
         faces = []
-        for landmarks, blendshapes in zip(
-            res.face_landmarks, res.face_blendshapes
-        ):
-            mesh_vals = [coord for pt in landmarks
-                                for coord in (pt.x, pt.y, pt.z)]
-
+        for landmarks, blendshapes in zip(res.face_landmarks, res.face_blendshapes):
+            mesh_vals = [coord for pt in landmarks for coord in (pt.x, pt.y, pt.z)]
             blend_vals = [b.score for b in blendshapes]
             blend_vals = blend_vals[:52] + [0.0]*(52 - len(blend_vals))
-
-            # centroid ~ mean landmark location
-            xs = [pt.x for pt in landmarks]
-            ys = [pt.y for pt in landmarks]
-            cx = int(np.mean(xs) * width)
-            cy = int(np.mean(ys) * height)
-
+            cx = int(np.mean([pt.x for pt in landmarks]) * width)
+            cy = int(np.mean([pt.y for pt in landmarks]) * height)
             faces.append({
                 'landmarks': landmarks,
                 'mesh': mesh_vals,
@@ -175,7 +158,7 @@ class Participant:
 
     def setup_stream(self, participant_id: str, stream_name: str):
         """
-        Initialize LSL stream for single or multi-face mode.
+        Initialize LSL stream outlet.
         """
         self.participant_id = participant_id
         self.stream_name    = stream_name
@@ -193,67 +176,17 @@ class Participant:
         )
         self.outlet = StreamOutlet(info)
 
-    def read_frame(self):
-        """
-        Capture one frame, run detection(s), and prepare data for streaming or display.
-        """
-        success, frame = self.cap.read()
-        if not success:
-            return None
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-        if self.multi_face_mode:
-            # multi-face path
-            t0 = time.time()
-            faces = self.detect_faces_multiface(mp_img)
-            print(f"[Participant] multi detect {(time.time()-t0)*1000:.1f}ms")
-            self.last_detected_faces = faces
-            return faces
-
-        else:
-            # single-face path
-            ts = int(time.monotonic() * 1e3)
-            self.face_landmarker.detect_async(mp_img, timestamp_ms=ts)
-            t1 = time.time()
-            res = self.holistic.process(rgb)
-            print(f"[Participant] holistic.process {(time.time()-t1)*1000:.1f}ms")
-
-            mesh_vals = []
-            if res.face_landmarks:
-                mesh_vals = [coord for lm in res.face_landmarks.landmark
-                             for coord in (lm.x, lm.y, lm.z)]
-            else:
-                mesh_vals = [0.0] * (468*3)
-
-            pose_vals = []
-            if res.pose_landmarks:
-                pose_vals = [coord for lm in res.pose_landmarks.landmark
-                             for coord in (lm.x, lm.y, lm.z, lm.visibility)]
-            else:
-                pose_vals = [0.0] * (33*4)
-
-            return {
-                'mesh': mesh_vals,
-                'pose': pose_vals,
-                'blend': self.last_blend_scores
-            }
-
     def push_multiface_samples(self, faces: list, face_ids: list, include_mesh: bool):
         """
-        Streams each face’s blendshapes and optional mesh to separate LSL outlets,
-        using per-face custom names stored in self.multiface_names.
+        Stream each face’s blendshapes and optional mesh to LSL.
         """
         for fdata, fid in zip(faces, face_ids):
-            # gather data
             blend = fdata['blend']
             mesh  = fdata['mesh'] if include_mesh else []
             sample = blend + mesh
 
-            # determine the base label for this face (Alice, Bob, or ID#)
             base = getattr(self, 'multiface_names', {}).get(fid, f"ID{fid}")
 
-            # create outlet on first sample
             if fid not in self.face_outlets:
                 ch_count = len(blend) + len(mesh)
                 info = StreamInfo(
@@ -266,11 +199,12 @@ class Participant:
                 )
                 self.face_outlets[fid] = StreamOutlet(info)
 
-            # push the sample
             self.face_outlets[fid].push_sample(sample)
 
     def release(self):
-        """Release camera and Mediapipe resources."""
+        """
+        Release all camera and Mediapipe resources.
+        """
         if self.cap:
             self.cap.release()
         if hasattr(self, 'holistic'):
@@ -279,21 +213,24 @@ class Participant:
             self.blendshape_landmarker.close()
         if hasattr(self, 'multiface_landmarker'):
             self.multiface_landmarker.close()
-        if hasattr(self, 'outlet') and self.outlet:
+        if getattr(self, 'outlet', None):
             try: self.outlet.close()
             except: pass
-        for ol in self.face_outlets.values():
-            try: ol.close()
-            except: pass
-            
+        if hasattr(self, 'face_outlets'):
+            for ol in self.face_outlets.values():
+                ol.close()
+                self.face_outlets.clear()
+                try: ol.close()
+                except: pass
+
     def stop_streaming(self):
-        """Close all LSL outlets so we can restart later without re-opening camera."""
-        # main outlet (holistic mode)
+        """
+        Close all LSL outlets but retain camera.
+        """
         if getattr(self, 'outlet', None):
             try: self.outlet.close()
             except: pass
             self.outlet = None
-        # per-face outlets (multi-face mode)
         for fid, ol in list(self.face_outlets.items()):
             try: ol.close()
             except: pass

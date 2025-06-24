@@ -141,7 +141,7 @@ class ChannelCorrelator:
                 self.update(vec1, vec2)
 
             stop_evt.wait(1.0 / self.fps)
-    def setup_stream(self,
+    def setup_stream(self, fps=None,
                      name: str = "CoModulation",
                      source_id: str = "comodulator_uid"):
         """Call this once when Start is pressed."""
@@ -149,7 +149,7 @@ class ChannelCorrelator:
             name=name,
             type="Comodulation",
             channel_count=52,
-            nominal_srate=self.fps,
+            nominal_srate=fps,
             channel_format="float32",
             source_id=source_id
         )
