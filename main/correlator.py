@@ -37,86 +37,86 @@ class ChannelCorrelator:
 
     def update(self, vec1: np.ndarray, vec2: np.ndarray):
         """
+        Optimized version.
         Append new samples, compute deviation from rolling mean, detect changes,
         then compute comodulation magnitudes when both participants change in synchrony.
         Returns a length-52 float array of comodulation magnitudes.
         """
         with self._lock:
-            # 1) Compute baseline from incremental sums
-            if len(self.buff1) >= self.w:
-                baseline1 = self.sum1 / self.w
-                baseline2 = self.sum2 / self.w
-            else:
-                baseline1 = np.zeros_like(vec1)
-                baseline2 = np.zeros_like(vec2)
-
-            # 2) Prepare new buffered values so latched channels keep their baseline
+            # Use faster operations
             buf1 = vec1.copy()
             buf2 = vec2.copy()
-            buf1[self.states] = baseline1[self.states]
-            buf2[self.states] = baseline2[self.states]
-
-            # 3) Update running sums & deques
+            
+            # Only modify latched channels (likely few)
+            if self.states.any():
+                if len(self.buff1) >= self.w:
+                    baseline1 = self.sum1 / self.w
+                    baseline2 = self.sum2 / self.w
+                    buf1[self.states] = baseline1[self.states]
+                    buf2[self.states] = baseline2[self.states]
+            
+            # Update buffers
             if len(self.buff1) == self.w:
-                # subtract oldest
-                old1 = self.buff1[0]; old2 = self.buff2[0]
+                old1 = self.buff1[0]
+                old2 = self.buff2[0]
                 self.sum1 -= old1
                 self.sum2 -= old2
+            
             self.buff1.append(buf1)
             self.buff2.append(buf2)
             self.sum1 += buf1
             self.sum2 += buf2
-
-            # 4) Wait until buffer is full
+            
             if len(self.buff1) < self.w:
                 return None
-
-            # 5) Compute deviations from baseline
+            
+            # Compute baselines only once
+            baseline1 = self.sum1 / self.w
+            baseline2 = self.sum2 / self.w
             delta1 = vec1 - baseline1
             delta2 = vec2 - baseline2
-
-        # Detect per-channel expression change
-        change1 = np.abs(delta1) > self.delta_threshold
-        change2 = np.abs(delta2) > self.delta_threshold
-
-        # Detect similarity of changes
+        
+        # Vectorized operations outside lock
+        abs_delta1 = np.abs(delta1)
+        abs_delta2 = np.abs(delta2)
+        
+        # Vectorized comparisons
+        change1 = abs_delta1 > self.delta_threshold
+        change2 = abs_delta2 > self.delta_threshold
         similarity = np.abs(delta1 - delta2) < self.similarity_threshold
-
-        # Compute comodulation magnitude: average of absolute deltas where both change and in sync
+        
+        # Compute all at once
         mask = change1 & change2 & similarity
-        magnitudes = (np.abs(delta1) + np.abs(delta2)) / 2.0
-        comod = magnitudes  * mask.astype(float)
-          # ── State‐machine: enter when above delta_threshold, exit when below exit_threshold ──
-        out = np.zeros_like(comod)
-        enter = self.delta_threshold
-        exit_ = self.exit_threshold
-
-        for i, val in enumerate(comod):
-            if self.states[i]:
-                # EXIT if either (a) the mask says they’re no longer co-moving, or
-                # (b) the magnitude has truly fallen below the exit threshold.
-                if (not mask[i]) or (val < exit_):
-                    self.states[i]    = False
-                    self.hold_vals[i] = 0.0
-                else:
-                    # still in a co-moving state, so keep or bump the peak
-                    if val > self.hold_vals[i]:
-                        self.hold_vals[i] = val
-
-            else:
-                # ENTER only if the mask says “both moved enough and are similar”
-                if mask[i] and (val > enter):
-                    self.states[i]    = True
-                    self.hold_vals[i] = val
-
-            out[i] = self.hold_vals[i]
-
-        # Push only if we've called setup_stream()
+        magnitudes = (abs_delta1 + abs_delta2) * 0.5
+        comod = magnitudes * mask
+        
+        # Vectorized state machine
+        out = self.hold_vals.copy()
+        
+        # Update states where entering
+        entering = mask & (comod > self.delta_threshold) & ~self.states
+        self.states[entering] = True
+        self.hold_vals[entering] = comod[entering]
+        
+        # Update values where already in state
+        in_state = self.states & mask
+        update_mask = in_state & (comod > self.hold_vals)
+        self.hold_vals[update_mask] = comod[update_mask]
+        
+        # Exit states
+        exiting = self.states & (~mask | (comod < self.exit_threshold))
+        self.states[exiting] = False
+        self.hold_vals[exiting] = 0.0
+        
+        out = self.hold_vals
+        
+        # Push to LSL
         if self.outlet:
             try:
                 self.outlet.push_sample(out.tolist())
             except Exception:
                 pass
+        
         return out
 
     def run(self, p1, p2, stop_evt):

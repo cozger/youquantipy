@@ -11,6 +11,8 @@ from mediapipe.framework.formats import landmark_pb2
 from facetracker import FaceTracker           # per-face centroid tracker
 import queue     # for threading Queue
 from multiprocessing import Queue as MPQueue 
+from fastreader import NumpySharedBuffer
+
 
 def participant_worker(camera_index: int,
                     model_path: str,
@@ -20,8 +22,9 @@ def participant_worker(camera_index: int,
                     enable_raw_facemesh: bool = False,
                     multi_face_mode: bool = False,
                     preview_queue: MPQueue = None,
-                    score_queue: MPQueue = None,
-                    control_conn=None):
+                    score_buffer_name: str = None,
+                    control_conn=None,
+                    resolution= (640, 480)):
     """
     Runs in its own process.  Captures frames, runs Mediapipe models,
     builds payloads for the GUI (landmarks + IDs), streams to LSL,
@@ -33,9 +36,20 @@ def participant_worker(camera_index: int,
         model_path=model_path,
         enable_raw_facemesh=enable_raw_facemesh,
         multi_face_mode=multi_face_mode,
-        fps=fps
+        fps=fps,
+        resolution=resolution
     )
     lsl_enabled = False
+    score_buffer = None
+    if score_buffer_name:
+        try:
+            score_buffer = NumpySharedBuffer(
+                size=104 if multi_face_mode else 52, 
+                name=score_buffer_name
+            )
+            print(f"[WORKER] Connected to shared buffer: {score_buffer_name}")
+        except Exception as e:
+            print(f"[WORKER] Failed to connect to shared buffer: {e}")
 
     # ─── 2) If multi-face, prepare a local FaceTracker ─
     if multi_face_mode:
@@ -52,12 +66,33 @@ def participant_worker(camera_index: int,
         # Check for control messages
         if control_conn is not None and control_conn.poll():
             msg = control_conn.recv()
-            print(f"[WORKER] received command → {msg}", flush=True)
-            if msg == 'start_stream':
-                p.setup_stream(participant_id, stream_name)
-                print(f"[WORKER] outlet created: name={stream_name}, id={participant_id}", flush=True)
+            
+            # Handle both old string format and new tuple format
+            if isinstance(msg, tuple):
+                command, *args = msg
+            else:
+                command = msg
+                args = []
+            
+            print(f"[WORKER] received command → {command}", flush=True)
+            
+            if command == 'start_stream':
+                if not multi_face_mode and args:
+                    # Update participant_id with the provided name
+                    participant_id = args[0]
+                    stream_name = f"{participant_id}_landmarks"
+                
+                if not multi_face_mode:
+                    # Holistic mode - single stream for this participant
+                    p.setup_stream(participant_id, stream_name)
+                    print(f"[WORKER] outlet created: name={stream_name}, id={participant_id}", flush=True)
+                else:
+                    if args and isinstance(args[0], dict):
+                        p.set_face_names(args[0])
+                        print(f"[WORKER] multiface mode - face names received: {args[0]}", flush=True)
+                    print(f"[WORKER] multiface mode - streams will be created per face", flush=True)
                 lsl_enabled = True
-            elif msg == 'stop_stream':
+            elif command == 'stop_stream':
                 p.stop_streaming()
                 print(f"[WORKER] streaming stopped", flush=True)
                 lsl_enabled = False
@@ -71,6 +106,8 @@ def participant_worker(camera_index: int,
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
         if p.multi_face_mode:
+            loop_start_time = time.time()
+
             # Generate unique timestamp
             ts = int(time.monotonic() * 1000)
             if ts <= last_sent_ts:
@@ -111,34 +148,58 @@ def participant_worker(camera_index: int,
                 except:
                     pass  # Queue full, skip this frame
                     
-            if score_queue is not None and not score_queue.full():
+            if score_buffer is not None:
                 try:
-                    score_queue.put_nowait(payload[0]['blend'] if payload else [0.0]*52)
-                except:
-                    pass  # Queue full, skip
+                    if len(payload) >= 2:
+                        face1_blend = payload[0]['blend']
+                        face2_blend = payload[1]['blend']
+                        combined_scores = face1_blend + face2_blend
+                    elif len(payload) == 1:
+                        face1_blend = payload[0]['blend']
+                        combined_scores = face1_blend + [0.0] * 52
+                    else:
+                        combined_scores = [0.0] * 104
+
+                    score_buffer.write(combined_scores)
+                except Exception as e:
+                    print(f"[WORKER] Error sending multiface scores: {e}")
 
             if lsl_enabled:
                 # --- Stream LSL ---
                 p.push_multiface_samples(faces=latest_faces,
                                         face_ids=ids,
                                         include_mesh=enable_raw_facemesh)
+            total_time = (time.time() - loop_start_time) * 1000
+            frame_count = getattr(tracker, '_timing_frame_count', 0) + 1
+            tracker._timing_frame_count = frame_count
+            
+            if frame_count % 30 == 0:
+                effective_fps = 1000 / total_time if total_time > 0 else 0
+                print(f"[MULTIFACE] Loop time: {total_time:.1f}ms, Effective FPS: {effective_fps:.1f}")
 
         else:
-            # Holistic mode
+            # Holistic mode with detailed timing
+            loop_start_time = time.time()
+            
             # Generate unique timestamp for blendshape detection
             ts = int(time.monotonic() * 1000)
             if ts <= last_sent_ts:
                 ts = last_sent_ts + 1
             last_sent_ts = ts
             
-            # Start async blendshape detection
+            # Time the async blendshape call
+            t1 = time.time()
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             p.blendshape_landmarker.detect_async(mp_img, timestamp_ms=ts)
-
-            # Run holistic processing (synchronous)
+            async_time = (time.time() - t1) * 1000
+            
+            # Time the holistic processing (the suspected bottleneck)
+            t2 = time.time()
             res = p.holistic.process(rgb)
-
-            # Extract landmarks for GUI
+            holistic_time = (time.time() - t2) * 1000
+            
+            # Time landmark extraction
+            t3 = time.time()
             if res.face_landmarks:
                 face_lms = [(lm.x, lm.y, lm.z) for lm in (res.face_landmarks.landmark or [])]
             else:
@@ -147,12 +208,14 @@ def participant_worker(camera_index: int,
                 pose_lms = [(lm.x, lm.y, lm.z) for lm in (res.pose_landmarks.landmark or [])]
             else:
                 pose_lms = []
+            extract_time = (time.time() - t3) * 1000
 
-            # Build mesh and pose data for LSL
+            # Time mesh/pose data building
+            t4 = time.time()
             mesh_vals = []
             if enable_raw_facemesh and getattr(res, 'face_world_mesh', None):
-                for v in res.face_world_mesh.vertices:
-                    mesh_vals.extend([v.x, v.y, v.z])
+                for lm in res.face_landmarks.landmark:
+                    mesh_vals.extend([lm.x, lm.y, lm.z])
 
             pose_vals = []
             if res.pose_landmarks:
@@ -160,11 +223,19 @@ def participant_worker(camera_index: int,
                     pose_vals.extend([lm.x, lm.y, lm.z, lm.visibility])
             else:
                 pose_vals = [0.0] * (33 * 4)
+            build_time = (time.time() - t4) * 1000
 
-            # Get latest blendshape scores
+            # Time getting blend scores
+            t5 = time.time()
             scores = p.get_latest_blend_scores()
+            frame_count = getattr(p, '_scores_debug_count', 0) + 1
+            p._scores_debug_count = frame_count
+            if frame_count % 30 == 0:
+                print(f"[WORKER] Got {len(scores)} blend scores, first few: {scores[:5] if scores else 'None'}")
+            scores_time = (time.time() - t5) * 1000
 
-            # Send to GUI
+            # Time GUI update
+            t6 = time.time()
             if preview_queue is not None and not preview_queue.full():
                 try:
                     preview_queue.put_nowait({
@@ -174,21 +245,49 @@ def participant_worker(camera_index: int,
                         'frame_bgr': frame_bgr
                     })
                 except:
-                    pass  # Queue full, skip
+                    pass
+            gui_time = (time.time() - t6) * 1000
                     
-            if score_queue is not None and not score_queue.full():
-                try:
-                    score_queue.put_nowait(scores)
-                except:
-                    pass  # Queue full, skip
-
-            # Build and stream full sample to LSL
+            # Time score buffer write
+            t7 = time.time()
+            if score_buffer is not None:
+                    try:
+                        scores_to_send = scores[:52] if len(scores) >= 52 else scores + [0.0] * (52 - len(scores))
+                        score_buffer.write(scores_to_send)
+                        
+                        # Debug output every 30 frames
+                        frame_count = getattr(p, '_buffer_write_count', 0) + 1
+                        p._buffer_write_count = frame_count
+                        if frame_count % 30 == 0:
+                            print(f"[WORKER] Writing {len(scores_to_send)} scores to buffer, first few: {scores_to_send[:5]}")
+                            
+                    except Exception as e:
+                        print(f"[WORKER] Error sending holistic scores: {e}")
+            # Time LSL streaming
+            t8 = time.time()
             if lsl_enabled:
                 sample = scores + mesh_vals + pose_vals
                 if len(sample) == p._lsl_info.channel_count():
                     p.outlet.push_sample(sample)
                 else:
                     print(f"[ERROR] Sample length {len(sample)} != LSL channels {p._lsl_info.channel_count()}")
+            lsl_time = (time.time() - t8) * 1000
+            
+            total_time = (time.time() - loop_start_time) * 1000
+            
+            # Print timing every 10 frames (more frequent for debugging)
+            frame_count = getattr(p, '_timing_frame_count', 0) + 1
+            p._timing_frame_count = frame_count
+            
+            if frame_count % 10 == 0:
+                print(f"[HOLISTIC TIMING] Async: {async_time:.1f}ms, Holistic: {holistic_time:.1f}ms, "
+                      f"Extract: {extract_time:.1f}ms, Build: {build_time:.1f}ms, Scores: {scores_time:.1f}ms, "
+                      f"GUI: {gui_time:.1f}ms, LSL: {lsl_time:.1f}ms, "
+                      f"TOTAL: {total_time:.1f}ms")
+                
+                # Calculate effective FPS
+                effective_fps = 1000 / total_time if total_time > 0 else 0
+                print(f"[HOLISTIC] Effective FPS: {effective_fps:.1f}")
 
         # Frame rate control
         elapsed = time.time() - loop_start
@@ -229,6 +328,7 @@ class Participant:
         self._frame_idx = 0
         self._cached_result = None
         self.face_outlets = {}
+        self.multiface_names = {}
 
         # Load model and setup Mediapipe base options
         with open(self.model_path, 'rb') as f:
@@ -247,10 +347,13 @@ class Participant:
             self.multiface_landmarker = vision.FaceLandmarker.create_from_options(options)
         else:
             self.holistic = mp.solutions.holistic.Holistic(
-                model_complexity=2,
+                model_complexity=1,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
-                refine_face_landmarks=True
+                refine_face_landmarks=False,
+                smooth_landmarks=True, 
+                enable_segmentation=False, 
+                smooth_segmentation=False
             )
             blend_opts = vision.FaceLandmarkerOptions(
                 base_options=base_opts,
@@ -262,6 +365,9 @@ class Participant:
             self.face_landmarker = self.blendshape_landmarker
 
         # ─── Setup camera capture ──────────────────────────────────────
+        # Replace the camera setup section in Participant.__init__ with this:
+
+        # ─── Setup camera capture ──────────────────────────────────────
         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
         for b in backends:
             cap = cv2.VideoCapture(self.camera_index, b)
@@ -271,15 +377,105 @@ class Participant:
         else:
             raise RuntimeError(f"Cannot open camera {self.camera_index!r}")
 
-        # Set properties explicitly
+        # Basic settings
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer lag
+        
+        # Try multiple approaches for auto-exposure
+        print("[Camera] Attempting to enable auto-exposure...")
+        auto_exposure_values = [3, 1, 0.75, 0.25, -1]  # Different values cameras might accept
+        for val in auto_exposure_values:
+            try:
+                result = self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, val)
+                current_val = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                print(f"[Camera] Auto-exposure set to {val}, result: {result}, current: {current_val}")
+                if result:
+                    break
+            except:
+                continue
+        
+        # Try autofocus
+        print("[Camera] Attempting to enable auto-focus...")
+        autofocus_values = [1, -1, True]
+        for val in autofocus_values:
+            try:
+                result = self.cap.set(cv2.CAP_PROP_AUTOFOCUS, val)
+                current_val = self.cap.get(cv2.CAP_PROP_AUTOFOCUS)
+                print(f"[Camera] Auto-focus set to {val}, result: {result}, current: {current_val}")
+                if result:
+                    break
+            except:
+                continue
+        
+        # Try auto white balance
+        print("[Camera] Attempting to enable auto white balance...")
+        auto_wb_values = [1, -1, True]
+        for val in auto_wb_values:
+            try:
+                result = self.cap.set(cv2.CAP_PROP_AUTO_WB, val)
+                current_val = self.cap.get(cv2.CAP_PROP_AUTO_WB)
+                print(f"[Camera] Auto WB set to {val}, result: {result}, current: {current_val}")
+                if result:
+                    break
+            except:
+                continue
+        
+        # Manual brightness/exposure adjustments if auto doesn't work
+        print("[Camera] Checking current exposure/brightness...")
+        current_exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+        current_brightness = self.cap.get(cv2.CAP_PROP_BRIGHTNESS)
+        current_gain = self.cap.get(cv2.CAP_PROP_GAIN)
+        
+        print(f"[Camera] Current - Exposure: {current_exposure}, Brightness: {current_brightness}, Gain: {current_gain}")
+        
+        # If image is too dark, try manual adjustments
+        if current_exposure < -5:  # Very low exposure
+            print("[Camera] Exposure seems low, attempting to increase...")
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, -3)  # Increase exposure
+            
+        if current_brightness < 0.3:  # Low brightness
+            print("[Camera] Brightness seems low, attempting to increase...")
+            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.5)  # Increase brightness
+            
+        if current_gain < 0.3:  # Low gain
+            print("[Camera] Gain seems low, attempting to increase...")
+            self.cap.set(cv2.CAP_PROP_GAIN, 0.5)  # Increase gain
+        
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[Participant] camera {self.camera_index} resolution = {w}x{h}")
-
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        # Final status check
+        final_exposure = self.cap.get(cv2.CAP_PROP_EXPOSURE)
+        final_brightness = self.cap.get(cv2.CAP_PROP_BRIGHTNESS)
+        final_auto_exposure = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        final_autofocus = self.cap.get(cv2.CAP_PROP_AUTOFOCUS)
+        final_auto_wb = self.cap.get(cv2.CAP_PROP_AUTO_WB)
+        
+        print(f"[Camera] Final settings:")
+        print(f"  Resolution: {w}x{h}@{actual_fps}fps")
+        print(f"  Auto-exposure: {final_auto_exposure}")
+        print(f"  Auto-focus: {final_autofocus}")
+        print(f"  Auto-WB: {final_auto_wb}")
+        print(f"  Exposure: {final_exposure}")
+        print(f"  Brightness: {final_brightness}")
+        
+        # Warm up camera (let it adjust)
+        print("[Camera] Warming up for 2 seconds...")
+        start_time = time.time()
+        while time.time() - start_time < 2.0:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            time.sleep(0.1)
+        print("[Camera] Camera ready!")
+        
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        print(f"[Participant] camera {self.camera_index}: {w}x{h}@{actual_fps}fps")
     # ─── Callback functions for results ─────────────────────────────
 
     def _on_multiface_result(self, res, image, timestamp_ms):
@@ -337,6 +533,10 @@ class Participant:
             print(f"[ERROR] get_latest_faces: {e}")
         
         return self.last_detected_faces
+    
+    def set_face_names(self, names_dict):
+        """Update face names for multiface streaming"""
+        self.multiface_names = names_dict
 
     def get_latest_blend_scores(self):
         """Thread-safe access to latest blend scores"""
@@ -373,7 +573,10 @@ class Participant:
         self.stream_name    = stream_name
         self.source_id      = f"{participant_id}_uid"
         
-        mesh_ch = (478*3) if self.enable_raw_facemesh else 0
+        if self.multi_face_mode:
+            mesh_ch = (478*3) if self.enable_raw_facemesh else 0
+        else:
+            mesh_ch = (468*3) if self.enable_raw_facemesh else 0
         total_ch = 52 + mesh_ch + (33*4)
         info = StreamInfo(
             name          = self.stream_name,
@@ -391,24 +594,52 @@ class Participant:
         """
         Stream each face's blendshapes and optional mesh to LSL.
         """
+        # Check if face names have changed and recreate outlets if needed
+        for fid in face_ids:
+            current_name = getattr(self, 'multiface_names', {}).get(fid, f"ID{fid}")
+            if fid in self.face_outlets:
+                # Check if name changed by comparing the stream name
+                outlet = self.face_outlets[fid]
+                # Store the expected name for this outlet
+                expected_name = f"{current_name}_face{fid}"
+                existing_name = getattr(outlet, '_stream_name', None)
+                
+                if existing_name != expected_name:
+                    # Name changed, close old outlet
+                    try:
+                        outlet.close()
+                    except:
+                        pass
+                    del self.face_outlets[fid]
+        
+        # Now create streams for each face
         for fdata, fid in zip(faces, face_ids):
             blend = fdata['blend']
-            mesh  = fdata['mesh'] if include_mesh else []
+            if include_mesh:
+                mesh_tuples = fdata['mesh']
+                mesh = [coord for pt in mesh_tuples for coord in (pt[0], pt[1], pt[2])]
+            else:
+                mesh = []
+                
             sample = blend + mesh
 
             base = getattr(self, 'multiface_names', {}).get(fid, f"ID{fid}")
+            stream_name = f"{base}_face{fid}"
 
             if fid not in self.face_outlets:
                 ch_count = len(blend) + len(mesh)
                 info = StreamInfo(
-                    name          = f"{base}_face{fid}",
-                    type          = "Landmark",
-                    channel_count = ch_count,
-                    nominal_srate = self.fps,
-                    channel_format= "float32",
-                    source_id     = f"{base}_face{fid}"
+                    name=stream_name,
+                    type="Landmark",
+                    channel_count=ch_count,
+                    nominal_srate=self.fps,
+                    channel_format="float32",
+                    source_id=stream_name
                 )
                 self.face_outlets[fid] = StreamOutlet(info)
+                # Store the stream name for future comparison
+                self.face_outlets[fid]._stream_name = stream_name
+                print(f"[WORKER] Created LSL outlet for face {fid}: {stream_name}")
 
             self.face_outlets[fid].push_sample(sample)
 
