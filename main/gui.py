@@ -3,11 +3,9 @@ from tkinter import ttk
 from pygrabber.dshow_graph import FilterGraph
 from PIL import Image, ImageTk
 from multiprocessing import Queue as MPQueue
-from multiprocessing import Process
-from multiprocessing import Pipe
+from multiprocessing import Process, shared_memory, Pipe
 from concurrent.futures import ThreadPoolExecutor
 import queue
-
 
 import threading
 import time
@@ -18,22 +16,24 @@ import numpy as np
 import cv2
 import mediapipe as mp
 
-from participant import participant_worker
-from facetracker import FaceTracker 
+from parallelworker import parallel_participant_worker
+from canvasdrawing import CanvasDrawingManager , draw_overlays_combined
 from correlator import ChannelCorrelator
-from fastreader import FastScoreReader, NumpySharedBuffer
+from sharedbuffer import NumpySharedBuffer
+from participantmanager import GlobalParticipantManager
+from LSLHelper import lsl_helper_process
 from videorecorder import VideoRecorderProcess
 from audiorecorder import AudioRecorder, VideoAudioRecorder, AudioDeviceManager
+from guireliability import setup_reliability_monitoring, GUIReliabilityMonitor
+
 from tkinter import filedialog, messagebox
 from confighandler import ConfigHandler
 from datetime import datetime
 from pathlib import Path
 
-
-
 # Path to your Mediapipe face_landmarker.task
-DEFAULT_MODEL_PATH = r"D:\Projects\MovieSynchrony\face_landmarker.task"
-
+DEFAULT_MODEL_PATH = r"D:\Projects\youquantipy\face_landmarker.task"
+POSE_MODEL_PATH = r"D:\Projects\youquantipy\pose_landmarker_heavy.task"
 
 DEFAULT_DESIRED_FPS = 30
 CAM_RESOLUTION = (1280, 720)
@@ -60,123 +60,88 @@ def list_video_devices(max_devices=10):
             continue
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if (actual_w, actual_h) != (640, 480):
-            print(f"[GUI] Warning: Device {i} locked to {actual_w}×{actual_h}")
         devices.append((i, names[i], actual_w, actual_h))
         cap.release()
     return devices
 
-
-def frame_to_tk(bgr, target_wh, mode="contain"):
-    """Fast BGR → Tk PhotoImage with performance optimizations."""
-    cw, ch = target_wh
-    h, w = bgr.shape[:2]
+def correlation_monitor_process(correlation_queue: MPQueue, 
+                               correlation_buffer_name: str,
+                               fps: int = 30):
+    """
+    Separate process for monitoring correlation without LSL streaming.
+    Starts automatically when 2+ faces are detected.
+    """
     
-    if cw <= 1 or ch <= 1:
-        return None
-
-    # Compute scale
-    if mode == "cover":
-        scale = max(cw / w, ch / h)
-    else:
-        scale = min(cw / w, ch / h)
-
-    # Fast resize if needed
-    if abs(scale - 1.0) > 0.01:  # Only resize if significantly different
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        # Use INTER_NEAREST for maximum speed
-        bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
-    # Centre-crop for "cover"
-    if mode == "cover":
-        h, w = bgr.shape[:2]
-        x0 = max(0, (w - cw) // 2)
-        y0 = max(0, (h - ch) // 2)
-        bgr = bgr[y0:y0 + ch, x0:x0 + cw]
-
-    # Convert to RGB and create PhotoImage
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-    return ImageTk.PhotoImage(pil_img)
-
-def draw_overlays_combined(
-    frame_bgr,
-    faces=None,
-    pose_landmarks=None,
-    labels=None,
-    face_mesh=True,
-    face_contours=True,
-    face_points=True,
-    pose_lines=True
-):
-    """
-    Draws face mesh/contours/points for each face, and pose lines if provided.
-    - faces: list of dicts, each dict with keys 'landmarks' (normalized), 'id' (optional), 'centroid' (optional)
-    - pose_landmarks: MediaPipe pose landmarks (list of normalized coords), or None
-    - labels: dict mapping id to name (for multiface), or int->name for holistic
-    """
-    frame = frame_bgr.copy()
-    h, w = frame.shape[:2]
-
-    # Draw face overlays (mesh/contours/points/labels)
-    if faces:
-        for idx, face in enumerate(faces):
-            landmarks = face["landmarks"]
-            fid = face.get("id", idx+1)
-            face_landmarks_px = [(int(x * w), int(y * h), z) for x, y, z in landmarks]
-            if face_mesh:
-                for conn in mp.solutions.face_mesh.FACEMESH_TESSELATION:
-                    i, j = conn
-                    cv2.line(frame, face_landmarks_px[i][:2], face_landmarks_px[j][:2], (64,255,64), 1, cv2.LINE_AA)
-            if face_contours:
-                for conn in mp.solutions.face_mesh.FACEMESH_CONTOURS:
-                    i, j = conn
-                    cv2.line(frame, face_landmarks_px[i][:2], face_landmarks_px[j][:2], (0,255,0), 2, cv2.LINE_AA)
-            if face_points:
-                for pt in face_landmarks_px:
-                    cv2.circle(frame, pt[:2], 1, (0,200,255), -1)
-            # Draw label above face
-            label_text = None
-            if labels and fid in labels:
-                label_text = labels[fid]
-            elif labels and idx in labels:
-                label_text = labels[idx]
-            elif not labels:
-                label_text = f"Face {fid}"
-            if label_text:
-                if "centroid" in face:
-                    cx, cy = int(face["centroid"][0] * w), int(face["centroid"][1] * h) - 50
-                else:
-                    cx, cy = face_landmarks_px[10][0], face_landmarks_px[10][1] - 50  # use forehead landmark
-                cv2.putText(frame, label_text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv2.LINE_AA)
-
-    # Draw pose overlays (if present)
-    if pose_landmarks is not None and len(pose_landmarks) > 0 and pose_lines:
-        pose_landmarks_px = [(int(x * w), int(y * h), z) for x, y, z in pose_landmarks]
-        for conn in mp.solutions.holistic.POSE_CONNECTIONS:
-            i, j = conn
-            if i < len(pose_landmarks_px) and j < len(pose_landmarks_px):
-                cv2.line(frame, pose_landmarks_px[i][:2], pose_landmarks_px[j][:2], (64,255,255), 2, cv2.LINE_AA)
-
-    return frame
+    correlator = ChannelCorrelator(window_size=60, fps=fps)
+    
+    # Connect to correlation output buffer
+    try:
+        corr_buffer = shared_memory.SharedMemory(name=correlation_buffer_name)
+        corr_array = np.ndarray((52,), dtype=np.float32, buffer=corr_buffer.buf)
+        print("[Correlation Monitor] Connected to correlation buffer")
+    except Exception as e:
+        print(f"[Correlation Monitor] Failed to connect to correlation buffer: {e}")
+        return
+    
+    participant_scores = {}
+    last_update_time = {}
+    
+    while True:
+        try:
+            # Get data with timeout
+            data = correlation_queue.get(timeout=0.1)
+            
+            if data is None:  # Shutdown signal
+                break
+                
+            pid = data['participant_id']
+            participant_scores[pid] = np.array(data['blend_scores'])
+            last_update_time[pid] = time.time()
+            
+            # Clean up old participants
+            current_time = time.time()
+            to_remove = [p for p, t in last_update_time.items() 
+                        if current_time - t > 2.0]
+            for p in to_remove:
+                del participant_scores[p]
+                del last_update_time[p]
+            
+            # Calculate correlation if we have 2+ active participants
+            if len(participant_scores) >= 2:
+                pids = sorted(participant_scores.keys())[:2]
+                corr = correlator.update(
+                    participant_scores[pids[0]],
+                    participant_scores[pids[1]]
+                )
+                if corr is not None:
+                    corr_array[:] = corr
+                    
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[Correlation Monitor] Error: {e}")
+            
+    print("[Correlation Monitor] Stopped")
 
 class YouQuantiPyGUI(tk.Tk):
     BAR_HEIGHT = 150
 
     def __init__(self):
         super().__init__()
+        
         #use handler to import configurations
-
         self.config = ConfigHandler()
         self.MODEL_PATH = self.config.get('paths.model_path', DEFAULT_MODEL_PATH)
+        self.POSE_MODEL_PATH = self.config.get('paths.pose_model_path',POSE_MODEL_PATH)
         self.DESIRED_FPS = self.config.get('camera_settings.target_fps', DEFAULT_DESIRED_FPS)
 
-        # Allows for mirroring in holistic mode. Will throw an error if used in multiface
-        self.testing_mode = False 
         # Load face_landmarker model buffer
         with open(self.MODEL_PATH, 'rb') as f:
             self.model_buf = f.read()
+
+        # For tracker
+        self.tracker_id_to_slot = {}      # Maps tracker_id -> slot index (for "P#")
+        self.slot_to_tracker_id = {}  
 
         print("[DEBUG] GUI __init__")
         self.title("YouQuantiPy")
@@ -187,20 +152,51 @@ class YouQuantiPyGUI(tk.Tk):
         # give the first row weight so everything grows vertically
         self.grid_rowconfigure(0, weight=1)
 
-        # Drawing utilities
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_styles = mp.solutions.drawing_styles
-        self.canvas_objects = {}  # Cache for reusable canvas objects
-        self.transform_cache = {}  # Cache for coordinate transformations
-        self.last_frame_time = {}  # Track frame timing per canvas
-        
-
+        # get drawing manager
+        self.drawingmanager = CanvasDrawingManager()
         # Synchrony plot correlator & face tracker
         self.correlator = ChannelCorrelator(window_size=60, fps=30)
-        self.face_tracker = FaceTracker(track_threshold=200, max_missed=1500)
-        self.enable_mesh = tk.BooleanVar(value=False)
-        self.multi_face_mode = tk.BooleanVar(value=False)
+        self.correlation_queue = MPQueue()
+        self.correlation_monitor_proc = None
+        
+        # Initialize active camera procs early
+        self.active_camera_procs = {}  
+            
+        # Load config values BEFORE creating UI controls
+        self.participant_count = tk.IntVar(value=self.config.get('startup_mode.participant_count', 2))
+        self.camera_count = tk.IntVar(value=self.config.get('startup_mode.camera_count', 2))
+        self.enable_mesh = tk.BooleanVar(value=self.config.get('startup_mode.enable_mesh', False))
+        self.enable_pose = tk.BooleanVar(value=self.config.get('startup_mode.enable_pose', True))
+        self.desired_fps = tk.IntVar(value=self.config.get('camera_settings.target_fps', 30))
+        default_res = self.config.get('camera_settings.resolution', '720p')
+        self.res_choice = tk.StringVar(value=default_res)
 
+        # Global participant management
+        self.participant_update_queue = MPQueue()
+        self.participant_mapping_pipes = {} 
+        
+        # Initialize with procrustes support
+        self.global_participant_manager = GlobalParticipantManager(
+            max_participants=self.participant_count.get(),
+            shape_weight=0.7,  # Prioritize procrustes
+            position_weight=0.3    # But still consider position
+        )
+
+        # NOW start participant update processor after queue is created
+        self.participant_update_thread = threading.Thread(
+            target=self._process_participant_updates, 
+            daemon=True
+        )
+        self.participant_update_thread.start()
+        
+        self.participant_monitor_thread = None
+        self.monitoring_active = False
+
+        self.performance_stats = {
+            'face_fps': {},
+            'pose_fps': {},
+            'fusion_fps': {}
+        }
 
         self.data_thread = None
         self.streaming = False
@@ -208,36 +204,32 @@ class YouQuantiPyGUI(tk.Tk):
         self.worker_procs = []
         self.preview_queues = []
         self.score_queues = []
+        self.recording_queues = []
         self.participant_names = {}
         self.score_reader = None
         self.gui_update_thread = None
         self.stop_evt = None
 
-
-        # UI controls
-        self.participant_count = tk.IntVar(value=2)
-        self.camera_count      = tk.IntVar(value=2)
-    
         # Left-side control panel
         self.control_panel = ttk.Frame(self)
         self.control_panel.grid(row=0, column=0, rowspan=3, sticky='ns', padx=10, pady=10)
         self.grid_columnconfigure(0, weight=0)
+        
         # Participant count
         ttk.Label(self.control_panel, text="Participants:").pack(anchor='w')
         self.part_spin = tk.Spinbox(self.control_panel, from_=1, to=6, textvariable=self.participant_count,
-                                    command=self.build_frames, width=5)
+                                    command=self.on_participant_count_change, width=5)
         self.part_spin.pack(anchor='w', pady=(0,20))
 
         # Camera count
         ttk.Label(self.control_panel, text="Cameras:").pack(anchor='w')
         self.cam_spin = tk.Spinbox(self.control_panel, from_=1, to=self.participant_count.get(),
-                                textvariable=self.camera_count,
-                                command=self.build_frames, width=5)
+                                    textvariable=self.camera_count,
+                                    command=self.on_camera_count_change, width=5)
         self.cam_spin.pack(anchor='w', pady=(0,15))
 
         #FPS input
         ttk.Label(self.control_panel, text="FPS:").pack(anchor='w')
-        self.desired_fps = tk.IntVar(value=self.DESIRED_FPS)
         self.fps_spin = tk.Spinbox(
             self.control_panel,
             from_=1, to=120,
@@ -247,25 +239,6 @@ class YouQuantiPyGUI(tk.Tk):
         )
         self.fps_spin.pack(anchor='w', pady=(0,20))
 
-        def _sync_counts(var_name, index, mode):
-            """Mirror participants⇆cameras in holistic mode."""
-            if not self.multi_face_mode.get():
-                # participant changed → update cameras
-                if var_name == self.participant_count._name:
-                    new_count = self.participant_count.get()
-                    self.camera_count.set(new_count)
-                    # Update spinbox maximum
-                    self.cam_spin.config(to=new_count)
-                # camera changed → update participants
-                elif var_name == self.camera_count._name:
-                    new_count = self.camera_count.get()
-                    self.participant_count.set(new_count)
-
-                # attach trace callbacks (write-only)
-        self._sync_counts = _sync_counts
-        self.participant_count.trace_add('write', self._sync_counts)
-        self.camera_count.trace_add('write',      self._sync_counts)
-
         # ─── Resolution selector ───────────────────────────────────────
         ttk.Label(self.control_panel, text="Resolution:").pack(anchor='w')
         # map label→(w,h)
@@ -273,8 +246,8 @@ class YouQuantiPyGUI(tk.Tk):
             "1080p": (1920, 1080),
             "720p":  (1280, 720),
             "480p":  ( 640, 480),
+            "240p":  ( 320, 240),
         }
-        self.res_choice = tk.StringVar(value="720p")
         self.res_menu = ttk.Combobox(
             self.control_panel,
             textvariable=self.res_choice,
@@ -283,19 +256,8 @@ class YouQuantiPyGUI(tk.Tk):
             width=7
         )
         self.res_menu.pack(anchor='w', pady=(0, 20))
+        self.res_menu.bind("<<ComboboxSelected>>", lambda e: self.on_resolution_change())
 
-        #----- Loading default values -----
-        # UI controls with config defaults
-        self.participant_count = tk.IntVar(value=self.config.get('startup_mode.participant_count', 2))
-        self.camera_count = tk.IntVar(value=self.config.get('startup_mode.camera_count', 2))
-        self.enable_mesh = tk.BooleanVar(value=self.config.get('startup_mode.enable_mesh', False))
-        self.multi_face_mode = tk.BooleanVar(value=self.config.get('startup_mode.multi_face', False))
-        # FPS with config default
-        self.desired_fps = tk.IntVar(value=self.config.get('camera_settings.target_fps', 30))
-        # Resolution with config default
-        default_res = self.config.get('camera_settings.resolution', '720p')
-        self.res_choice = tk.StringVar(value=default_res)
-        
         # Layout for previews
         self.container = ttk.Frame(self)
         self.container.grid(row=0, column=1, columnspan=1, rowspan=1, pady=10, sticky='nsew')
@@ -328,9 +290,13 @@ class YouQuantiPyGUI(tk.Tk):
             command=self.on_mesh_toggle
         ).pack(anchor='w')
 
-        ttk.Checkbutton(self.control_panel, text="Enable Multi-Face Mode (No Pose Estimation)",
-                        variable=self.multi_face_mode, command=self.on_mode_toggle).pack(anchor='w', pady=(0,50))
-        
+        ttk.Checkbutton(
+            self.control_panel,
+            text="Enable Pose Estimation",
+            variable=self.enable_pose,
+            command=self.on_pose_toggle
+        ).pack(anchor='w', pady=(0,10))
+
         # ─── Video Recording Section ───────────────────────────────────
         record_frame = ttk.LabelFrame(self.control_panel, text="Video Recording")
         record_frame.pack(fill='x', pady=(20, 0))
@@ -476,52 +442,240 @@ class YouQuantiPyGUI(tk.Tk):
         ttk.Button(self.control_panel, text="Reset", command=self.reset).pack(fill='x', pady=(2))
         ttk.Button(self.control_panel, text="Save Current Settings", command=self.save_current_settings).pack(fill='x', pady=(10,2))
 
-        # Apply startup mode
-        if self.config.get('startup_mode.multi_face', False):
-            self.on_mode_toggle()  # This will trigger multiface setup
-        
         # Save window geometry on close
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # === RELIABILITY MONITORING SETUP ===
+        # Configure reliability monitoring (optional - uses defaults if not provided)
+        reliability_config = {
+            'memory_growth_threshold': 800,    # memory threshold in MB
+            'max_queue_size': 8,               # Smaller queues for better responsiveness  
+            'gui_freeze_threshold': 3.0,       # More sensitive freeze detection
+            'stats_report_interval': 60,      # Report every N seconds
+            'resource_check_interval': 10,      # More frequent memory checks (default: 10)
+            'queue_check_interval': 5,         # More frequent queue checks (default: 5)
+            'gui_check_interval': 1,         # More sensitive GUI freeze detection (default: 1)
+        }
+        
+        # Setup monitoring - this adds convenience methods to self
+        self.reliability_monitor, self.recording_protection = setup_reliability_monitoring(
+            self, reliability_config
+        )
+        
+        # Start monitoring after GUI is fully initialized
+        self.after(1000, self._start_monitoring)  # Start 1 second after GUI loads
+        self._last_cache_cleanup = time.time()
+
+    def _start_monitoring(self):
+        """Start reliability monitoring after GUI is ready"""
+        self.reliability_monitor.start_monitoring()
+        print("[GUI] Reliability monitoring started")
+
+    def _process_participant_updates(self):
+        """Process participant updates from workers in the main thread"""
+        last_cleanup = time.time()
+        update_count = 0  # Add counter for debugging
+
+        while True:
+            try:
+                update = self.participant_update_queue.get(timeout=0.1)
+                if update is None:  # Shutdown signal
+                    break
+                    
+                # Update global participant manager
+                camera_idx = update['camera_idx']
+                local_id = update['local_id']
+                centroid = update['centroid']
+                shape = update.get('shape')
+                
+                # # Debug print
+                # update_count += 1
+                # if update_count % 30 == 0:  # Every 30 updates
+                #     print(f"[GUI] Processing update #{update_count}: camera={camera_idx}, local_id={local_id}, centroid={centroid}")
+                
+                # Get global ID from manager
+                global_id = self.global_participant_manager.update_participant(
+                    camera_idx, local_id, centroid, shape  
+                )
+                
+                # Debug print the result
+                # if update_count % 30 == 0:
+                #     print(f"[GUI] Assigned global_id={global_id} to local_id={local_id}")
+                
+                # Send response back to worker
+                if camera_idx in self.participant_mapping_pipes:
+                    try:
+                        response = {
+                            'local_id': local_id,
+                            'global_id': global_id
+                        }
+                        self.participant_mapping_pipes[camera_idx].send(response)
+                        # if update_count % 30 == 0:
+                        #     print(f"[GUI] Sent mapping response: {response}")
+                    except Exception as e:
+                        print(f"[GUI] Error sending response to camera {camera_idx}: {e}")
+
+                # Periodically call cleanup:
+                now = time.time()
+                if now - last_cleanup > 1.0:
+                    self.global_participant_manager.cleanup_old_participants()
+                    last_cleanup = now
+                        
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[GUI] Error processing participant update: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        print("[GUI] Participant update processor stopped")
+        
+    def update_performance_stats(self):
+        """Monitor and display performance statistics"""
+        if not self.streaming:
+            return
+            
+        # Collect stats from workers via control connection
+        for idx, info in enumerate(self.frames):
+            if info.get('control_conn'):
+                info['control_conn'].send('get_stats')
+                
+        # Schedule next update
+        self.after(5000, self.update_performance_stats) 
     
+    def on_participant_count_change(self):
+        """Handle participant count change"""
+        # Update camera spinbox maximum
+        self.cam_spin.config(to=self.participant_count.get())
+        #update max participants in global manager
+        self.global_participant_manager.set_max_participants(self.participant_count.get())
+
+        # Ensure camera count doesn't exceed participant count
+        if self.camera_count.get() > self.participant_count.get():
+            self.camera_count.set(self.participant_count.get())
+        
+        # Rebuild frames
+        self.build_frames()
+
+    def on_camera_count_change(self):
+        """Handle camera count change"""
+        # Ensure camera count doesn't exceed participant count
+        if self.camera_count.get() > self.participant_count.get():
+            self.camera_count.set(self.participant_count.get())
+        
+        # Rebuild frames
+        self.build_frames()
+
+    def on_resolution_change(self):
+        """
+        Called when the user picks a new resolution from the dropdown. This does not restart running cameras.
+        """
+        res_label = self.res_choice.get()
+        print(f"[GUI] Resolution changed to {res_label} ({self.res_map[res_label]})")
+        for info in self.frames:
+            if info.get('meta_label'):
+                fps = self.desired_fps.get()
+                resolution = self.res_map.get(res_label)
+                info['meta_label'].config(text=f"Camera → {info['camera_index']} ({resolution[0]}x{resolution[1]}@{fps}fps)")
+
+
     def on_closing(self):
         """Save configuration before closing"""
+
+        # Stop reliability monitoring first
+        if hasattr(self, 'reliability_monitor'):
+            self.reliability_monitor.stop_monitoring()
+        
+        # Stop participant update processor
+        if hasattr(self, 'participant_update_queue'):
+            try:
+                self.participant_update_queue.put(None)
+            except:
+                pass
+        
+        # Stop correlation monitor
+        if hasattr(self, 'correlation_queue'):
+            try:
+                self.correlation_queue.put(None)
+            except:
+                pass
+
+        # Clean up drawing manager
+        if hasattr(self, 'drawingmanager '):
+            for idx in range(len(self.frames)):
+                self.drawingmanager .cleanup_canvas(idx)
+        
+        if hasattr(self, 'correlation_monitor_proc') and self.correlation_monitor_proc:
+            self.correlation_monitor_proc.terminate()
+            self.correlation_monitor_proc.join(timeout=1.0)
+        
         # Save current settings
         self.config.set('camera_settings.target_fps', self.desired_fps.get())
         self.config.set('camera_settings.resolution', self.res_choice.get())
-        self.config.set('startup_mode.multi_face', self.multi_face_mode.get())
         self.config.set('startup_mode.participant_count', self.participant_count.get())
         self.config.set('startup_mode.camera_count', self.camera_count.get())
         self.config.set('startup_mode.enable_mesh', self.enable_mesh.get())
+        self.config.set('startup_mode.enable_pose', self.enable_pose.get())
+        
+        # Clean up shared memory
+        if hasattr(self, 'correlation_buffer'):
+            try:
+                self.correlation_buffer.close()
+                self.correlation_buffer.unlink()
+            except:
+                pass
+        
+        # Stop LSL helper
+        if hasattr(self, 'lsl_helper_proc') and self.lsl_helper_proc is not None and self.lsl_helper_proc.is_alive():
+            self.lsl_command_queue.put({'type': 'stop'})
+            self.lsl_helper_proc.terminate()
+            self.lsl_helper_proc.join(timeout=1.0)
         
         self.destroy()
-    
+
     def on_mesh_toggle(self):
         """Notify each worker to turn raw‐mesh pushing on/off."""
         val = self.enable_mesh.get()
+        print(f"[GUI] Mesh toggle changed to: {val}")
+        
+        # First, notify all workers
         for info in self.frames:
             conn = info.get('control_conn')
             if conn:
                 conn.send(('set_mesh', val))
                 print(f"[GUI] Sent mesh toggle → {val} to worker")
-
-    def on_mode_toggle(self):
-        if self.multi_face_mode.get():          # ── Multi-face
-            # lock both boxes
-            # single camera, but dynamic participants
-            self.cam_spin .config(state='disabled')
-            self.camera_count.set(1)
-            self.part_spin.config(state='normal')
- 
-        else:                                   # ── Holistic
-            # enable and let the trace keep them equal
-            # both spinboxes enabled and mirrored
-            self.part_spin.config(state='normal')
-            self.cam_spin .config(state='normal')
-        # re-sync counts by passing in any of the traced var names
-        self._sync_counts(self.participant_count._name, None, None)
-        # rebuild frames immediately
-        self.build_frames()
         
+        # If streaming, force recreation of all streams
+        if self.streaming and hasattr(self, 'lsl_command_queue'):
+            # Send a special command to force recreation
+            self.lsl_command_queue.put({
+                'type': 'force_recreate_streams',
+                'mesh_enabled': val
+            })
+    def on_pose_toggle(self):
+        enabled = self.enable_pose.get()
+        for info in self.frames:
+            if info.get('control_conn'):
+                info['control_conn'].send(('enable_pose', enabled))
+        # LSL streams
+        if self.streaming and hasattr(self, 'lsl_command_queue'):
+            for idx, info in enumerate(self.frames):
+                participant_id = self.participant_names.get(idx, f"P{idx+1}")
+                if enabled:
+                    print(f"[GUI] ({'Enabling' if enabled else 'Disabling'}) pose stream for:", participant_id)
+
+                    self.lsl_command_queue.put({
+                        'type': 'create_pose_stream',
+                        'participant_id': participant_id,
+                        'fps': self.desired_fps.get()
+                    })
+                else:
+                    self.lsl_command_queue.put({
+                        'type': 'close_pose_stream',
+                        'participant_id': participant_id
+                    })
+        print(f"[GUI] Pose estimation: {'enabled' if enabled else 'disabled'}")
+
     def on_record_toggle(self):
         """Handle recording toggle state change"""
         enabled = self.record_video.get()
@@ -581,29 +735,37 @@ class YouQuantiPyGUI(tk.Tk):
 
     def update_participant_names(self):
         """Periodically update participant names from entry fields"""
-        # Schedule next update
-        self.after(1000, self.update_participant_names)  # Update every second
+        self.after(1000, self.update_participant_names)
         
-        if self.multi_face_mode.get():
-            # Update multiface participant names
-            if hasattr(self, 'multi_entries'):
-                self.participant_names = {}
-                for idx, entry in enumerate(self.multi_entries):
-                    name = entry.get().strip()
-                    if name:
-                        self.participant_names[idx + 1] = name  # Face IDs start at 1
-                    else:
-                        self.participant_names[idx + 1] = f"Face {idx + 1}"
-        else:
-            # Update holistic participant names
-            self.participant_names = {}
-            for idx, info in enumerate(self.frames):
-                if info.get('entry'):
-                    name = info['entry'].get().strip()
-                    if name:
-                        self.participant_names[idx] = name
-                    else:
-                        self.participant_names[idx] = f"P{idx + 1}"
+        # Update participant names from entries
+        if hasattr(self, 'participant_entries'):
+            names_changed = False
+            for idx, entry in enumerate(self.participant_entries):
+                name = entry.get().strip()
+                old_name = self.participant_names.get(idx, f"P{idx + 1}")
+                if name:
+                    if name != old_name:
+                        names_changed = True
+                    self.participant_names[idx] = name
+                else:
+                    if f"P{idx + 1}" != old_name:
+                        names_changed = True
+                    self.participant_names[idx] = f"P{idx + 1}"
+        
+        # Update the global participant manager with current names
+        if hasattr(self, 'global_participant_manager'):
+            self.global_participant_manager.set_participant_names(self.participant_names)
+        
+        # If streaming and names changed, update all fusion processes
+        if self.streaming and names_changed:
+            for cam_idx, pipe in self.participant_mapping_pipes.items():
+                try:
+                    pipe.send({
+                        'type': 'participant_names',
+                        'names': self.global_participant_manager.participant_names.copy()
+                    })
+                except:
+                    pass
 
     def on_landmarker_result(self, idx, result):
         info = self.frames[idx]
@@ -622,92 +784,77 @@ class YouQuantiPyGUI(tk.Tk):
 
     def build_frames(self):
         print("[DEBUG] build_frames called")
-        print(f"[DEBUG] build_frames: about to tear down {len(self.frames)} frames")
-
-        # --- cancel any lingering preview callbacks before teardown ---
-        # 1) cancel pending callbacks
+        
+        # Cancel any lingering preview callbacks
         for info in self.frames:
             if aid := info.get('after_id'):
                 self.after_cancel(aid)
 
-        # 2) stop & join threads, release cameras
+        # Stop & join threads
         for info in self.frames:
             if info.get('proc'):
                 info['proc'].terminate()
                 info['proc'].join(timeout=1.0)
 
-
-        # 3) destroy all canvas frames and cache objects
+        # Destroy all canvas frames and cache objects
         for w in self.container.winfo_children():
             w.destroy()
-        self.canvas_objects.clear()
-        self.transform_cache.clear()
-        self.last_frame_time.clear()
 
         if hasattr(self, '_photo_images'):
             self._photo_images.clear()
-    
-        # 4) now clear the list
+
+        # Clear the list
         self.frames.clear()
         self.cams = list_video_devices()
-        cams = len(self.cams)
+        
+        # Clear IPC state
+        self.worker_procs = []
+        self.preview_queues = []
+        self.score_queues = []
+        self.recording_queues = []
 
-        # 5) clear IPC state
-        self.worker_procs   = [None] * cams
-        self.preview_queues = [None] * cams
-        self.score_queues   = [None] * cams
+        # Get camera count (limited by participant count)
+        cam_count = min(self.camera_count.get(), self.participant_count.get())
+        self.camera_count.set(cam_count)
+        self.cam_spin.config(to=self.participant_count.get())
 
-        # holistically mirror cameras to participants; multiface always 1
-        if self.multi_face_mode.get():
-            cams = 1
-        else:
-            # clamp camera_count to [1, participant_count]
-            cams = max(1, min(self.camera_count.get(), self.participant_count.get()))
-        # update the IntVar and the spinbox bounds
-        self.camera_count.set(cams)
-        if self.multi_face_mode.get():
-            self.cam_spin.config(to=1)
-        else:
-            self.cam_spin.config(to=self.participant_count.get())
-            # --- Create Participant name input for multiface ---
-        # Remove any old panel
+        # Remove any old multiface panel if it exists
         if hasattr(self, 'multi_panel'):
             self.multi_panel.destroy()
 
-        # Create participant name entry panel for multiface mode
-        if self.multi_face_mode.get():
-            self.multi_panel = ttk.LabelFrame(self, text="Participant Names")
-            self.multi_panel.grid(row=2, column=1, columnspan=3, padx=10, pady=10, sticky='ew')
-            
-            # Clear any old list
-            self.multi_entries = []
-            
-            for i in range(self.participant_count.get()):
-                row = ttk.Frame(self.multi_panel)
-                row.pack(fill='x', padx=5, pady=2)
-                ttk.Label(row, text=f"Face {i+1}:").pack(side='left', padx=(0,5))
-                ent = ttk.Entry(row, width=20)
-                ent.insert(0, f"Participant {i+1}")  # Default name
-                ent.pack(side='left', padx=5)
-                self.multi_entries.append(ent)
-                self.participant_names[i + 1] = f"Participant {i+1}"
-        else:
-            # Clean up entries if switching away from multiface
-            if hasattr(self, 'multi_entries'):
-                self.multi_entries = []
+        # Create participant name panel
+        self.participant_panel = ttk.LabelFrame(self, text="Participant Names")
+        self.participant_panel.grid(row=2, column=1, columnspan=3, padx=10, pady=10, sticky='ew')
+        
+        self.participant_entries = []
+        for i in range(self.participant_count.get()):
+            row = ttk.Frame(self.participant_panel)
+            row.pack(fill='x', padx=5, pady=2)
+            ttk.Label(row, text=f"Participant {i+1}:").pack(side='left', padx=(0,5))
+            ent = ttk.Entry(row, width=20)
+            ent.insert(0, f"P{i+1}")  # Default name
+            ent.pack(side='left', padx=5)
+            self.participant_entries.append(ent)
+            self.participant_names[i] = f"P{i+1}"
+            ent.bind("<KeyRelease>", lambda event, idx=i: self.on_participant_name_change(idx, event.widget.get().strip()))
+
 
         # Build camera selection values
-        cam_vals = [f"{i}: {name} ({w}x{h})" for i,name,w,h in self.cams]
+        cam_vals = [f"{i}: {name})" for i,name,w,h in self.cams]
+
+        # Initialize LSL helper if needed
+        if not hasattr(self, 'lsl_helper_proc') or self.lsl_helper_proc is None or not self.lsl_helper_proc.is_alive():
+            self._initialize_lsl_helper()
 
         def on_select(idx, event=None):
             print(f"[DEBUG] on_select(idx={idx})")
-
+            
             if idx < 0 or idx >= len(self.frames):
                 return
 
             info = self.frames[idx]
             parent_conn, child_conn = Pipe()
-            info['control_conn'] = parent_conn 
+            info['control_conn'] = parent_conn
 
             # Clean up any previous process
             if info.get('proc'):
@@ -718,450 +865,427 @@ class YouQuantiPyGUI(tk.Tk):
             sel = info['combo'].get()
             cam_idx = int(sel.split(":", 1)[0])
 
-            pv_q = MPQueue(maxsize=2) #preview queue
-            enable_mesh = self.enable_mesh.get()
-            multi_face = self.multi_face_mode.get()
+            #Kill any existing process using the same camera index (elsewhere) 
+            for other_idx, other_info in enumerate(self.frames):
+                if other_idx == idx:
+                    continue
+                other_proc = other_info.get('proc')
+                other_sel = other_info.get('combo').get() if other_info.get('combo') else None
+                if other_sel:
+                    other_cam_idx = int(other_sel.split(":", 1)[0])
+                    if other_cam_idx == cam_idx and other_proc and other_proc.is_alive():
+                        print(f"[GUI] Terminating process for camera {other_cam_idx} in slot {other_idx} (duplicate usage)")
+                        other_proc.terminate()
+                        other_proc.join(timeout=2.0)
+                        other_info['proc'] = None
 
+            pv_q = MPQueue(maxsize=2)
+            rec_q = MPQueue(maxsize=10)
+
+            # Update queues
             if idx >= len(self.preview_queues):
                 self.preview_queues.append(pv_q)
+                self.recording_queues.append(rec_q)
             else:
                 self.preview_queues[idx] = pv_q
+                self.recording_queues[idx] = rec_q
 
-            # Create numpy shared buffer instead of regular SharedScoreBuffer
-            score_buffer = NumpySharedBuffer(104 if multi_face else 52)
+            # Create score buffer
+            score_buffer = NumpySharedBuffer(52)
             info['score_buffer'] = score_buffer
-            score_buffer_name = score_buffer.name  # Get the shared memory name
+            score_buffer_name = score_buffer.name
 
-            fps = self.auto_detect_optimal_fps(cam_idx)
-            res_label = self.res_choice.get()            # e.g. "720p"
-            resolution = self.res_map.get(res_label, CAM_RESOLUTION)
+            # Get FPS and resolution
+            if info['use_auto_fps'].get():
+                best = self.auto_detect_optimal_fps(cam_idx)
+                fps = int(best['actual_fps'])
+                resolution = tuple(map(int, best['resolution'].split('x')))
+            else:
+                fps = self.desired_fps.get()
+                res_label = self.res_choice.get()
+                resolution = self.res_map.get(res_label, CAM_RESOLUTION)
 
-            # Update camera resolution for this specific camera
             info['resolution'] = resolution
             info['fps'] = fps
 
-            
+            # Create participant mapping pipe for this camera
+            main_pipe, worker_pipe = Pipe()
+            self.participant_mapping_pipes[cam_idx] = main_pipe
 
-            if not multi_face:
-                pid = info['entry'].get().strip() or f"P{idx+1}"
-                stream_name = f"{pid}_landmarks"
-                participant_id = pid
-                self.participant_names[idx] = participant_id
-            else:
-                stream_name = None
-                participant_id = None
+            max_participants = self.participant_count.get()
 
-            # Pass the buffer name instead of the buffer object
+            # Start correlation monitor if not running
+            if not self.correlation_monitor_proc or not self.correlation_monitor_proc.is_alive():
+                self._start_correlation_monitor()
+
+            # Start worker process with queues and pipes
             proc = Process(
-                target=participant_worker,
-                args=(cam_idx, self.MODEL_PATH, participant_id, stream_name, fps,
-                    enable_mesh, multi_face, pv_q, score_buffer_name, child_conn, resolution),  # Changed score_buffer to score_buffer_name
-                daemon=True
+                target=parallel_participant_worker,
+                args=(cam_idx, self.MODEL_PATH, self.POSE_MODEL_PATH,
+                    fps, self.enable_mesh.get(), self.enable_pose.get(),
+                    pv_q, score_buffer_name, child_conn,
+                    rec_q, self.lsl_data_queue,
+                    self.participant_update_queue,
+                    worker_pipe, self.correlation_queue,
+                    max_participants,
+                    resolution),
+                daemon=False
             )
             proc.start()
             info['proc'] = proc
             info['meta_label'].config(text=f"Camera → {cam_idx} ({resolution[0]}x{resolution[1]}@{fps}fps)")
-            
-            # Update record now button state when a camera is selected
+            # Update record button state
             if self.record_video.get() and not self.streaming:
                 self.record_now_btn.config(state='normal')
+            # Update global active camera mapping
+            self.active_camera_procs[cam_idx] = proc
 
-        for i in range(self.camera_count.get()):
-            frame = ttk.LabelFrame(self.container, text=f"Camera {i}")  
+
+        # Create camera frames
+        for i in range(cam_count):
+            frame = ttk.LabelFrame(self.container, text=f"Camera {i}")
             frame.grid(row=0, column=i, padx=5, sticky='nsew')
             self.container.grid_columnconfigure(i, weight=1)
-            self.container.grid_rowconfigure(0, weight=1) 
+            self.container.grid_rowconfigure(0, weight=1)
             frame.grid_columnconfigure(0, weight=1)
             frame.grid_rowconfigure(1, weight=1)
-            row = 0
-            ent    = ttk.Entry(frame, width=15) if not self.multi_face_mode.get() else None
-            if ent: ent.grid(row=0, column=0, sticky='w', padx=4, pady=2)
 
-            #Stretchy canvas
-            canvas = tk.Canvas(frame, bg='black',highlightthickness=0, borderwidth=0)
+            # Canvas
+            canvas = tk.Canvas(frame, bg='black', highlightthickness=0, borderwidth=0)
             canvas.grid(row=1, column=0, sticky='nsew', padx=2, pady=2)
 
-            #Meta label + combobox sit under the canvas
-            meta = ttk.Label(frame, text="ID: -, Stream: -")
+            # Meta label
+            meta = ttk.Label(frame, text="Camera not selected")
             meta.grid(row=2, column=0, sticky='w', padx=2, pady=(4,0))
 
+            # Camera selector
             cmb = ttk.Combobox(frame, values=cam_vals, state='readonly', width=30)
-            if cam_vals: cmb.current(0)
+            if cam_vals: 
+                cmb.current(0)
             cmb.grid(row=4, column=0, sticky='we', padx=2, pady=(0,4))
-            frame.grid_columnconfigure(0, weight=1)   
 
-            # Store references for later use
+            # Auto FPS toggle
+            use_auto_fps = tk.BooleanVar(value=False)
+            chk = ttk.Checkbutton(frame, text="Auto-detect optimal FPS", variable=use_auto_fps)
+            chk.grid(row=5, column=0, sticky='w', padx=2, pady=(0,4))
+
+            # Store references
             info = {
                 'frame': frame,
-                'entry': ent,
                 'canvas': canvas,
                 'meta_label': meta,
                 'combo': cmb,
                 'proc': None,
                 'preview_queue': None,
                 'score_buffer': None,
+                'use_auto_fps': use_auto_fps,
+                'camera_index': i
             }
             self.frames.append(info)
 
-            # Bind the combobox selection event to on_select
+            # Bind selection event
             cmb.bind("<<ComboboxSelected>>", lambda event, idx=i: on_select(idx, event))
 
+            self.diagnose_pipeline() #call the diagnostic
+
+    def _initialize_lsl_helper(self):
+        """Initialize the LSL helper process"""
+        self.lsl_command_queue = MPQueue()
+        self.lsl_data_queue = MPQueue()
+        
+        # Create correlation buffer
+        if hasattr(self, 'correlation_buffer'):
+            try:
+                self.correlation_buffer.close()
+                self.correlation_buffer.unlink()
+            except:
+                pass
+        
+        self.correlation_buffer = shared_memory.SharedMemory(
+            create=True, 
+            size=52 * 4  # float32 array
+        )
+        self.corr_array = np.ndarray((52,), dtype=np.float32, 
+                                    buffer=self.correlation_buffer.buf)
+        
+        # Start LSL helper process
+        self.lsl_helper_proc = Process(
+            target=lsl_helper_process,
+            args=(self.lsl_command_queue, self.lsl_data_queue, 
+                self.correlation_buffer.name, self.desired_fps.get()),
+            daemon=True
+        )
+        self.lsl_helper_proc.start()
+        print("[GUI] LSL helper process started")
+
     def auto_detect_optimal_fps(self, cam_idx):
-        """Auto-detect and set optimal FPS for camera"""
-        # Quick test capture
+        """Test camera to find best resolution/FPS combination"""
+        test_configs = [
+            # (width, height, target_fps)
+            (320, 240, 120),
+            (320, 240, 60),
+            (640, 480, 60),
+            (640, 480, 30),
+            (1280, 720, 60),
+            (1280, 720, 30),
+            (1920, 1080, 30),
+        ]
+        
+        camera_opt_results = []
+        
+        for width, height, target_fps in test_configs:
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                continue
 
-        res_label = self.res_choice.get()               # e.g. "720p"
-        width, height = self.res_map.get(res_label, CAM_RESOLUTION)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FPS, target_fps)
 
-        cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            # Warm-up
+            start_time = time.time()
+            while time.time() - start_time < 0.5:  # 0.5 sec warm-up
+                cap.read()
+
+            # Measure for longer
+            measure_time = 2.0
+            frames = 0
+            unique = 0
+            last_hash = None
+            measure_start = time.time()
+            while time.time() - measure_start < measure_time:
+                ret, frame = cap.read()
+                if ret:
+                    frames += 1
+                    h = hash(frame[::10, ::10].tobytes())
+                    if h != last_hash:
+                        unique += 1
+                        last_hash = h
+
+            cap.release()
+            actual_fps = unique / measure_time
+            camera_opt_results.append({
+                'resolution': f"{width}x{height}",
+                'target_fps': target_fps,
+                'actual_fps': actual_fps,
+                'efficiency': actual_fps / target_fps if target_fps > 0 else 0
+            })
+            
+            print(f"[Camera Test] {width}x{height}@{target_fps}: {actual_fps:.1f} FPS actual")
         
-        # Test actual frame rate
-        test_duration = 5.0  # seconds
-        start_time = time.time()
-        frame_count = 0
-        last_frame = None
-        unique_count = 0
+        def select_smart_config(configs):
+            """Prefers higher resolution unless it costs ≥10 fps vs next lowest."""
+            # Parse width, height for sorting
+            for cfg in configs:
+                w, h = map(int, cfg['resolution'].split('x'))
+                cfg['width'] = w
+                cfg['height'] = h
+                cfg['pixels'] = w * h
+
+            # Sort by pixel count (ascending)
+            configs = sorted(configs, key=lambda x: x['pixels'])
+
+            best = configs[0]
+            for i in range(1, len(configs)):
+                prev = configs[i-1]
+                curr = configs[i]
+                if prev['actual_fps'] - curr['actual_fps'] >= 10:
+                    # Too much fps drop, pick previous
+                    break
+                else:
+                    best = curr  # Move up to higher res
+
+            return best
+
         
-        print(f"[GUI] Testing camera {cam_idx} for optimal FPS ETA {test_duration} seconds: ...")
-        while time.time() - start_time < test_duration:
-            ret, frame = cap.read()
-            if ret:
-                frame_count += 1
-                # Check if unique
-                if last_frame is None or not np.array_equal(frame[::10, ::10], last_frame):
-                    unique_count += 1
-                    last_frame = frame[::10, ::10].copy()
+        # Find best configuration
+        best = select_smart_config(camera_opt_results)
+        print(f"[Camera Test] Best config: {best['resolution']} @ {best['actual_fps']:.1f} FPS")
         
-        cap.release()
+        return best
+    
         
-        actual_fps = unique_count / test_duration
-        print(f"[GUI] Camera {cam_idx} actual FPS: {actual_fps:.1f}")
+    def diagnose_pipeline(self):
+        """Diagnostic method to test if the pipeline is working"""
+        print("\n=== PIPELINE DIAGNOSIS ===")
         
-        # Set FPS to slightly below actual to avoid duplicates
-        optimal_fps = int(actual_fps * 0.98)  # 98% of actual
-        self.desired_fps.set(optimal_fps)
-        return optimal_fps
+        # Check if workers are running
+        active_workers = 0
+        for idx, info in enumerate(self.frames):
+            if info.get('proc') and info['proc'].is_alive():
+                active_workers += 1
+                print(f"Worker {idx}: RUNNING")
+            else:
+                print(f"Worker {idx}: NOT RUNNING")
+        
+        print(f"Active workers: {active_workers}")
+        
+        # Check if preview queues have data
+        for idx, q in enumerate(self.preview_queues):
+            if q:
+                print(f"Preview queue {idx}: {q.qsize()} items")
+            else:
+                print(f"Preview queue {idx}: None")
+        
+        # Check LSL helper
+        if not hasattr(self, 'lsl_helper_proc') or self.lsl_helper_proc is None or not self.lsl_helper_proc.is_alive():
+            print("LSL Helper: RUNNING")
+        else:
+            print("LSL Helper: NOT RUNNING")
+        
+        # Check streaming state
+        print(f"Streaming active: {self.streaming}")
+        
+        print("=== END DIAGNOSIS ===\n")
     
     def schedule_preview(self):
-        """Optimized preview focusing on video smoothness"""
-        # Run at 30ms intervals (33 FPS) for smoother perception
+        """Enhanced preview updates using the drawing manager."""
+        # Schedule next update
         self.after(GUI_scheduler_time, self.schedule_preview)
         
-        # Process all canvases in rotation
+        # Update GUI responsiveness timestamp
+        if hasattr(self, 'reliability_monitor'):
+            self.reliability_monitor.update_gui_timestamp()
+        
         for idx, q in enumerate(self.preview_queues):
             if not q or idx >= len(self.frames):
                 continue
             
-            # Get latest frame without blocking
-            latest_msg = None
-            try:
-                # Keep only the latest frame
-                while not q.empty():
-                    latest_msg = q.get_nowait()
-            except:
+            # Check if we should skip this frame (FPS limiting)
+            if self.drawingmanager .should_skip_frame(idx):
                 continue
-                
+            
+            # Get latest frame (with batching)
+            latest_msg = None
+            drop_count = 0
+            max_drain = 20
+            
+            try:
+                while drop_count < max_drain:
+                    try:
+                        if q.empty():
+                            break
+                        latest_msg = q.get_nowait()
+                        drop_count += 1
+                    except queue.Empty:
+                        break
+            except Exception as e:
+                print(f"[GUI Preview {idx}] Queue error: {e}")
+                continue
+            
             if latest_msg is None:
                 continue
-
-            canvas = self.frames[idx]['canvas']
-            W, H = canvas.winfo_width(), canvas.winfo_height()
             
-            if W <= 1 or H <= 1:
-                continue
-
-            frame_bgr = latest_msg.get('frame_bgr', None)
-            if frame_bgr is None:
-                continue
-
+            # Track dropped frames
+            if drop_count > 1 and hasattr(self, 'reliability_monitor'):
+                self.reliability_monitor.track_dropped_frames(drop_count - 1)
+            
             try:
-                # Render image with PhotoImage reuse
-                img = self._render_image_fast(frame_bgr, W, H, idx)
-                if img is not None:
-                    # Update image without recreating canvas items
-                    if hasattr(canvas, '_image_id'):
-                        canvas.itemconfig(canvas._image_id, image=img)
-                    else:
-                        canvas._image_id = canvas.create_image(W // 2, H // 2, 
-                                                            image=img, anchor='center')
-                    canvas.image = img  # Keep reference
-
-                    # Draw overlays
-                    if latest_msg['mode'] == 'holistic':
-                        face_lms = latest_msg.get('face', [])
-                        pose_lms = latest_msg.get('pose', [])
-                        self._draw_holistic_fast(canvas, face_lms, pose_lms, W, H, idx)
-                    else:
-                        faces = latest_msg.get('faces', [])
-                        self._draw_multiface_fast(canvas, faces, W, H, idx)
+                canvas = self.frames[idx]['canvas']
+                
+                # Render frame
+                frame_bgr = latest_msg.get('frame_bgr')
+                if frame_bgr is not None:
+                    self.drawingmanager .render_frame_to_canvas(frame_bgr, canvas, idx)
+                
+                # Draw face overlays
+                faces = latest_msg.get('faces', [])
+                if faces:
+                    # Get labels
+                    labels = {}
+                    for face in faces:
+                        global_id = face.get('id')
+                        if global_id and not isinstance(global_id, str):
+                            labels[global_id] = self.global_participant_manager.get_participant_name(global_id)
+                    
+                    # Draw faces with optimization
+                    self.drawingmanager .draw_faces_optimized(
+                        canvas, faces, idx, 
+                        labels=labels,
+                        participant_count=self.participant_count.get(),
+                        participant_names=self.participant_names
+                    )
+                
+                # Draw pose overlays
+                if self.enable_pose.get():
+                    all_poses = latest_msg.get('all_poses', [])
+                    self.drawingmanager .draw_poses_optimized(
+                        canvas, all_poses, idx, 
+                        enabled=True
+                    )
+                
+                # Track successful update
+                if hasattr(self, 'reliability_monitor'):
+                    self.reliability_monitor.track_preview_update()
+                    
             except Exception as e:
-                print(f"[GUI] Error in preview for canvas {idx}: {e}")
+                print(f"[GUI Preview {idx}] Error: {e}")
+                import traceback
+                traceback.print_exc()
 
-    def _render_image_fast(self, frame_bgr, W, H, canvas_idx):
-        """Optimized image rendering with dynamic quality adjustment"""
-        frame_h, frame_w = frame_bgr.shape[:2]
-        
-        # Calculate scaling to fit within canvas while maintaining aspect ratio
-        scale = min(W / frame_w, H / frame_h)
-        scaled_w, scaled_h = int(frame_w * scale), int(frame_h * scale)
-        
-        # PERFORMANCE: Use lower quality interpolation for high resolution
-        if frame_w > 1280 or frame_h > 720:
-            interpolation = cv2.INTER_NEAREST  # Fastest for high res
-        else:
-            interpolation = cv2.INTER_LINEAR   # Better quality for lower res
-        
-        # Calculate offsets to center the image
-        x_offset = (W - scaled_w) // 2
-        y_offset = (H - scaled_h) // 2
-        
-        # Store these values for coordinate transformation
-        if canvas_idx not in self.transform_cache:
-            self.transform_cache[canvas_idx] = {}
-        self.transform_cache[canvas_idx]['video_bounds'] = (x_offset, y_offset, scaled_w, scaled_h)
-        
-        # Resize frame to fit
-        if abs(scale - 1.0) > 0.01:
-            frame_bgr = cv2.resize(frame_bgr, (scaled_w, scaled_h), interpolation=interpolation)
-        
-        # PERFORMANCE: For 1080p, consider downsampling the canvas buffer
-        if W > 960 or H > 540:  # If canvas is large
-            # Create smaller buffer first, then scale up
-            small_w, small_h = W // 2, H // 2
-            small_canvas = np.zeros((small_h, small_w, 3), dtype=np.uint8)
-            
-            # Calculate positions in small canvas
-            small_x_offset = x_offset // 2
-            small_y_offset = y_offset // 2
-            small_scaled_w = scaled_w // 2
-            small_scaled_h = scaled_h // 2
-            
-            # Resize frame to smaller size
-            small_frame = cv2.resize(frame_bgr, (small_scaled_w, small_scaled_h), 
-                                    interpolation=cv2.INTER_NEAREST)
-            
-            # Place in small canvas
-            small_canvas[small_y_offset:small_y_offset+small_scaled_h, 
-                        small_x_offset:small_x_offset+small_scaled_w] = small_frame
-            
-            # Scale up to full size
-            canvas_img = cv2.resize(small_canvas, (W, H), interpolation=cv2.INTER_NEAREST)
-        else:
-            # Normal processing for smaller canvases
-            canvas_img = np.zeros((H, W, 3), dtype=np.uint8)
-            canvas_img[y_offset:y_offset+scaled_h, x_offset:x_offset+scaled_w] = frame_bgr
-        
-        # Convert to RGB
-        rgb = cv2.cvtColor(canvas_img, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb)
-        
-        # Reuse PhotoImage if it exists
-        if hasattr(self, '_photo_images') and canvas_idx in self._photo_images:
-            self._photo_images[canvas_idx].paste(pil_img)
-            return self._photo_images[canvas_idx]
-        else:
-            if not hasattr(self, '_photo_images'):
-                self._photo_images = {}
-            photo = ImageTk.PhotoImage(pil_img)
-            self._photo_images[canvas_idx] = photo
-            return photo
-
-    
-    def _draw_connections_fast(self, canvas, landmarks, connections, line_cache, color, width):
-        """Draw connections reusing existing line objects when possible"""
-        connection_list = list(connections)
-        
-        # Extend cache if we need more lines
-        while len(line_cache) < len(connection_list):
-            line_id = canvas.create_line(0, 0, 0, 0, fill=color, width=width)
-            line_cache.append(line_id)
-        
-        # Update existing lines
-        for i, (start_idx, end_idx) in enumerate(connection_list):
-            if i >= len(line_cache):
-                break
-                
-            if start_idx < len(landmarks) and end_idx < len(landmarks):
-                x1, y1, _ = landmarks[start_idx]
-                x2, y2, _ = landmarks[end_idx]
-                
-                # Update existing line coordinates
-                canvas.coords(line_cache[i], int(x1), int(y1), int(x2), int(y2))
-                canvas.itemconfig(line_cache[i], state='normal')
-            else:
-                # Hide unused line
-                canvas.itemconfig(line_cache[i], state='hidden')
-        
-        # Hide excess lines if we have more cached than needed
-        for i in range(len(connection_list), len(line_cache)):
-            canvas.itemconfig(line_cache[i], state='hidden')
-
-   
-    def _draw_holistic_fast(self, canvas, face_lms, pose_lms, W, H, canvas_idx):
-        # Initialize canvas objects cache for this canvas if not exists
-        if canvas_idx not in self.canvas_objects:
-            self.canvas_objects[canvas_idx] = {
-                'face_lines': [],
-                'pose_lines': [],
-                'face_points': [],
-                'pose_points': []
-            }
-        
-        cache = self.canvas_objects[canvas_idx]
-        
-        # Get video bounds for proper coordinate transformation
-        video_bounds = self.transform_cache.get(canvas_idx, {}).get('video_bounds', (0, 0, W, H))
-        x_offset, y_offset, video_w, video_h = video_bounds
-    
-        def transform_coords_to_video_area(lms):
-            """Transform normalized coords to actual video area within canvas"""
-            if not lms:
-                return []
-            # Scale to video dimensions and offset to video position
-            return [(x * video_w + x_offset, y * video_h + y_offset, z) for x, y, z in lms]
-        
-        # Transform coordinates
-        face_coords = transform_coords_to_video_area(face_lms) if face_lms else []
-        pose_coords = transform_coords_to_video_area(pose_lms) if pose_lms else []
-        
-        # Draw or hide face mesh
-        if face_coords and len(face_coords) > 0:
-            if self.enable_mesh.get():
-                # Full tessellation with semi-transparency
-                connections = mp.solutions.face_mesh.FACEMESH_TESSELATION
-                self._draw_connections_fast(canvas, face_coords, connections, 
-                                        cache['face_lines'], '#40FF40', 1)
-            else:
-                # Just contours for performance
-                connections = mp.solutions.face_mesh.FACEMESH_CONTOURS
-                self._draw_connections_fast(canvas, face_coords, connections, 
-                                        cache['face_lines'], '#00FF00', 1)
-        else:
-            # No face landmarks - hide all face lines
-            for line_id in cache['face_lines']:
-                canvas.itemconfig(line_id, state='hidden')
-        
-        # Draw or hide pose
-        if pose_coords and len(pose_coords) > 0:
-            connections = mp.solutions.holistic.POSE_CONNECTIONS
-            self._draw_connections_fast(canvas, pose_coords, connections, 
-                                    cache['pose_lines'], '#40FFFF', 2)
-        else:
-            # No pose landmarks - hide all pose lines
-            for line_id in cache['pose_lines']:
-                canvas.itemconfig(line_id, state='hidden')
-
-
-    def _draw_multiface_fast(self, canvas, faces, W, H, canvas_idx):
-        """Fixed multiface drawing with names and tessellation"""
-        if canvas_idx not in self.canvas_objects:
-            self.canvas_objects[canvas_idx] = {
-                'face_lines': {},
-                'face_labels': {}
-            }
-        
-        cache = self.canvas_objects[canvas_idx]
-        
-        # Get video bounds
-        video_bounds = self.transform_cache.get(canvas_idx, {}).get('video_bounds', (0, 0, W, H))
-        x_offset, y_offset, video_w, video_h = video_bounds
-        
-        active_faces = set()
-        
-        for face in faces:
-            fid = face['id']
-            active_faces.add(fid)
-            lm_xyz = face['landmarks']
-            cx_norm, cy_norm = face['centroid']
-            
-            if fid not in cache['face_lines']:
-                cache['face_lines'][fid] = []
-            if fid not in cache['face_labels']:
-                cache['face_labels'][fid] = None
-            
-            # Transform landmarks to video area coordinates
-            canvas_landmarks = [(x * video_w + x_offset, y * video_h + y_offset, z) 
-                            for x, y, z in lm_xyz]
-            
-            # Use TESSELLATION for more detailed mesh with transparency
-            connections = mp.solutions.face_mesh.FACEMESH_TESSELATION
-            self._draw_connections_fast(canvas, canvas_landmarks, connections, 
-                                    cache['face_lines'][fid], '#40FF40', 1)
-            
-            # Transform label position properly and place above face
-            label_x = int(cx_norm * video_w + x_offset)
-            label_y = int(cy_norm * video_h + y_offset) - 50
-            label_text = self.participant_names.get(fid, f"Face {fid}")
-            
-            if cache['face_labels'][fid] is None:
-                cache['face_labels'][fid] = canvas.create_text(
-                    label_x, label_y, text=label_text,
-                    fill='yellow', font=('Arial', 14, 'bold'),
-                    anchor='center'
-                )
-            else:
-                canvas.coords(cache['face_labels'][fid], label_x, label_y)
-                canvas.itemconfig(cache['face_labels'][fid], text=label_text, state='normal')  # Always show
-        
-        # Hide only truly inactive faces
-        for fid in list(cache['face_lines'].keys()):
-            if fid not in active_faces:
-                for line_id in cache['face_lines'][fid]:
-                    canvas.itemconfig(line_id, state='hidden')
-                if cache['face_labels'].get(fid):
-                    canvas.itemconfig(cache['face_labels'][fid], state='hidden')
-
-    def continuous_correlation_monitor(self):
-        """Continuously monitor for correlation data regardless of streaming state"""
-        self.after(33, self.continuous_correlation_monitor)
-        
-        if self.streaming:
-            if hasattr(self, 'latest_correlation') and self.latest_correlation is not None:
-                self.update_plot(self.latest_correlation)
+    def debug_canvas_state(self, canvas_idx=None):
+        """Debug canvas state using drawing manager stats."""
+        if canvas_idx is None:
+            for idx in range(len(self.frames)):
+                self.debug_canvas_state(idx)
             return
         
-        # Fallback to direct buffer reading when not streaming (for testing)
-        scores = []
+        if canvas_idx >= len(self.frames):
+            return
         
-        if self.multi_face_mode.get():
-            active_workers = [info for info in self.frames if info.get('proc') and info.get('score_buffer')]
-            if len(active_workers) >= 1:
-                buffer = active_workers[0]['score_buffer']
-                if buffer is not None:
-                    try:
-                        data, ts = buffer.read_latest()
-                        if data is not None and len(data) >= 104:
-                            scores.append(data[:52])
-                            scores.append(data[52:104])
-                    except:
-                        pass
+        print(f"\n[Canvas Debug] Canvas {canvas_idx}:")
+        stats = self.drawingmanager .get_stats(canvas_idx)
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+    
+    def on_participant_name_change(self, slot_idx, new_name):
+        """Update participant_names and force overlays to update."""
+        if new_name:
+            self.participant_names[slot_idx] = new_name
         else:
-            active_workers = [info for info in self.frames if info.get('proc') and info.get('score_buffer')]
-            if len(active_workers) < 2:
-                return
-                
-            for i, info in enumerate(active_workers[:2]):
-                buffer = info['score_buffer']
-                if buffer is None:
-                    continue
-                    
-                try:
-                    data, ts = buffer.read_latest()
-                    if data is not None and len(data) >= 52:
-                        scores.append(data[:52])
-                except:
-                    continue
-        
-        if len(scores) >= 2:
+            self.participant_names[slot_idx] = f"P{slot_idx+1}"
+
+        # Optionally: force overlays to update now
+        self.schedule_preview()
+
+    def get_label_for_face(self, global_id):
+        """
+        Given a global participant ID (integer), return display label:
+        - Use GUI participant name if set, else default to 'P#'.
+        - Mapping is 1-based (global_id starts at 1).
+        """
+        idx = global_id - 1  # zero-based for lists/dicts
+        name = self.participant_names.get(idx)
+        if name and name.strip() and not name.strip().startswith('P'):
+            return name.strip()
+        return f"P{global_id}"
+
+    def continuous_correlation_monitor(self):
+        """Monitor correlation from shared buffer"""
+        self.after(33, self.continuous_correlation_monitor)
+        if hasattr(self, 'corr_array'):
             try:
-                corr = self.correlator.update(np.array(scores[0]), np.array(scores[1]))
-                if corr is not None and len(corr) > 0:
+                # Read from shared memory
+                corr = self.corr_array.copy()
+                if np.any(corr):
                     self.update_plot(corr)
-            except Exception as e:
-                print(f"[GUI] Error in correlation monitor: {e}")
+            except:
+                pass
                 
+    def _start_correlation_monitor(self):
+        """Start the correlation monitoring process"""
+        if hasattr(self, 'correlation_monitor_proc') and self.correlation_monitor_proc and self.correlation_monitor_proc.is_alive():
+            return
+            
+        self.correlation_monitor_proc = Process(
+            target=correlation_monitor_process,
+            args=(self.correlation_queue, self.correlation_buffer.name, self.desired_fps.get()),
+            daemon=True
+        )
+        self.correlation_monitor_proc.start()
+        print("[GUI] Started correlation monitor")  
+
     def update_plot(self, corr):
         """Fixed plot update with proper label alignment"""
         c = self.bar_canvas
@@ -1334,6 +1458,7 @@ class YouQuantiPyGUI(tk.Tk):
             self.save_dir.set(directory)
             self.config.set('video_recording.save_directory', directory)
 
+
     def _start_video_recording(self, active_workers):
         """Start video recording with optional audio for all active workers"""
         # Set immediate recording flag if not already recording
@@ -1394,9 +1519,73 @@ class YouQuantiPyGUI(tk.Tk):
                 }
                 
                 # Define the recording thread function with proper scope
-                def create_recording_thread(recorder, preview_queue, width, height, idx, participant_names, multi_face_mode):
+                def create_recording_thread(recorder, recording_queue, preview_queue, width, height, idx, participant_names):
                     stop_flag = threading.Event()
-                    
+                
+                    def add_recording_info_overlay(frame, frame_count, lsl_timestamp, recording_fps=None):
+                        """
+                        Add recording information overlay to frame.
+                        
+                        Args:
+                            frame: The video frame to overlay on
+                            frame_count: Current frame number
+                            lsl_timestamp: LSL timestamp (seconds since epoch)
+                            recording_fps: Optional actual recording FPS
+                        """
+                        h, w = frame.shape[:2]
+                        
+                        # Format timestamp for display
+                        dt = datetime.fromtimestamp(lsl_timestamp)
+                        time_str = dt.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+                        
+                        # Prepare text lines
+                        text_lines = [
+                            f"Frame: {frame_count:06d}",
+                            f"Time: {time_str}",
+                            f"LSL: {lsl_timestamp:.6f}",
+                        ]
+                        
+                        if recording_fps is not None:
+                            text_lines.append(f"FPS: {recording_fps:.1f}")
+                        
+                        # Style settings
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.5
+                        thickness = 1
+                        text_color = (0, 255, 0)  # Green
+                        bg_color = (0, 0, 0)  # Black background
+                        padding = 5
+                        line_height = 20
+                        
+                        # Calculate text dimensions
+                        max_width = 0
+                        for text in text_lines:
+                            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+                            max_width = max(max_width, text_size[0])
+                        
+                        # Position in top-right corner
+                        x_start = w - max_width - 15
+                        y_start = 15
+                        
+                        # Draw semi-transparent background
+                        overlay = frame.copy()
+                        cv2.rectangle(overlay,
+                                    (x_start - padding, y_start - padding),
+                                    (w - 5, y_start + len(text_lines) * line_height + padding),
+                                    bg_color, -1)
+                        
+                        # Blend with original (semi-transparent background)
+                        alpha = 0.7
+                        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                        
+                        # Draw text lines
+                        for i, text in enumerate(text_lines):
+                            y = y_start + (i + 1) * line_height
+                            cv2.putText(frame, text, (x_start, y),
+                                        font, font_scale, text_color, thickness, cv2.LINE_AA)
+                        
+                        return frame
+
                     def record_overlay_thread():
                         """Fixed overlay recording thread with proper frame timing"""
                         frame_count = 0
@@ -1413,16 +1602,10 @@ class YouQuantiPyGUI(tk.Tk):
                                 if time_since_last < frame_interval:
                                     time.sleep(frame_interval - time_since_last)
                                     continue
-                                
-                                # Get latest frame (drain queue)
-                                latest = None
-                                attempts = 0
+                                                            
                                 try:
-                                    while not preview_queue.empty() and attempts < 10:
-                                        latest = preview_queue.get_nowait()
-                                        attempts += 1
-                                except Exception as e:
-                                    print(f"[Recorder Thread {idx}] Error accessing queue: {e}")
+                                    latest = recording_queue.get(timeout=0.1)
+                                except:
                                     continue
                                 
                                 if latest is None:
@@ -1434,55 +1617,58 @@ class YouQuantiPyGUI(tk.Tk):
                                 
                                 # Make a copy to avoid modifying the preview
                                 frame_bgr = frame_bgr.copy()
+
+                                # Get ALL faces data (multiple faces)
+                                faces = latest.get('faces', [])
                                 
-                                if multi_face_mode:
-                                    # Multiface mode - faces are already in correct format
-                                    faces = latest.get('faces', [])
-                                    overlayed = draw_overlays_combined(
-                                        frame_bgr,
-                                        faces=faces,
-                                        labels=participant_names,
-                                        face_mesh=True,
-                                        face_contours=True,
-                                        face_points=False,
-                                        pose_lines=False
-                                    )
-                                else:
-                                    # Holistic mode
-                                    face_lms = latest.get('face', [])
-                                    pose_lms = latest.get('pose', [])
-                                    
-                                    # Prepare faces list for draw_overlays_combined
-                                    faces = []
-                                    if face_lms and len(face_lms) > 0:
-                                        # face_lms is already a list of (x, y, z) tuples
-                                        # Calculate centroid from normalized coordinates
-                                        x_coords = [lm[0] for lm in face_lms if len(lm) >= 2]
-                                        y_coords = [lm[1] for lm in face_lms if len(lm) >= 2]
-                                        
-                                        if x_coords and y_coords:
-                                            face_dict = {
-                                                'landmarks': face_lms,  # Already in (x, y, z) format
-                                                'id': 0,
-                                                'centroid': (
-                                                    np.mean(x_coords),
-                                                    np.mean(y_coords)
-                                                )
-                                            }
-                                            faces = [face_dict]
-                                    
-                                    # Draw overlays with proper face and pose data
-                                    participant_name = participant_names.get(idx, f"P{idx+1}")
-                                    overlayed = draw_overlays_combined(
-                                        frame_bgr,
-                                        faces=faces,
-                                        pose_landmarks=pose_lms if pose_lms else None,
-                                        labels={0: participant_name} if faces else None,
-                                        face_mesh=False,
-                                        face_contours=True,
-                                        face_points=False,
-                                        pose_lines=True
-                                    )
+                                # Get ALL poses data (multiple poses)
+                                all_poses = latest.get('all_poses', [])
+                                
+                                # Build labels dictionary for faces using global IDs
+                                labels = {}
+                                for face in faces:
+                                    global_id = face.get('id')
+                                    if global_id and (not isinstance(global_id, str) or not str(global_id).startswith('local_')):
+                                        # Get participant name from global manager
+                                        labels[global_id] = self.global_participant_manager.get_participant_name(global_id)
+
+                                # Draw overlays with all faces and poses
+                                overlayed = draw_overlays_combined(
+                                    frame_bgr,
+                                    faces=faces,  # Pass all faces
+                                    pose_landmarks=None,  # We'll handle poses separately
+                                    labels=labels,
+                                    face_mesh=False,
+                                    face_contours=True,
+                                    face_points=False,
+                                    pose_lines=False  # We'll draw poses manually
+                                )
+                                
+                                # Draw all poses if enabled
+                                if self.enable_pose.get() and all_poses:
+                                    for pose_idx, pose in enumerate(all_poses):
+                                        if pose and 'landmarks' in pose:
+                                            # Draw each pose
+                                            h, w = overlayed.shape[:2]
+                                            pose_landmarks_px = [(int(x * w), int(y * h), z) 
+                                                            for x, y, z in pose['landmarks']]
+                                            
+                                            # Draw pose connections
+                                            for conn in mp.solutions.pose.POSE_CONNECTIONS:
+                                                i, j = conn
+                                                if i < len(pose_landmarks_px) and j < len(pose_landmarks_px):
+                                                    cv2.line(overlayed, 
+                                                        pose_landmarks_px[i][:2], 
+                                                        pose_landmarks_px[j][:2], 
+                                                        (64, 255, 255), 2, cv2.LINE_AA)
+                                
+                                # Add recording info overlay
+                                overlayed = add_recording_info_overlay(
+                                    overlayed, 
+                                    frame_count, 
+                                    current_time,
+                                    1.0 / (current_time - last_frame_time) if last_frame_time else None
+                                )
                                 
                                 # Get actual frame dimensions
                                 actual_h, actual_w = overlayed.shape[:2]
@@ -1516,15 +1702,17 @@ class YouQuantiPyGUI(tk.Tk):
                 # Now use this function to start the recording thread:
                 print(f"[GUI] Starting overlay recording thread for cam {idx}")
                 preview_queue = self.preview_queues[idx]
+                recording_queue = self.recording_queues[idx]
+
                 
                 capture_thread, stop_flag = create_recording_thread(
                     recorder, 
+                    recording_queue,
                     preview_queue,
                     actual_width,
                     actual_height,
                     idx,
                     self.participant_names,
-                    self.multi_face_mode.get()
                 )
 
                 self.video_recorders[idx]['capture_thread'] = capture_thread
@@ -1590,68 +1778,6 @@ class YouQuantiPyGUI(tk.Tk):
             import traceback
             traceback.print_exc()
             return None
-
-    def _start_overlayed_recording_thread(self, idx, recorder, preview_queue, mode, participant_names, stop_flag):
-        """
-        idx: camera index
-        recorder: VideoRecorderProcess instance
-        preview_queue: queue.Queue, delivers dicts with 'frame_bgr' and overlay data
-        mode: "holistic" or "multiface"
-        participant_names: {id: name} or similar
-        stop_flag: threading.Event or other shared flag
-        """
-        def record_loop():
-            while self.recording_active and not stop_flag.is_set():
-                try:
-                    # Get latest preview (don't block)
-                    latest = None
-                    while not preview_queue.empty():
-                        latest = preview_queue.get_nowait()
-                    if latest is None:
-                        time.sleep(1 / CAPTURE_FPS)
-                        continue
-
-                    frame_bgr = latest['frame_bgr']
-                    # Holistic mode (single face, pose)
-                    if mode == 'holistic':
-                        face_lms = latest.get('face', [])
-                        pose_lms = latest.get('pose', [])
-                        faces = []
-                        if face_lms:
-                            # lm.x, lm.y, lm.z for each landmark
-                            landmarks = [(lm.x, lm.y, lm.z) for lm in face_lms]
-                            face_dict = {
-                                'landmarks': landmarks,
-                                'id': 0,
-                                'centroid': (
-                                    np.mean([lm.x for lm in face_lms]),
-                                    np.mean([lm.y for lm in face_lms])
-                                )
-                            }
-                            faces = [face_dict]
-                        overlayed = draw_overlays_combined(
-                            frame_bgr,
-                            faces=faces,
-                            pose_landmarks=pose_lms,
-                            labels={0: participant_names.get(0, "P1")},
-                        )
-                    else:  # multiface
-                        faces = latest.get('faces', [])
-                        overlayed = draw_overlays_combined(
-                            frame_bgr,
-                            faces=faces,
-                            labels=participant_names,
-                        )
-                        
-                    recorder.add_frame(overlayed)
-                except Exception as e:
-                    print(f"[Recorder Thread] Error: {e}")
-                time.sleep(1 / CAPTURE_FPS)
-        # Start and return the thread object
-        t = threading.Thread(target=record_loop, daemon=True)
-        t.start()
-        return t
-
     
     def _stop_video_recording(self):
         """Stop all process recorders + capture threads."""
@@ -1826,7 +1952,7 @@ class YouQuantiPyGUI(tk.Tk):
         # Instructions
         ttk.Label(
             dialog,
-            text="Assign audio devices to participants/cameras:",
+            text="Assign audio devices to participants:",
             font=('Arial', 10, 'bold')
         ).pack(pady=10)
         
@@ -1846,43 +1972,24 @@ class YouQuantiPyGUI(tk.Tk):
         # Device assignment widgets
         device_vars = {}
         
-        # Get current counts
-        if self.multi_face_mode.get():
-            count = self.participant_count.get()
-        else:
-            count = self.camera_count.get()
-        
-        if self.multi_face_mode.get():
-            # Multiface mode - assign devices to participants
-            for i in range(count):
-                frame = ttk.Frame(scrollable_frame)
-                frame.pack(fill='x', padx=10, pady=5)
-                
-                participant_name = self.participant_names.get(i + 1, f"Face {i + 1}")
-                ttk.Label(frame, text=f"{participant_name}:", width=20).pack(side='left')
-                
-                var = tk.StringVar(value=self.audio_device_assignments.get(f"face{i+1}", "None"))
-                device_vars[f"face{i+1}"] = var
-                
-                devices = ["None"] + [f"{d['index']}: {d['name']}" for d in self.available_audio_devices]
-                combo = ttk.Combobox(frame, textvariable=var, values=devices, state='readonly', width=40)
-                combo.pack(side='left', padx=(10, 0))
-        else:
-            # Holistic mode - assign devices to cameras
-            for i in range(count):
-                frame = ttk.Frame(scrollable_frame)
-                frame.pack(fill='x', padx=10, pady=5)
-                
-                participant_name = self.participant_names.get(i, f"P{i+1}")
-                ttk.Label(frame, text=f"Camera {i} ({participant_name}):", width=20).pack(side='left')
-                
-                var = tk.StringVar(value=self.audio_device_assignments.get(f"cam{i}", "None"))
-                device_vars[f"cam{i}"] = var
-                
-                devices = ["None"] + [f"{d['index']}: {d['name']}" for d in self.available_audio_devices]
-                combo = ttk.Combobox(frame, textvariable=var, values=devices, state='readonly', width=40)
-                combo.pack(side='left', padx=(10, 0))
-                
+        # Create assignment for each participant
+        for i in range(self.participant_count.get()):
+            frame = ttk.Frame(scrollable_frame)
+            frame.pack(fill='x', padx=10, pady=5)
+            
+            # Get participant name from the entry field
+            participant_name = self.participant_names.get(i, f"P{i+1}")
+            
+            ttk.Label(frame, text=f"{participant_name}:", width=20).pack(side='left')
+            
+            # Store by participant index
+            var = tk.StringVar(value=self.audio_device_assignments.get(f"participant{i}", "None"))
+            device_vars[f"participant{i}"] = var
+            
+            devices = ["None"] + [f"{d['index']}: {d['name']}" for d in self.available_audio_devices]
+            combo = ttk.Combobox(frame, textvariable=var, values=devices, state='readonly', width=40)
+            combo.pack(side='left', padx=(10, 0))
+            
         canvas.pack(side="left", fill="both", expand=True, padx=(10, 0))
         scrollbar.pack(side="right", fill="y")
         
@@ -1917,7 +2024,7 @@ class YouQuantiPyGUI(tk.Tk):
             text="Refresh Devices",
             command=lambda: [self.refresh_audio_devices(), dialog.destroy(), self.configure_audio_devices()]
         ).pack(side='left', padx=5)
-
+        
     def _start_standalone_audio_recording(self):
         """Start standalone audio recording for assigned devices"""
         save_path = Path(self.save_dir.get())
@@ -1926,13 +2033,13 @@ class YouQuantiPyGUI(tk.Tk):
             if device_index is None:
                 continue
                 
-            # Determine participant ID
-            if assignment.startswith("face"):
-                face_num = int(assignment.replace("face", ""))
-                participant_id = self.participant_names.get(face_num, f"Face{face_num}")
+            # Determine participant ID from assignment
+            if assignment.startswith("participant"):
+                participant_num = int(assignment.replace("participant", ""))
+                participant_id = self.participant_names.get(participant_num, f"P{participant_num+1}")
             else:
-                cam_num = int(assignment.replace("cam", ""))
-                participant_id = self.participant_names.get(cam_num, f"P{cam_num+1}")
+                # Fallback for old format
+                participant_id = assignment
             
             # Create audio recorder
             recorder = AudioRecorder(
@@ -1948,264 +2055,390 @@ class YouQuantiPyGUI(tk.Tk):
                 print(f"[GUI] Started audio recording for {participant_id}")
 
     def start_stream(self):
-        """
-        Updated start_stream method with FastScoreReader and debugging
-        """
-        if self.streaming: 
-            print("[GUI] Already streaming, ignoring start request")
+        """Start unified streaming (LSL only, correlation already running)"""
+        if self.streaming:
+            print("[GUI] Already streaming, returning")
             return
-            
-        # Find all camera slots where we've spawned a worker
+        
         active_workers = [info for info in self.frames if info.get('control_conn')]
         print(f"[GUI] Found {len(active_workers)} active workers")
+        
         if not active_workers:
             print("[GUI] No active workers found")
             return
-
+        
+        # Re-initialize LSL helper if needed
+        if not hasattr(self, 'lsl_helper_proc') or self.lsl_helper_proc is None or not self.lsl_helper_proc.is_alive():
+            self._initialize_lsl_helper()
+        
         self.streaming = True
-        self.score_queues.clear()
         
-        # Initialize correlation storage
-        self.latest_correlation = None
-
-        print(f"[GUI] Starting stream for {len(active_workers)} worker(s)")
-        print(f"[GUI] Multi-face mode: {self.multi_face_mode.get()}")
+        # Notify LSL helper that streaming started
+        self.lsl_command_queue.put({
+            'type': 'streaming_started',
+            'max_participants': self.participant_count.get()
+        })
         
-        # Send start commands to workers
-        for idx, info in enumerate(active_workers):
-            print(f"[GUI] Starting worker {idx}")
-            
-            # Get the appropriate name based on mode
-            if self.multi_face_mode.get():
-                face_names = {}
-                if hasattr(self, 'multi_entries'):
-                    for face_idx, entry in enumerate(self.multi_entries):
-                        name = entry.get().strip() or f"Participant {face_idx+1}"
-                        face_names[face_idx + 1] = name
-                info['control_conn'].send(('start_stream', face_names))
-                print(f"[GUI] Sent multiface start command with names: {face_names}")
-            else:
-                if info.get('entry'):
-                    participant_name = info['entry'].get().strip() or f"P{idx+1}"
-                    info['control_conn'].send(('start_stream', participant_name))
-                    print(f"[GUI] Sent holistic start command for: {participant_name}")
-                else:
-                    info['control_conn'].send('start_stream')
-                    print(f"[GUI] Sent basic start command")
-            
-            # Register score buffer for correlation analysis
-            if info.get('score_buffer'):
-                self.score_queues.append(info['score_buffer'])
-                print(f"[GUI] Added score buffer {idx} to queues")
-            else:
-                print(f"[GUI] WARNING: No score buffer for worker {idx}")
-                
-            info['meta_label'].config(text="LSL → ON")
-
-        # Start video/audio recording if enabled
-        if self.record_video.get() or self.audio_enabled.get():
-            self._start_video_recording(active_workers)
-
-
-        print(f"[GUI] Total score queues: {len(self.score_queues)}")
-        print(f"[GUI] Required for correlation: {1 if self.multi_face_mode.get() else 2}")
-
-        # Setup correlator with FastScoreReader if we have multiple participants OR in multiface mode
-        if (self.multi_face_mode.get() and len(self.score_queues) >= 1) or len(self.score_queues) >= 2:
+        # Send streaming state AND participant names to fusion processes
+        for cam_idx, pipe in self.participant_mapping_pipes.items():
             try:
-                print("[GUI] Setting up correlator...")
-                self.correlator.setup_stream(fps=DESIRED_FPS)
-                print("[GUI] Correlator stream setup complete")
-                
-                # Use the FastScoreReader instead of combined_loop
-                print("[GUI] Creating FastScoreReader...")
-                self.score_reader = FastScoreReader(
-                    self.score_queues, 
-                    self.correlator, 
-                    self.multi_face_mode.get(),
-                    target_fps=DESIRED_FPS 
-                )
-                self.score_reader.start()
-                print("[GUI] Fast score reader started")
-                
-                # Start a separate thread just for GUI updates
-                if not hasattr(self, 'stop_evt') or self.stop_evt is None:
-                    self.stop_evt = threading.Event()
-                    self.gui_update_thread = threading.Thread(
-                        target=self._gui_update_loop, 
-                        daemon=True
-                    )
-                    self.gui_update_thread.start()
-                    print("[GUI] GUI update thread started")
-                
+                # Send streaming state
+                pipe.send({
+                    'type': 'streaming_state',
+                    'active': True
+                })
+                # Send participant names mapping
+                pipe.send({
+                    'type': 'participant_names',
+                    'names': self.global_participant_manager.participant_names.copy()
+                })
+                print(f"[GUI] Sent streaming=True and participant names to fusion for camera {cam_idx}")
             except Exception as e:
-                print(f"[GUI] Error setting up correlator: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f"[GUI] Not enough buffers for correlation: need {1 if self.multi_face_mode.get() else 2}, have {len(self.score_queues)}")
-                
-    def stop_stream(self):
-        """
-        Updated stop_stream with proper cleanup for FastScoreReader
-        """
-        if not self.streaming:
-            return
-            
-        print("[GUI] Stopping stream...")
-        self.streaming = False
-
-        #Stop video recording
-        if self.recording_active:
-            self._stop_video_recording()
-
-        # Stop all workers
-        for info in self.frames:
+                print(f"[GUI] ERROR sending streaming state to fusion for camera {cam_idx}: {e}")
+        
+        # Notify workers about streaming state AND current mesh state
+        for idx, info in enumerate(self.frames):
             if info.get('control_conn'):
                 try:
-                    info['control_conn'].send('stop_stream')
-                except: 
+                    # Send streaming state
+                    info['control_conn'].send(('streaming_state', True))
+                    print(f"[GUI] Sent streaming=True to worker {idx}")
+                    
+                    # Also ensure mesh state is synced
+                    info['control_conn'].send(('set_mesh', self.enable_mesh.get()))
+                    print(f"[GUI] Sent mesh state ({self.enable_mesh.get()}) to worker {idx}")
+                except Exception as e:
+                    print(f"[GUI] ERROR sending to worker {idx}: {e}")
+        
+        # Start comodulation LSL stream
+        self.lsl_command_queue.put({
+            'type': 'start_comodulation'
+        })
+        
+        # If pose is enabled, ensure pose streams are created
+        if self.enable_pose.get():
+            for idx, info in enumerate(self.frames):
+                if info.get('control_conn'):
+                    participant_id = self.participant_names.get(idx, f"P{idx+1}")
+                    self.lsl_command_queue.put({
+                        'type': 'create_pose_stream',
+                        'participant_id': participant_id,
+                        'fps': self.desired_fps.get()
+                    })
+        
+        # Auto-start video recording if enabled
+        if self.record_video.get() and active_workers:
+            print("[GUI] Auto-starting video recording with stream...")
+            # Disable the immediate recording button since we're recording with stream
+            self.record_now_btn.config(state='disabled')
+            self.stop_record_btn.config(state='disabled')  # Will be controlled by stop stream
+            # Start recording
+            self._start_video_recording(active_workers)
+            # Update status to indicate recording is tied to streaming
+            if self.recording_active:
+                self.record_status.config(
+                    text=f"Recording with stream to {Path(self.save_dir.get()).name}/",
+                    foreground='red'
+                )
+        print(f"[GUI] Started LSL streaming - streams will be created dynamically with mesh={'enabled' if self.enable_mesh.get() else 'disabled'}")
+    
+    def _shutdown_all_processes(self, timeout=3.0):
+        """UPDATED: Enhanced shutdown with reliability monitoring"""
+        print("\n[GUI] === COMPREHENSIVE SHUTDOWN INITIATED ===")
+        
+        # Stop reliability monitoring first
+        if hasattr(self, 'reliability_monitor'):
+            self.reliability_monitor.stop_monitoring()
+        
+        # 1. Stop streaming flag first
+        self.streaming = False
+        
+        # 2. Stop all recordings
+        if self.recording_active:
+            print("[GUI] Stopping video recording...")
+            self._stop_video_recording()
+        
+        if self.audio_recording_active:
+            print("[GUI] Stopping audio recording...")
+            self.stop_audio_recording()
+        
+        # 3. Send shutdown signals to all worker control connections
+        print("[GUI] Sending shutdown signals to workers...")
+        for idx, info in enumerate(self.frames):
+            if info.get('control_conn'):
+                try:
+                    for _ in range(3):
+                        info['control_conn'].send('stop')
+                    print(f"[GUI] Sent stop signal to worker {idx}")
+                except Exception as e:
+                    print(f"[GUI] Error sending stop to worker {idx}: {e}")
+        
+        # 4. Close all participant mapping pipes
+        print("[GUI] Closing participant mapping pipes...")
+        for cam_idx, pipe in list(self.participant_mapping_pipes.items()):
+            try:
+                pipe.send({'type': 'shutdown'})
+                pipe.close()
+            except:
+                pass
+        self.participant_mapping_pipes.clear()
+        
+        # 5. Send shutdown to LSL helper
+        if hasattr(self, 'lsl_command_queue'):
+            print("[GUI] Shutting down LSL helper...")
+            try:
+                for _ in range(3):
+                    self.lsl_command_queue.put({'type': 'stop'})
+            except:
+                pass
+        
+        # 6. Clear all queues - FIXED: Handle both dict and list cases
+        print("[GUI] Clearing all queues...")
+        queues_to_clear = [
+            ('participant_update_queue', self.participant_update_queue),
+            ('correlation_queue', self.correlation_queue),
+            ('lsl_command_queue', getattr(self, 'lsl_command_queue', None)),
+            ('lsl_data_queue', getattr(self, 'lsl_data_queue', None))
+        ]
+        
+        for name, q in queues_to_clear:
+            if q:
+                try:
+                    q.put(None)
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except:
+                            break
+                    print(f"[GUI] Cleared {name}")
+                except:
                     pass
-            info['meta_label'].config(text="LSL → OFF")
-
-        # Stop the fast score reader
-        if hasattr(self, 'score_reader') and self.score_reader:
-            self.score_reader.stop()
-            self.score_reader = None
-
-        # Stop the GUI update thread
-        if self.stop_evt:
-            self.stop_evt.set()
-            self.stop_evt = None
         
-        if hasattr(self, 'gui_update_thread') and self.gui_update_thread and self.gui_update_thread.is_alive():
-            self.gui_update_thread.join(timeout=2.0)
-
-        # Clear data structures
-        self.score_queues.clear()
-        self.latest_correlation = None
+        # 7. Terminate worker processes
+        print("[GUI] Terminating worker processes...")
+        for idx, info in enumerate(self.frames):
+            if info.get('proc'):
+                proc = info['proc']
+                if proc.is_alive():
+                    print(f"[GUI] Terminating worker {idx}...")
+                    proc.terminate()
+                    proc.join(timeout=1.0)
+                    if proc.is_alive():
+                        print(f"[GUI] Force killing worker {idx}...")
+                        proc.kill()
+                        proc.join(timeout=0.5)
+                info['proc'] = None
         
-        # Clear the plot
-        self.bar_canvas.delete('all')
-        self.bar_canvas.create_text(
-            self.bar_canvas.winfo_width()//2, 
-            self.bar_canvas.winfo_height()//2, 
-            text="Stopped", fill='gray', font=('Arial', 14)
-        )
+        # 8. Terminate LSL helper process
+        if hasattr(self, 'lsl_helper_proc') and self.lsl_helper_proc:
+            if self.lsl_helper_proc.is_alive():
+                print("[GUI] Terminating LSL helper...")
+                self.lsl_helper_proc.terminate()
+                self.lsl_helper_proc.join(timeout=1.0)
+                if self.lsl_helper_proc.is_alive():
+                    print("[GUI] Force killing LSL helper...")
+                    self.lsl_helper_proc.kill()
+                    self.lsl_helper_proc.join(timeout=0.5)
+            self.lsl_helper_proc = None
         
-        # Close correlator
-        try:
-            self.correlator.close()
-        except:
-            pass
-            
-        print("[GUI] Stream stopped and cleaned up")
-
-        def _cleanup():
-            if any((info.get('thread') and info.get('thread').is_alive()) or
-                    (self.data_thread and self.data_thread.is_alive())
-                    for info in self.frames):
-                self.after(100, _cleanup)
-                return
-            for i, info in enumerate(self.frames):
-                # just reset the label; camera & ML remain ready
-                info['meta_label'].config(text="ID: -, Stream: -")
-
-            self.bar_canvas.delete('all')
-            self.correlator.close()
-
-        self.after(50, _cleanup)
-
-    def reset(self):
-        """
-        Stop all streams and visualizations, 
-        then rebuild the GUI to its initial state.
-        """
-        # 1) Stop data stream (participants + comodulator)
-        self.stop_stream()
-
-        # 2) Clean up shared memory buffers
+        # 9. Terminate correlation monitor
+        if hasattr(self, 'correlation_monitor_proc') and self.correlation_monitor_proc:
+            if self.correlation_monitor_proc.is_alive():
+                print("[GUI] Terminating correlation monitor...")
+                self.correlation_monitor_proc.terminate()
+                self.correlation_monitor_proc.join(timeout=1.0)
+                if self.correlation_monitor_proc.is_alive():
+                    print("[GUI] Force killing correlation monitor...")
+                    self.correlation_monitor_proc.kill()
+                    self.correlation_monitor_proc.join(timeout=0.5)
+            self.correlation_monitor_proc = None
+        
+        # 10. Clean up shared memory
+        print("[GUI] Cleaning up shared memory...")
+        # Score buffers
         for info in self.frames:
             if info.get('score_buffer'):
                 try:
                     info['score_buffer'].cleanup()
                 except:
                     pass
+                info['score_buffer'] = None
+        
+        # Correlation buffer
+        if hasattr(self, 'correlation_buffer'):
+            try:
+                self.correlation_buffer.close()
+                self.correlation_buffer.unlink()
+            except:
+                pass
+            self.correlation_buffer = None
+        
+        # 11. Terminate active camera processes
+        print("[GUI] Terminating active camera processes...")
+        for cam_idx, proc in list(self.active_camera_procs.items()):
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.0)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=0.5)
+            except:
+                pass
+        self.active_camera_procs.clear()
+        
+        # 12. Reset state variables
+        self.streaming = False
+        self.recording_active = False
+        self.immediate_recording = False
+        self.audio_recording_active = False
+        
+        # 13. Final cleanup - ensure all child processes are gone
+        import psutil
+        try:
+            current_process = psutil.Process()
+            children = current_process.children(recursive=True)
+            if children:
+                print(f"[GUI] Found {len(children)} remaining child processes, terminating...")
+                for child in children:
+                    try:
+                        child.terminate()
+                    except:
+                        pass
+                # Give them time to terminate
+                gone, alive = psutil.wait_procs(children, timeout=1)
+                # Force kill any remaining
+                for p in alive:
+                    try:
+                        print(f"[GUI] Force killing process {p.pid}")
+                        p.kill()
+                    except:
+                        pass
+        except ImportError:
+            print("[GUI] psutil not available, skipping child process cleanup")
+        except Exception as e:
+            print(f"[GUI] Error during child process cleanup: {e}")
+        
+        print("[GUI] === SHUTDOWN COMPLETE ===\n")
 
-        # 3) Fully close correlator outlet and reset state
-        self.correlator.close()
-        # Re-instantiate to clear any holding state
-        self.correlator = ChannelCorrelator(window_size=60, fps=30)
 
-        # 4) Re-run build_frames, resetting threads & callbacks
-        self.build_frames()
+    def stop_stream(self):
+        """Stop unified streaming with comprehensive cleanup"""
+        if not self.streaming:
+            return
+        
+        print("\n[GUI] === STOPPING STREAM ===")
+        
+        # Use the comprehensive shutdown
+        self._shutdown_all_processes()
+        
+        # Update UI elements
+        for info in self.frames:
+            if info.get('meta_label'):
+                info['meta_label'].config(text="LSL → OFF")
+        
+        # Update button states
+        if self.record_video.get():
+            active_workers = [info for info in self.frames if info.get('proc') and info['proc'].is_alive()]
+            if active_workers:
+                self.record_now_btn.config(state='normal')
+        self.stop_record_btn.config(state='disabled')
+        
+        print("[GUI] Stream stopped\n")
 
-        # 5) Clear the bar plot AND remove the debug rectangle
+
+    def reset(self):
+        """Complete reset with comprehensive cleanup"""
+        print("\n[GUI] === FULL RESET INITIATED ===")
+        
+        # 1. Comprehensive shutdown first
+        self._shutdown_all_processes()
+        
+        # 2. Stop and wait for participant update thread
+        if hasattr(self, 'participant_update_thread') and self.participant_update_thread.is_alive():
+            print("[GUI] Stopping participant update thread...")
+            if hasattr(self, 'participant_update_queue'):
+                self.participant_update_queue.put(None)
+            self.participant_update_thread.join(timeout=2.0)
+        
+        # 3. Reset global participant manager
+        if hasattr(self, 'global_participant_manager'):
+            self.global_participant_manager.reset()
+        
+        # 4. Clear all data structures
+        self.frames.clear()
+        self.worker_procs.clear()
+        self.preview_queues.clear()
+        self.score_queues.clear()
+        self.recording_queues.clear()
+        self.participant_mapping_pipes.clear()
+        self.video_recorders.clear()
+        self.audio_recorders.clear()
+        
+        # 5. Clear drawing manager state
+        for idx in range(len(self.frames)):
+            self.drawingmanager .cleanup_canvas(idx)
+        
+        # 6. Clear the bar plot
         self.bar_canvas.delete('all')
-        # Don't create the debug rectangle - just show a message
         self.bar_canvas.create_text(
             self.bar_canvas.winfo_width()//2, 
             self.bar_canvas.winfo_height()//2, 
             text="Ready", fill='gray', font=('Arial', 12)
         )
-
-        # 6) Reset streaming flag and cleanup FastScoreReader
-        self.streaming = False
-        if hasattr(self, 'score_reader') and self.score_reader:
-            self.score_reader.stop()
-            self.score_reader = None
-            
-        # 7) Clear any cached correlation data
-        self.latest_correlation = None
-        if hasattr(self, 'bar_items'):
-            delattr(self, 'bar_items')  # Force recreation of plot items
-            
-        if hasattr(self, '_comod_after_id'):
-            try:
-                self.after_cancel(self._comod_after_id)
-            except tk.TclError:
-                pass
-        
-        # 8) Clear any cached correlation data
-        self.latest_correlation = None
         if hasattr(self, 'bar_items'):
             delattr(self, 'bar_items')
-            
-        if hasattr(self, '_comod_after_id'):
-            try:
-                self.after_cancel(self._comod_after_id)
-            except tk.TclError:
-                pass
-                
-        # 9) Reset recording states
+        
+        # 7. Reset all flags
+        self.streaming = False
         self.recording_active = False
         self.immediate_recording = False
+        self.audio_recording_active = False
+        self.monitoring_active = False
+        self.latest_correlation = None
+        
+        # 8. Update UI states
         self.record_status.config(text="Not recording", foreground='gray')
-        self.record_now_btn.config(text="Record Now", state='normal' if self.record_video.get() else 'disabled')
-        
-        # 10) Reset audio states
-        self.audio_recorders.clear()
+        self.record_now_btn.config(
+            text="Start Video Recording", 
+            state='normal' if self.record_video.get() else 'disabled'
+        )
+        self.stop_record_btn.config(state='disabled')
+        self.start_audio_btn.config(
+            state='normal' if self.audio_enabled.get() and self.audio_mode.get() == "standalone" else 'disabled'
+        )
+        self.stop_audio_btn.config(state='disabled')
         self.audio_status.config(text=self.audio_status.cget("text").replace(" (recording)", ""))
-                
-        # Reset executor
-        if hasattr(self, 'exec') and self.exec:
-            self.exec.shutdown(wait=False, cancel_futures=True)
-        self.exec = ThreadPoolExecutor(max_workers=12)
         
-        if hasattr(self, 'worker_procs'):
-            for proc in self.worker_procs:
-                if proc is not None:
-                    proc.terminate()
-                    proc.join()
-            self.worker_procs = []
-            self.preview_queues = []
-
+        # 9. Recreate essential structures
+        self.participant_update_queue = MPQueue()
+        self.correlation_queue = MPQueue()
+        
+        # 10. Restart participant update processor
+        self.participant_update_thread = threading.Thread(
+            target=self._process_participant_updates, 
+            daemon=True
+        )
+        self.participant_update_thread.start()
+        
+        # 11. Re-initialize correlation buffer
+        self.correlation_buffer = shared_memory.SharedMemory(
+            create=True, 
+            size=52 * 4
+        )
+        self.corr_array = np.ndarray((52,), dtype=np.float32, 
+                                    buffer=self.correlation_buffer.buf)
+        
+        # 12. Rebuild frames
+        self.build_frames()
+        
+        print("[GUI] === RESET COMPLETE ===\n")
+        
     def save_current_settings(self):
         """Save all current GUI settings to configuration file"""
         # Save all current settings
         self.config.set('camera_settings.target_fps', self.desired_fps.get())
         self.config.set('camera_settings.resolution', self.res_choice.get())
-        self.config.set('startup_mode.multi_face', self.multi_face_mode.get())
         self.config.set('startup_mode.participant_count', self.participant_count.get())
         self.config.set('startup_mode.camera_count', self.camera_count.get())
         self.config.set('startup_mode.enable_mesh', self.enable_mesh.get())
