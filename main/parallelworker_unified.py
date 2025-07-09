@@ -501,9 +501,13 @@ def face_worker_process(frame_queue: MPQueue,
         landmark_proc.start()
         
         # Initialize tracker and ROI processor
+        # Adjusted parameters for detection every 7 frames:
+        # - min_hits=1: Accept tracks immediately
+        # - max_age=21: Keep tracks for 3 detection cycles (7*3)
+        # - iou_threshold=0.3: Standard IOU threshold
         tracker = LightweightTracker(
-            max_age=10,
-            min_hits=3,
+            max_age=21,
+            min_hits=1,
             iou_threshold=0.3
         )
         
@@ -981,7 +985,9 @@ def fusion_process(face_result_queue: MPQueue,
     latest_pose_data = []
     latest_frame_bgr = None
     last_preview_time = 0
+    last_lsl_time = 0
     preview_interval = 1.0 / 15  # 15 FPS preview
+    lsl_interval = 1.0 / 30  # 30 FPS LSL data (throttled)
     enable_mesh = False  # Track mesh state
     
     # Result collection with timeout
@@ -1143,8 +1149,8 @@ def fusion_process(face_result_queue: MPQueue,
             except:
                 pass
         
-        # Send to other outputs (recording, LSL, correlation)
-        if latest_face_data or latest_pose_data:
+        # Send to other outputs (recording, LSL, correlation) at limited rate
+        if (latest_face_data or latest_pose_data) and current_time - last_lsl_time > lsl_interval:
             output_data = {
                 'cam_idx': cam_idx,
                 'face_data': latest_face_data,
@@ -1202,6 +1208,9 @@ def fusion_process(face_result_queue: MPQueue,
                             correlation_queue.put_nowait(correlation_data)
                         except:
                             pass
+            
+            # Update LSL time after sending
+            last_lsl_time = current_time
             
             # Score buffer update
             if latest_face_data:
