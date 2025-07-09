@@ -1,0 +1,88 @@
+{
+    "video_recording": {
+        "enabled": false,
+        "save_directory": "./recordings",
+        "filename_template": "{participant}_{timestamp}",
+        "codec": "MJPG"
+    },
+    "camera_settings": {
+        "target_fps": 30,
+        "resolution": "480p"
+    },
+    "startup_mode": {
+        "multi_face": false,
+        "participant_count": 2,
+        "camera_count": 2,
+        "enable_mesh": false,
+        "enable_pose": true,
+        "enable_face_recognition": true
+    },
+    "paths": {
+        "model_path": "D:/Projects/youquantipy/face_landmarker.task"
+    },
+    "audio_recording": {
+        "enabled": false,
+        "standalone_audio": false,
+        "audio_with_video": false,
+        "sample_rate": 44100,
+        "channels": 1
+    },
+    "audio_devices": {},
+    "advanced_detection": {
+        "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
+        "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
+        "tile_size": 640,
+        "tile_overlap": 0.2,
+        "detection_confidence": 0.5,
+        "nms_threshold": 0.4,
+        "max_detection_workers": 4,
+        "tracker_settings": {
+            "max_age": 30,
+            "min_hits": 3,
+            "iou_threshold": 0.3,
+            "max_drift": 50.0,
+            "drift_correction_rate": 0.1
+        },
+        "roi_settings": {
+            "target_size": [
+                256,
+                256
+            ],
+            "padding_ratio": 0.3,
+            "min_quality_score": 0.5,
+            "max_roi_workers": 4
+        },
+        "recognition_settings": {
+            "embedding_dim": 512,
+            "max_embeddings_per_person": 50,
+            "similarity_threshold": 0.5,
+            "update_threshold": 0.7
+        },
+        "enrollment_settings": {
+            "min_samples": 10,
+            "min_quality": 0.7,
+            "min_consistency": 0.85,
+            "min_stability": 0.8,
+            "collection_timeout": 30.0,
+            "improvement_window": 20
+        }
+    },
+    "camera_resolutions": {
+        "480p": [
+            640,
+            480
+        ],
+        "720p": [
+            1280,
+            720
+        ],
+        "1080p": [
+            1920,
+            1080
+        ],
+        "4K": [
+            3840,
+            2160
+        ]
+    }
+}

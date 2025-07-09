@@ -21,7 +21,9 @@ class ConfigHandler:
             "multi_face": False,
             "participant_count": 2,
             "camera_count": 2,
-            "enable_mesh": False
+            "enable_mesh": False,
+            "enable_pose": True,
+            "enable_face_recognition": True
         },
         "paths": {
             "model_path":  "D:/Projects/youquantipy/face_landmarker.task" 
@@ -39,7 +41,16 @@ class ConfigHandler:
     }
     
     def __init__(self, config_file="./youquantipy_config.json"):
-        self.config_file = Path(config_file)
+        # If relative path, make it relative to this file's directory
+        config_path = Path(config_file)
+        if not config_path.is_absolute():
+            # Get the directory where this confighandler.py file is located
+            this_dir = Path(__file__).parent
+            config_path = this_dir / config_file
+        
+        self.config_file = config_path
+        print(f"[ConfigHandler] Initializing with config file: {self.config_file.absolute()}")
+        print(f"[ConfigHandler] Config file exists: {self.config_file.exists()}")
         self.config = self.load_config()
         
     def load_config(self):
@@ -49,7 +60,8 @@ class ConfigHandler:
                 with open(self.config_file, 'r') as f:
                     loaded_config = json.load(f)
                 # Merge with defaults to ensure all keys exist
-                return self._merge_configs(self.DEFAULT_CONFIG, loaded_config)
+                merged = self._merge_configs(self.DEFAULT_CONFIG, loaded_config)
+                return merged
             except Exception as e:
                 print(f"[Config] Error loading config: {e}")
                 return self.DEFAULT_CONFIG.copy()
@@ -59,13 +71,18 @@ class ConfigHandler:
             return self.DEFAULT_CONFIG.copy()
     
     def _merge_configs(self, default, loaded):
-        """Recursively merge loaded config with defaults"""
-        result = default.copy()
-        for key, value in loaded.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = self._merge_configs(result[key], value)
-            else:
+        """Recursively merge loaded config with defaults, preserving loaded values"""
+        # Start with loaded config to preserve all user values
+        result = loaded.copy()
+        
+        # Add missing keys from defaults
+        for key, value in default.items():
+            if key not in result:
                 result[key] = value
+            elif isinstance(value, dict) and isinstance(result[key], dict):
+                # Recursively merge nested dicts
+                result[key] = self._merge_configs(value, result[key])
+        
         return result
     
     def save_config(self, config=None):

@@ -39,12 +39,26 @@ class SharedScoreBuffer:
 
 class NumpySharedBuffer:
     """Zero-copy shared memory using numpy arrays"""
-    def __init__(self, size=104, name=None):
-        self.size = size
+    def __init__(self, size=104, name=None, shape=None):
+        """
+        Initialize shared buffer.
+        
+        Args:
+            size: Total size of buffer (for backward compatibility)
+            name: Name of shared memory (None to create new)
+            shape: Optional shape tuple for multi-dimensional arrays
+        """
+        # Determine shape and size
+        if shape is not None:
+            self.shape = shape
+            self.size = np.prod(shape)
+        else:
+            self.size = size
+            self.shape = (size,)
         
         if name is None:
             # Create new shared memory
-            self.shm = shared_memory.SharedMemory(create=True, size=size * 4 + 8)  # float32 + timestamp
+            self.shm = shared_memory.SharedMemory(create=True, size=self.size * 4 + 8)  # float32 + timestamp
             self.name = self.shm.name
             self._created = True
         else:
@@ -54,17 +68,29 @@ class NumpySharedBuffer:
             self._created = False
             
         # Create views into the shared memory
-        self.arr = np.ndarray((size,), dtype=np.float32, buffer=self.shm.buf[8:])
+        self.arr = np.ndarray(self.shape, dtype=np.float32, buffer=self.shm.buf[8:])
         self.timestamp = np.ndarray((1,), dtype=np.float64, buffer=self.shm.buf[:8])
         
     def write(self, scores):
         """Write scores with zero copy"""
         self.timestamp[0] = time.time()
         scores_len = min(len(scores), self.size)
-        self.arr[:scores_len] = scores[:scores_len]
-        if scores_len < self.size:
-            self.arr[scores_len:] = 0.0  # Clear remaining
-        
+        if len(self.shape) == 1:
+            # 1D array
+            self.arr[:scores_len] = scores[:scores_len]
+            if scores_len < self.size:
+                self.arr[scores_len:] = 0.0  # Clear remaining
+        else:
+            # Multi-dimensional - write to first row
+            self.arr.flat[:scores_len] = scores[:scores_len]
+    
+    def update_column(self, col_idx, values):
+        """Update a specific column (for 2D arrays)"""
+        if len(self.shape) == 2 and 0 <= col_idx < self.shape[1]:
+            self.timestamp[0] = time.time()
+            values_len = min(len(values), self.shape[0])
+            self.arr[:values_len, col_idx] = values[:values_len]
+    
     def read_latest(self):
         """Read with zero copy"""
         return self.arr.copy(), float(self.timestamp[0])

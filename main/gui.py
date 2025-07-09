@@ -16,16 +16,14 @@ import numpy as np
 import cv2
 import mediapipe as mp
 
-from parallelworker import parallel_participant_worker
 from canvasdrawing import CanvasDrawingManager , draw_overlays_combined
 from correlator import ChannelCorrelator
 from sharedbuffer import NumpySharedBuffer
-from participantmanager import GlobalParticipantManager
 from LSLHelper import lsl_helper_process
 from videorecorder import VideoRecorderProcess
 from audiorecorder import AudioRecorder, VideoAudioRecorder, AudioDeviceManager
 from guireliability import setup_reliability_monitoring, GUIReliabilityMonitor
-
+from advanced_detection_integration import create_participant_manager, create_parallel_worker, parallel_participant_worker_auto
 from tkinter import filedialog, messagebox
 from confighandler import ConfigHandler
 from datetime import datetime
@@ -134,6 +132,8 @@ class YouQuantiPyGUI(tk.Tk):
         self.MODEL_PATH = self.config.get('paths.model_path', DEFAULT_MODEL_PATH)
         self.POSE_MODEL_PATH = self.config.get('paths.pose_model_path',POSE_MODEL_PATH)
         self.DESIRED_FPS = self.config.get('camera_settings.target_fps', DEFAULT_DESIRED_FPS)
+        
+        # Advanced detection will be automatically used if configured
 
         # Load face_landmarker model buffer
         with open(self.MODEL_PATH, 'rb') as f:
@@ -141,7 +141,10 @@ class YouQuantiPyGUI(tk.Tk):
 
         # For tracker
         self.tracker_id_to_slot = {}      # Maps tracker_id -> slot index (for "P#")
-        self.slot_to_tracker_id = {}  
+        self.slot_to_tracker_id = {}
+        
+        # For advanced detection bboxes
+        self.participant_bboxes = {}  # {(camera_idx, participant_id): bbox}  
 
         print("[DEBUG] GUI __init__")
         self.title("YouQuantiPy")
@@ -175,12 +178,19 @@ class YouQuantiPyGUI(tk.Tk):
         self.participant_update_queue = MPQueue()
         self.participant_mapping_pipes = {} 
         
-        # Initialize with procrustes support
-        self.global_participant_manager = GlobalParticipantManager(
-            max_participants=self.participant_count.get(),
-            shape_weight=0.7,  # Prioritize procrustes
-            position_weight=0.3    # But still consider position
+        # Initialize participant manager (will use advanced if configured)
+        self.global_participant_manager = create_participant_manager(
+            max_participants=self.participant_count.get()
         )
+        # Check which manager we got
+        if hasattr(self.global_participant_manager, 'update_from_advanced_detection'):
+            print("[GUI] Using ADVANCED participant manager with face recognition")
+        else:
+            # Set weights for standard manager
+            if hasattr(self.global_participant_manager, 'shape_weight'):
+                self.global_participant_manager.shape_weight = 0.7
+                self.global_participant_manager.position_weight = 0.3
+            print("[GUI] Using standard participant manager")
 
         # NOW start participant update processor after queue is created
         self.participant_update_thread = threading.Thread(
@@ -494,13 +504,36 @@ class YouQuantiPyGUI(tk.Tk):
                 #     print(f"[GUI] Processing update #{update_count}: camera={camera_idx}, local_id={local_id}, centroid={centroid}")
                 
                 # Get global ID from manager
-                global_id = self.global_participant_manager.update_participant(
-                    camera_idx, local_id, centroid, shape  
-                )
+                # Check if we're using advanced manager with face recognition data
+                if hasattr(self.global_participant_manager, 'update_from_advanced_detection') and 'bbox' in update:
+                    # Advanced detection provides more data
+                    face_data = [{
+                        'track_id': local_id,
+                        'participant_id': update.get('participant_id', -1),
+                        'centroid': centroid,
+                        'landmarks': update.get('landmarks', []),
+                        'bbox': update.get('bbox'),
+                        'quality_score': update.get('confidence', 0.5)
+                    }]
+                    track_to_global = self.global_participant_manager.update_from_advanced_detection(
+                        camera_idx, face_data
+                    )
+                    global_id = track_to_global.get(local_id, 1)
+                else:
+                    # Standard update
+                    global_id = self.global_participant_manager.update_participant(
+                        camera_idx, local_id, centroid, shape  
+                    )
                 
                 # Debug print the result
                 # if update_count % 30 == 0:
                 #     print(f"[GUI] Assigned global_id={global_id} to local_id={local_id}")
+                
+                # Store bbox if available
+                if 'bbox' in update:
+                    self.participant_bboxes[(camera_idx, global_id)] = update['bbox']
+                    if update_count % 30 == 0:
+                        print(f"[GUI] Stored bbox for participant {global_id}: {update['bbox']}")
                 
                 # Send response back to worker
                 if camera_idx in self.participant_mapping_pipes:
@@ -918,9 +951,9 @@ class YouQuantiPyGUI(tk.Tk):
             if not self.correlation_monitor_proc or not self.correlation_monitor_proc.is_alive():
                 self._start_correlation_monitor()
 
-            # Start worker process with queues and pipes
+            # Start worker process with queues and pipes (auto-selects standard or advanced)
             proc = Process(
-                target=parallel_participant_worker,
+                target=parallel_participant_worker_auto,
                 args=(cam_idx, self.MODEL_PATH, self.POSE_MODEL_PATH,
                     fps, self.enable_mesh.get(), self.enable_pose.get(),
                     pv_q, score_buffer_name, child_conn,
@@ -1643,6 +1676,23 @@ class YouQuantiPyGUI(tk.Tk):
                                     face_points=False,
                                     pose_lines=False  # We'll draw poses manually
                                 )
+                                
+                                # Draw bboxes from advanced detection
+                                for face in faces:
+                                    global_id = face.get('id')
+                                    if global_id and (cam_idx, global_id) in self.participant_bboxes:
+                                        bbox = self.participant_bboxes[(cam_idx, global_id)]
+                                        if bbox and len(bbox) == 4:
+                                            x1, y1, x2, y2 = [int(v) for v in bbox]
+                                            # Draw green bbox
+                                            cv2.rectangle(overlayed, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                            # Draw label background
+                                            label = labels.get(global_id, f"P{global_id}")
+                                            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                                            cv2.rectangle(overlayed, (x1, y1-25), (x1+label_size[0]+10, y1), (0, 255, 0), -1)
+                                            # Draw label text
+                                            cv2.putText(overlayed, label, (x1+5, y1-8), 
+                                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
                                 
                                 # Draw all poses if enabled
                                 if self.enable_pose.get() and all_poses:

@@ -119,6 +119,17 @@ def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, tar
     if fps_measurements:
         actual_measured_fps = np.median(fps_measurements)
         print(f"[Camera] Measured FPS: {actual_measured_fps:.1f} (requested: {fps})")
+        
+        # Add warning for low FPS
+        if actual_measured_fps < fps * 0.5:  # Less than 50% of requested
+            print(f"\n[Camera] ⚠️  WARNING: Low FPS detected!")
+            print(f"[Camera] Camera {camera_index} only achieving {actual_measured_fps:.1f} FPS (requested {fps})")
+            print(f"[Camera] This is likely a hardware/driver limitation. Suggestions:")
+            print(f"[Camera]   • Try a lower resolution (current: {resolution[0]}x{resolution[1]})")
+            print(f"[Camera]   • Check USB bandwidth (use USB 3.0 ports)")
+            print(f"[Camera]   • Update camera drivers")
+            print(f"[Camera]   • Close other camera applications")
+            print(f"[Camera]   • Try a different camera\n")
     else:
         actual_measured_fps = fps
 

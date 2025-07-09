@@ -1,0 +1,7 @@
+{
+  "timestamp": 1751962448.265239,
+  "recording_active": false,
+  "active_cameras": [],
+  "save_directory": "./recordings",
+  "filename_template": "{participant}_{timestamp}"
+}
