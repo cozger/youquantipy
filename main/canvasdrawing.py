@@ -284,6 +284,64 @@ class CanvasDrawingManager:
         # Hide unused pose overlays
         self._cleanup_unused_poses(canvas, cache, len(poses))
     
+    def draw_debug_detections(self, canvas: tk.Canvas, debug_data: Dict, 
+                             canvas_idx: int) -> None:
+        """DEBUG_RETINAFACE: Draw raw RetinaFace detections for debugging."""
+        if not debug_data:
+            return
+        
+        # Get video bounds
+        video_bounds = self.transform_cache.get(canvas_idx, {}).get('video_bounds')
+        if not video_bounds:
+            return
+        x_offset, y_offset, video_w, video_h = video_bounds
+        
+        # Get raw detections
+        raw_detections = debug_data.get('raw_detections', [])
+        if not raw_detections:
+            return
+        
+        # Get frame dimensions from debug data
+        frame_shape = debug_data.get('frame_shape', (1080, 1920, 3))
+        frame_h, frame_w = frame_shape[:2]
+        
+        # Clear previous debug overlays
+        try:
+            canvas.delete('debug_detection')
+        except:
+            pass
+        
+        # Draw each raw detection
+        for i, det in enumerate(raw_detections):
+            bbox = det.get('bbox', [])
+            if len(bbox) != 4:
+                continue
+                
+            confidence = det.get('confidence', 0)
+            
+            # Transform coordinates (bbox is already in frame coordinates)
+            # Scale to canvas coordinates using actual frame dimensions
+            x1 = int(bbox[0] * video_w / frame_w + x_offset)
+            y1 = int(bbox[1] * video_h / frame_h + y_offset)
+            x2 = int(bbox[2] * video_w / frame_w + x_offset)
+            y2 = int(bbox[3] * video_h / frame_h + y_offset)
+            
+            # Draw rectangle
+            color = '#FF0000' if confidence > 0.98 else '#FFFF00'  # Red for high conf, yellow for lower
+            canvas.create_rectangle(x1, y1, x2, y2, 
+                                  outline=color, width=2, 
+                                  tags=('debug_detection', 'overlay'))
+            
+            # Draw confidence text
+            text = f"{confidence:.3f}"
+            canvas.create_text(x1, y1-5, text=text, 
+                             fill=color, anchor='sw',
+                             font=('Arial', 10, 'bold'),
+                             tags=('debug_detection', 'overlay'))
+        
+        # Log debug info
+        print(f"[DEBUG_RETINAFACE] Drew {len(raw_detections)} raw detections on canvas {canvas_idx}")
+    
     def _hide_inactive_faces(self, canvas: tk.Canvas, cache: Dict, active_ids: set) -> None:
         """Hide faces that are no longer active."""
         for face_id in list(cache['face_lines'].keys()):

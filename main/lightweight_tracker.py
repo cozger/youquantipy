@@ -23,9 +23,14 @@ class Track:
     reference_features: Optional[np.ndarray] = None
     drift_accumulated: np.ndarray = None
     
+    # Sliding window hit tracking
+    hit_history: List[int] = None  # Frame numbers where hits occurred
+    
     def __post_init__(self):
         if self.drift_accumulated is None:
             self.drift_accumulated = np.zeros(2)
+        if self.hit_history is None:
+            self.hit_history = []
 
 class LightweightTracker:
     def __init__(self,
@@ -33,22 +38,31 @@ class LightweightTracker:
                  min_hits: int = 3,
                  iou_threshold: float = 0.3,
                  max_drift: float = 50.0,
-                 drift_correction_rate: float = 0.1):
+                 drift_correction_rate: float = 0.1,
+                 detection_interval: int = 7,
+                 min_hits_in_window: int = 3,
+                 window_cycles: int = 4):
         """
         Lightweight tracker with optical flow and drift correction.
         
         Args:
             max_age: Maximum frames to keep track alive without detection
-            min_hits: Minimum hits before track is confirmed
+            min_hits: Minimum hits before track is confirmed (deprecated, use min_hits_in_window)
             iou_threshold: IOU threshold for matching
             max_drift: Maximum allowed drift in pixels
             drift_correction_rate: Rate of drift correction (0-1)
+            detection_interval: How often detection runs (every N frames)
+            min_hits_in_window: Minimum hits required within sliding window
+            window_cycles: Number of detection cycles for sliding window
         """
         self.max_age = max_age
-        self.min_hits = min_hits
+        self.min_hits = min_hits  # Keep for backward compatibility
         self.iou_threshold = iou_threshold
         self.max_drift = max_drift
         self.drift_correction_rate = drift_correction_rate
+        self.detection_interval = detection_interval
+        self.min_hits_in_window = min_hits_in_window
+        self.window_size = detection_interval * window_cycles  # Adaptive window size
         
         self.tracks: List[Track] = []
         self.track_id_counter = 0
@@ -63,6 +77,20 @@ class LightweightTracker:
         
         # Previous frame for optical flow
         self.prev_gray = None
+        
+    def _has_enough_hits_in_window(self, track: Track) -> bool:
+        """Check if track has enough hits within the sliding window."""
+        if not track.hit_history:
+            return False
+            
+        # Remove old hits outside the window
+        current_frame = self.frame_count
+        window_start = current_frame - self.window_size
+        track.hit_history = [f for f in track.hit_history if f > window_start]
+        
+        # Count hits in window
+        hits_in_window = len(track.hit_history)
+        return hits_in_window >= self.min_hits_in_window
         
     def update(self, frame: np.ndarray, detections: List[Dict]) -> List[Dict]:
         """
@@ -112,7 +140,8 @@ class LightweightTracker:
         # Prepare output
         results = []
         for track in self.tracks:
-            if track.hits >= self.min_hits or track.age < self.min_hits:
+            # Use sliding window check for track confirmation
+            if self._has_enough_hits_in_window(track) or track.age < self.detection_interval:
                 result = {
                     'track_id': track.track_id,
                     'bbox': track.bbox.tolist(),
@@ -169,7 +198,8 @@ class LightweightTracker:
             hits=1,
             hit_streak=1,
             time_since_update=0,
-            landmarks=detection.get('landmarks')
+            landmarks=detection.get('landmarks'),
+            hit_history=[self.frame_count]  # Initialize with first hit
         )
         
         self.track_id_counter += 1
@@ -307,6 +337,9 @@ class LightweightTracker:
         track.hit_streak += 1
         track.time_since_update = 0
         track.landmarks = detection.get('landmarks')
+        
+        # Record hit in history for sliding window
+        track.hit_history.append(self.frame_count)
         
         # Extract features for drift correction
         x1, y1, x2, y2 = track.bbox.astype(int)

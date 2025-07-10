@@ -28,6 +28,49 @@ except ImportError:
     ENHANCED_COMPONENTS_AVAILABLE = False
     print("[ParallelWorker] Enhanced components not available, will use standard mode only")
 
+# Import participant manager for direct access
+try:
+    from participantmanager_unified import GlobalParticipantManager
+    PARTICIPANT_MANAGER_AVAILABLE = True
+except ImportError:
+    GlobalParticipantManager = None
+    PARTICIPANT_MANAGER_AVAILABLE = False
+    print("[ParallelWorker] GlobalParticipantManager not available")
+
+
+class SyncParticipantManager:
+    """Synchronous wrapper for participant management in fusion process"""
+    def __init__(self, max_participants=10):
+        self.participant_manager = GlobalParticipantManager(max_participants=max_participants) if PARTICIPANT_MANAGER_AVAILABLE else None
+        self.camera_participant_cache = {}  # (cam_idx, local_id) -> global_id
+        self.last_update = {}  # (cam_idx, local_id) -> timestamp
+        self.cache_timeout = 0.5  # seconds
+        
+    def get_participant_id(self, cam_idx, local_id, centroid, shape=None, embedding=None, timestamp=None):
+        """Get global participant ID synchronously"""
+        if not self.participant_manager:
+            # Fallback to simple ID assignment
+            return local_id + 1
+        
+        current_time = timestamp or time.time()
+        cache_key = (cam_idx, local_id)
+        
+        # Check cache (but not if we have a new embedding)
+        if embedding is None and cache_key in self.camera_participant_cache:
+            last_time = self.last_update.get(cache_key, 0)
+            if current_time - last_time < self.cache_timeout:
+                return self.camera_participant_cache[cache_key]
+        
+        # Get ID from participant manager
+        global_id = self.participant_manager.update_participant(cam_idx, local_id, centroid, shape, embedding)
+        
+        # Update cache
+        if global_id is not None:
+            self.camera_participant_cache[cache_key] = global_id
+            self.last_update[cache_key] = current_time
+        
+        return global_id if global_id is not None else local_id + 1
+
 
 def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, target_brightness_range=(30, 200), max_attempts=1):
     """Initialize camera with robust settings and FPS validation"""
@@ -255,8 +298,12 @@ class FrameDistributor:
                             try:
                                 if sub['full_res']:
                                     sub['queue'].put_nowait(frame_data_full)
+                                    if frame_count % 30 == 0 and sub['name'] == 'face':
+                                        print(f"[Frame Distributor] Sent full res to {sub['name']}, BGR shape: {frame_data_full['bgr'].shape}")
                                 else:
                                     sub['queue'].put_nowait(frame_data_downsampled)
+                                    if frame_count % 30 == 0 and sub['name'] == 'face':
+                                        print(f"[Frame Distributor] Sent downsampled to {sub['name']}, BGR shape: {frame_data_downsampled['bgr'].shape}")
                             except:
                                 pass
                     
@@ -273,17 +320,20 @@ class FrameDistributor:
 def face_detection_process(detection_queue: MPQueue,
                           detection_result_queue: MPQueue,
                           retinaface_model_path: str,
-                          control_pipe):
+                          control_pipe,
+                          debug_queue=None):  # DEBUG_RETINAFACE: Add debug queue parameter
     """Dedicated process for face detection using RetinaFace"""
     print("[FACE DETECTOR] Starting RetinaFace detection process")
     
     # Initialize detector
     detector = RetinaFaceDetector(
         model_path=retinaface_model_path,
-        tile_size=640,
-        overlap=0.15,
-        confidence_threshold=0.7,
-        max_workers=4
+        tile_size=640,  # Will be adjusted to 640x608 internally to match model
+        overlap=0.1,  # Reduced overlap to minimize duplicate detections
+        confidence_threshold=0.9,  # Lowered threshold to allow full-face detections
+        nms_threshold=0.2,  # More aggressive NMS for overlapping tiles
+        max_workers=4,
+        debug_queue=debug_queue  # DEBUG_RETINAFACE: Pass debug queue
     )
     detector.start()
     
@@ -481,6 +531,7 @@ def face_worker_process(frame_queue: MPQueue,
         detection_result_queue = MPQueue(maxsize=5)
         roi_queue = MPQueue(maxsize=10)
         landmark_result_queue = MPQueue(maxsize=10)
+        debug_detection_queue = MPQueue(maxsize=5)  # DEBUG_RETINAFACE: Queue for raw detections
         
         # Create control pipes for sub-processes
         detector_parent, detector_child = Pipe()
@@ -489,7 +540,7 @@ def face_worker_process(frame_queue: MPQueue,
         # Start detection process
         detector_proc = Process(
             target=face_detection_process,
-            args=(detection_queue, detection_result_queue, retinaface_model_path, detector_child)
+            args=(detection_queue, detection_result_queue, retinaface_model_path, detector_child, debug_detection_queue)  # DEBUG_RETINAFACE: Pass debug queue
         )
         detector_proc.start()
         
@@ -502,13 +553,16 @@ def face_worker_process(frame_queue: MPQueue,
         
         # Initialize tracker and ROI processor
         # Adjusted parameters for detection every 7 frames:
-        # - min_hits=1: Accept tracks immediately
-        # - max_age=21: Keep tracks for 3 detection cycles (7*3)
+        # - sliding window: 3 hits in 4 detection cycles
+        # - max_age=14: Keep tracks for 2 detection cycles (7*2)
         # - iou_threshold=0.3: Standard IOU threshold
         tracker = LightweightTracker(
-            max_age=21,
-            min_hits=1,
-            iou_threshold=0.3
+            max_age=14,
+            min_hits=1,  # Kept for backward compatibility
+            iou_threshold=0.3,
+            detection_interval=detection_interval,
+            min_hits_in_window=3,
+            window_cycles=4
         )
         
         roi_processor = ROIProcessor(
@@ -559,6 +613,11 @@ def face_worker_process(frame_queue: MPQueue,
             rgb = frame_data['rgb']
             timestamp = frame_data['timestamp']
             frame_id = frame_data.get('frame_id', frame_count)
+            
+            # Debug: Check if BGR is present
+            if frame_count % 30 == 0:
+                has_bgr = 'bgr' in frame_data and frame_data['bgr'] is not None
+                print(f"[FACE WORKER] Frame {frame_id}: BGR present: {has_bgr}, keys: {list(frame_data.keys())}")
             
             # Send frame to detector (it will handle detection interval)
             try:
@@ -673,6 +732,8 @@ def face_worker_process(frame_queue: MPQueue,
             
             if frame_count % 30 == 0:
                 print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects, {landmarks_collected} landmark results -> {len(face_data)} faces")
+                if len(tracked_objects) == 0:
+                    print(f"[FACE WORKER] No tracked objects. Detections received: {len(latest_detections)} frames with detections")
             
             # Create face data from tracked objects even if no landmarks yet
             # This ensures faces are shown immediately while landmarks are processed
@@ -690,20 +751,34 @@ def face_worker_process(frame_queue: MPQueue,
                     }
                     face_data.append(face_info)
             
-            # Send results with frame (always send if we have tracked objects)
-            if face_data or tracked_objects:
-                result = {
-                    'type': 'face',
-                    'mode': mode,
-                    'data': face_data,
-                    'timestamp': timestamp,
-                    'frame_bgr': frame_data.get('bgr')
-                }
-                
-                try:
-                    result_queue.put_nowait(result)
-                except:
-                    pass
+            # DEBUG_RETINAFACE: Check for debug detections
+            debug_detections = None
+            try:
+                debug_data = debug_detection_queue.get_nowait()
+                debug_detections = debug_data
+                print(f"[FACE WORKER DEBUG] Got debug detections: {len(debug_data.get('raw_detections', []))} raw")
+            except:
+                pass
+            
+            # Always send results to ensure frame is displayed
+            bgr_frame = frame_data.get('bgr')
+            result = {
+                'type': 'face',
+                'mode': mode,
+                'data': face_data,
+                'timestamp': timestamp,
+                'frame_bgr': bgr_frame,
+                'debug_detections': debug_detections  # DEBUG_RETINAFACE: Include debug data
+            }
+            
+            # Debug: Check if BGR is being sent
+            if frame_count % 30 == 0:
+                print(f"[FACE WORKER] Sending result with BGR: {bgr_frame is not None}, shape: {bgr_frame.shape if bgr_frame is not None else 'None'}")
+            
+            try:
+                result_queue.put_nowait(result)
+            except:
+                pass
             
             frame_count += 1
             
@@ -844,7 +919,7 @@ def pose_worker_process(frame_queue: MPQueue,
     pose_options = vision.PoseLandmarkerOptions(
         base_options=base_opts,
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=2,
+        num_poses=5,  # Increased from 2 to support more participants
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -969,9 +1044,13 @@ def fusion_process(face_result_queue: MPQueue,
                   correlation_queue: queue.Queue,
                   cam_idx: int,
                   enable_pose: bool,
-                  resolution: tuple):
+                  resolution: tuple,
+                  max_participants: int = 10):
     """Fuses face and pose results, manages preview and output"""
     print(f"[FUSION] Starting for camera {cam_idx}")
+    
+    # Initialize synchronous participant manager
+    sync_participant_manager = SyncParticipantManager(max_participants=max_participants)
     
     # Debug tracking
     frame_count = 0
@@ -984,10 +1063,11 @@ def fusion_process(face_result_queue: MPQueue,
     latest_face_data = []
     latest_pose_data = []
     latest_frame_bgr = None
+    latest_debug_detections = None  # DEBUG_RETINAFACE: Store latest debug detections
     last_preview_time = 0
     last_lsl_time = 0
-    preview_interval = 1.0 / 15  # 15 FPS preview
-    lsl_interval = 1.0 / 30  # 30 FPS LSL data (throttled)
+    preview_interval = 1.0 / 60  # 60 FPS preview cap
+    lsl_interval = 1.0 / 60  # 60 FPS LSL data cap
     enable_mesh = False  # Track mesh state
     
     # Result collection with timeout
@@ -1001,7 +1081,7 @@ def fusion_process(face_result_queue: MPQueue,
         while time.time() < deadline:
             try:
                 result = face_result_queue.get_nowait()
-                if result['type'] == 'face':
+                if result['type'] in ['face', 'face_advanced']:
                     face_results.append(result)
             except:
                 break
@@ -1044,29 +1124,69 @@ def fusion_process(face_result_queue: MPQueue,
             # Extract frame if available
             if 'frame_bgr' in result and result['frame_bgr'] is not None:
                 latest_frame_bgr = result['frame_bgr']
+            elif frame_count % 60 == 0:
+                print(f"[FUSION DEBUG] No frame_bgr in face result. Keys: {list(result.keys())}")
+            
+            # DEBUG_RETINAFACE: Extract debug detections if available
+            if 'debug_detections' in result and result['debug_detections'] is not None:
+                latest_debug_detections = result['debug_detections']
+                print(f"[FUSION DEBUG] Got debug detections: {len(latest_debug_detections.get('raw_detections', []))} raw")
             
             # Check if this is enhanced mode data
             is_enhanced = any('track_id' in face for face in face_data)
             
             if is_enhanced:
-                # Enhanced mode - data already has track IDs
+                # Enhanced mode - use synchronous participant manager
                 tracked_faces = []
                 for face in face_data:
                     participant_id = face.get('participant_id', -1)
+                    track_id = face.get('track_id', -1)
+                    
+                    # Calculate shape from landmarks
+                    shape = None
+                    if 'landmarks' in face and face['landmarks']:
+                        landmarks = np.array(face['landmarks'])
+                        if len(landmarks) > 0:
+                            shape = landmarks[:, :2]  # Use only x,y coordinates
+                    
+                    # Get embedding if available
+                    embedding = face.get('embedding')
+                    
+                    # Debug embedding availability
+                    if frame_count % 60 == 0 and track_id == 0:
+                        print(f"[FUSION] Track {track_id}: participant_id={participant_id}, has_embedding={embedding is not None}")
+                    
                     if participant_id < 0:
-                        # Not yet enrolled, use tracker
-                        tracked_face = face_tracker.update_single_detection({
-                            'centroid': face['centroid'],
-                            'landmarks': face['landmarks'],
-                            'local_id': face.get('track_id', -1)
-                        })
-                        if tracked_face:
-                            face['global_id'] = tracked_face['global_id']
-                            face['id'] = tracked_face['global_id']  # Add 'id' field for GUI compatibility
+                        # Not yet enrolled by face recognition, use participant manager
+                        global_id = sync_participant_manager.get_participant_id(
+                            cam_idx=cam_idx,
+                            local_id=track_id,
+                            centroid=face['centroid'],
+                            shape=shape,
+                            embedding=embedding,
+                            timestamp=timestamp
+                        )
+                        face['global_id'] = global_id
+                        face['id'] = global_id
                     else:
-                        # Use participant ID from face recognition
-                        face['global_id'] = participant_id + 1  # Convert to 1-based
-                        face['id'] = participant_id + 1  # Add 'id' field for GUI compatibility
+                        # Use participant ID from face recognition (already 0-based)
+                        # But still update participant manager for consistency
+                        global_id = participant_id + 1  # Convert to 1-based
+                        face['global_id'] = global_id
+                        face['id'] = global_id
+                        
+                        # Update participant manager with recognized ID and embedding
+                        if sync_participant_manager.participant_manager:
+                            sync_participant_manager.participant_manager.participants[global_id] = {
+                                'camera': cam_idx,
+                                'centroid': face['centroid'],
+                                'shape': shape,
+                                'last_seen': timestamp,
+                                'local_id': track_id
+                            }
+                            # Update embedding if available
+                            if embedding is not None:
+                                sync_participant_manager.participant_manager.update_participant_embedding(global_id, embedding)
                     
                     tracked_faces.append(face)
                 
@@ -1084,26 +1204,48 @@ def fusion_process(face_result_queue: MPQueue,
                         'local_id': i
                     })
                 
-                # For now, bypass the UnifiedTracker and send to participant manager directly
+                # Use synchronous participant manager for global ID assignment
                 latest_face_data = []
                 for i, face in enumerate(face_data):
-                    # Send to participant manager for global ID assignment
+                    # Calculate shape array from landmarks for Procrustes matching
+                    shape = None
+                    if 'landmarks' in face and face['landmarks']:
+                        # Convert landmarks to numpy array for shape analysis
+                        landmarks = np.array(face['landmarks'])
+                        if len(landmarks) > 0:
+                            shape = landmarks[:, :2]  # Use only x,y coordinates
+                    
+                    # Get global ID from synchronous participant manager
+                    global_id = sync_participant_manager.get_participant_id(
+                        cam_idx=cam_idx,
+                        local_id=i,
+                        centroid=face['centroid'],
+                        shape=shape,
+                        timestamp=timestamp
+                    )
+                    
+                    # Also send to async queue for GUI updates (optional)
                     if participant_update_queue:
                         try:
                             update_msg = {
                                 'camera_idx': cam_idx,
                                 'local_id': i,
                                 'centroid': face['centroid'],
-                                'landmarks': face['landmarks']
+                                'landmarks': face['landmarks'],
+                                'shape': shape.tolist() if shape is not None else None,
+                                'global_id': global_id,  # Include assigned ID
+                                'timestamp': timestamp
                             }
                             participant_update_queue.put_nowait(update_msg)
                         except:
                             pass
                     
-                    # For now, assign simple IDs
-                    face['global_id'] = i + 1
-                    face['id'] = i + 1  # Add 'id' field for GUI compatibility
+                    face['global_id'] = global_id
+                    face['id'] = global_id  # Add 'id' field for GUI compatibility
                     latest_face_data.append(face)
+                    
+                    if frame_count % 60 == 0 and i == 0:
+                        print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to face {i}")
                 
                 if frame_count % 30 == 0 and len(latest_face_data) > 0:
                     print(f"[FUSION DEBUG] Standard mode: {len(latest_face_data)} faces processed")
@@ -1121,13 +1263,51 @@ def fusion_process(face_result_queue: MPQueue,
                         'local_id': i
                     })
                 
-                # For now, bypass tracker for poses too
+                # Use synchronous participant manager for pose tracking
                 latest_pose_data = []
                 for i, pose in enumerate(pose_data):
-                    # Simple ID assignment
-                    pose['global_id'] = i + 1
-                    pose['id'] = i + 1  # Add 'id' field for GUI compatibility
+                    # For pose, we use subset of landmarks as shape
+                    shape = None
+                    if 'landmarks' in pose and pose['landmarks']:
+                        # Use key pose points for shape matching (e.g., shoulders, hips)
+                        landmarks = np.array(pose['landmarks'])
+                        if len(landmarks) >= 33:  # MediaPipe has 33 pose landmarks
+                            # Use shoulders (11,12), hips (23,24), nose (0)
+                            key_points = landmarks[[0, 11, 12, 23, 24], :2]
+                            shape = key_points
+                    
+                    # Get global ID from synchronous participant manager
+                    global_id = sync_participant_manager.get_participant_id(
+                        cam_idx=cam_idx,
+                        local_id=i,
+                        centroid=pose['centroid'],
+                        shape=shape,
+                        timestamp=timestamp
+                    )
+                    
+                    # Also send to async queue for GUI updates (optional)
+                    if participant_update_queue:
+                        try:
+                            update_msg = {
+                                'camera_idx': cam_idx,
+                                'local_id': i,
+                                'centroid': pose['centroid'],
+                                'landmarks': pose['landmarks'],
+                                'shape': shape.tolist() if shape is not None else None,
+                                'is_pose': True,  # Flag to indicate this is pose data
+                                'global_id': global_id,  # Include assigned ID
+                                'timestamp': timestamp
+                            }
+                            participant_update_queue.put_nowait(update_msg)
+                        except:
+                            pass
+                    
+                    pose['global_id'] = global_id
+                    pose['id'] = global_id  # Add 'id' field for GUI compatibility
                     latest_pose_data.append(pose)
+                    
+                    if frame_count % 60 == 0 and i == 0:
+                        print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to pose {i}")
         
         # Send preview at limited rate
         current_time = time.time()
@@ -1137,11 +1317,12 @@ def fusion_process(face_result_queue: MPQueue,
                 'faces': latest_face_data,  # Changed from 'face_data' to 'faces' to match GUI
                 'all_poses': latest_pose_data if enable_pose else [],  # Changed from 'pose_data' to 'all_poses'
                 'timestamp': current_time,
-                'frame_bgr': latest_frame_bgr  # Already downsampled by distributor
+                'frame_bgr': latest_frame_bgr,  # Already downsampled by distributor
+                'debug_detections': latest_debug_detections  # DEBUG_RETINAFACE: Include debug detections
             }
             
-            if frame_count % 60 == 0:  # Reduce debug frequency
-                print(f"[FUSION DEBUG] Sending preview: {len(latest_face_data)} faces, {len(latest_pose_data)} poses, frame: {latest_frame_bgr is not None}")
+            if frame_count % 300 == 0:  # Reduced debug frequency
+                print(f"[FUSION DEBUG] Sending preview: {len(latest_face_data)} faces, {len(latest_pose_data)} poses, frame: {latest_frame_bgr is not None}, frame shape: {latest_frame_bgr.shape if latest_frame_bgr is not None else 'None'}")
             
             try:
                 preview_queue.put_nowait(preview_data)
@@ -1320,7 +1501,7 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
         target=fusion_process,
         args=(face_result_queue, pose_result_queue, preview_queue, score_buffer,
               result_pipe, recording_queue, lsl_queue, participant_update_queue,
-              worker_pipe, correlation_queue, cam_idx, enable_pose, resolution)
+              worker_pipe, correlation_queue, cam_idx, enable_pose, resolution, max_participants)
     )
     fusion_proc.start()
     processes.append(fusion_proc)

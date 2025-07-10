@@ -48,8 +48,8 @@ def face_worker_advanced_process(frame_queue: MPQueue,
     detector.start()
     
     tracker = LightweightTracker(
-        max_age=10,  # Reduced from 30 to remove stale tracks faster
-        min_hits=3,
+        max_age=21,  # Keep tracks for 3 detection cycles (7 frames × 3)
+        min_hits=1,  # Accept tracks immediately instead of waiting
         iou_threshold=0.3
     )
     
@@ -155,8 +155,13 @@ def face_worker_advanced_process(frame_queue: MPQueue,
             continue
         
         rgb = frame_data['rgb']
+        bgr = frame_data.get('bgr')  # Get BGR frame for preview
         timestamp = frame_data['timestamp']
         frame_id += 1
+        
+        # Debug BGR frame availability
+        if frame_id % 100 == 0:
+            print(f"[ADVANCED FACE WORKER] Frame {frame_id}: RGB shape={rgb.shape}, BGR available={bgr is not None}, BGR shape={bgr.shape if bgr is not None else 'None'}")
         
         # Create downscaled version for everything except face detection
         rgb_downscaled = cv2.resize(rgb, downscale_resolution) if rgb.shape[:2] != downscale_resolution else rgb
@@ -328,19 +333,36 @@ def face_worker_advanced_process(frame_queue: MPQueue,
                     except Exception as e:
                         print(f"[ADVANCED FACE WORKER] MediaPipe error: {e}")
             
-            # Send results
-            if face_data:
-                result = {
-                    'type': 'face_advanced',
-                    'data': face_data,
-                    'timestamp': timestamp,
-                    'enrollment_status': enrollment_manager.get_all_enrollments() if enrollment_manager else {}
-                }
-                
-                try:
-                    result_queue.put_nowait(result)
-                except:
-                    pass
+            # Create face data from tracked objects even without landmarks
+            if not face_data and tracked_faces:
+                # Send tracked faces without landmarks for immediate overlay
+                for track in tracked_faces:
+                    face_data.append({
+                        'track_id': track['track_id'],
+                        'participant_id': -1,  # Not enrolled yet
+                        'bbox': track['bbox'].tolist(),
+                        'landmarks': [],  # No landmarks yet
+                        'blend': [0.0] * 52,
+                        'centroid': [(track['bbox'][0] + track['bbox'][2]) / 2,
+                                   (track['bbox'][1] + track['bbox'][3]) / 2],
+                        'mesh': None,
+                        'timestamp': timestamp,
+                        'quality_score': 0.0
+                    })
+            
+            # Always send results to ensure frame is displayed
+            result = {
+                'type': 'face_advanced',
+                'data': face_data,
+                'timestamp': timestamp,
+                'enrollment_status': enrollment_manager.get_all_enrollments() if enrollment_manager else {},
+                'frame_bgr': bgr  # Include BGR frame for preview
+            }
+            
+            try:
+                result_queue.put_nowait(result)
+            except:
+                pass
         
         frame_count += 1
         

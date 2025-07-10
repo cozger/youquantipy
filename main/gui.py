@@ -25,7 +25,7 @@ from audiorecorder import AudioRecorder, VideoAudioRecorder, AudioDeviceManager
 from guireliability import setup_reliability_monitoring, GUIReliabilityMonitor
 from advanced_detection_integration import create_participant_manager, create_parallel_worker, parallel_participant_worker_auto
 from tkinter import filedialog, messagebox
-from confighandler import ConfigHandler
+from confighandler import ConfigHandler 
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +157,9 @@ class YouQuantiPyGUI(tk.Tk):
 
         # get drawing manager
         self.drawingmanager = CanvasDrawingManager()
+        
+        # DEBUG_RETINAFACE: Enable debug drawing of raw detections
+        self.debug_retinaface = True  # Set to False to disable debug drawing
         # Synchrony plot correlator & face tracker
         self.correlator = ChannelCorrelator(window_size=60, fps=30)
         self.correlation_queue = MPQueue()
@@ -1221,6 +1224,14 @@ class YouQuantiPyGUI(tk.Tk):
                 frame_bgr = latest_msg.get('frame_bgr')
                 if frame_bgr is not None:
                     self.drawingmanager .render_frame_to_canvas(frame_bgr, canvas, idx)
+                else:
+                    # Debug when frame is missing
+                    if hasattr(self, '_frame_debug_count'):
+                        self._frame_debug_count += 1
+                    else:
+                        self._frame_debug_count = 1
+                    if self._frame_debug_count % 30 == 0:
+                        print(f"[GUI DEBUG] Camera {idx}: No frame_bgr in preview data. Keys: {list(latest_msg.keys())}")
                 
                 # Draw face overlays
                 faces = latest_msg.get('faces', [])
@@ -1247,6 +1258,12 @@ class YouQuantiPyGUI(tk.Tk):
                         canvas, all_poses, idx, 
                         enabled=True
                     )
+                
+                # DEBUG_RETINAFACE: Draw raw detections if enabled
+                if self.debug_retinaface:
+                    debug_detections = latest_msg.get('debug_detections')
+                    if debug_detections:
+                        self.drawingmanager.draw_debug_detections(canvas, debug_detections, idx)
                 
                 # Track successful update
                 if hasattr(self, 'reliability_monitor'):

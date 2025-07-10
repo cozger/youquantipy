@@ -17,35 +17,53 @@ The application supports two architecture modes:
 python gui.py
 ```
 
+### Running Tests
+```bash
+# Test standard mode
+python test_standard_mode.py
+
+# Test enhanced mode
+python test_enhanced_current.py
+
+# Run specific tests in tests/ directory
+python tests/test_enhanced.py
+python tests/test_retinaface_model.py
+```
+
 ### Installing Dependencies
 ```bash
 pip install pillow opencv-python numpy mediapipe pygrabber pylsl scipy onnxruntime
 ```
 
-### Enabling Enhanced Architecture
+### Code Organization
 ```bash
-python use_enhanced_architecture.py
+# Organize deprecated and experimental files
+python cleanup_codebase.py
 ```
 
 ## Architecture Overview
 
 ### Architecture Selection
-The system automatically selects the appropriate architecture based on configuration:
-- If face recognition is enabled in `youquantipy_config.json` → Enhanced Mode
-- Otherwise → Standard Mode
+The system automatically selects the appropriate architecture based on:
+1. `enable_face_recognition` setting in `youquantipy_config.json`
+2. Availability of required model files (RetinaFace and ArcFace ONNX models)
+3. Graceful fallback to standard mode if enhanced requirements aren't met
 
 ### Core Components (Both Modes)
 - **gui.py**: Main entry point - Tkinter-based GUI that orchestrates the entire application
 - **confighandler.py**: Configuration management system
 - **tracker.py**: Unified tracking using Procrustes shape analysis and Hungarian assignment
-- **participantmanager.py**: Global participant state management across cameras
+- **participantmanager_unified.py**: Global participant state management across cameras
 - **sharedbuffer.py**: Efficient frame sharing between processes using shared memory
 - **canvasdrawing.py**: GUI canvas drawing and overlay rendering
 - **LSLHelper.py**: Lab Streaming Layer integration for real-time data output
 - **correlator.py**: Real-time correlation calculation between participants
+- **guireliability.py**: GUI performance monitoring and recovery
+- **videorecorder.py**: Video recording functionality
+- **audiorecorder.py**: Audio recording functionality
 
 ### Standard Mode Components
-- **parallelworker.py**: Basic parallel processing for each participant
+- **parallelworker_unified.py**: Unified parallel processing (standard mode path)
 - Uses direct MediaPipe detection on full frames
 - Simple face/pose tracking without identity recognition
 
@@ -59,16 +77,15 @@ Enhanced mode uses a sophisticated multi-tier architecture:
 - **roi_manager.py**: ROI extraction and coordinate transformation
 
 #### Processing Layer
-- **landmark_worker_pool_adaptive.py**: Adaptive multiprocessing pool for landmarks
+- **landmark_worker_pool_unified.py**: Adaptive multiprocessing pool for landmarks
 - **face_recognition_process.py**: Separate process for ArcFace embeddings
 - **enrollment_manager.py**: Progressive enrollment state machine
 - **result_aggregator.py**: Aggregates results from multiple processing pipelines
 
 #### Integration Layer
 - **camera_worker_enhanced.py**: Main enhanced processing pipeline
-- **parallelworker_advanced_enhanced.py**: Enhanced face worker process
-- **parallelworker_enhanced_integration.py**: Backward compatibility wrapper
-- **advanced_detection_integration.py**: Automatic mode selection
+- **parallelworker_unified.py**: Unified worker (enhanced mode path)
+- **advanced_detection_integration.py**: Automatic mode selection and factory
 
 ### Data Flow
 
@@ -84,18 +101,6 @@ Camera → Frame Router → RetinaFace Detector ↘
                    Tracker → ROI Manager → Landmark Pool ↗
 ```
 
-#### Proposed Detailed Dataflow
-- This should be the dataflow:  Camera (4K capable)
-      ↓
-  FrameDistributor (30Hz)
-      ├─[Full]→ Face Detection (RetinaFace, every 7 frames)
-      │              ↓
-      │         ROI Locations → Face Landmarks (continuous)
-      │                              ↓
-      ├─[480p]→ Pose Detection ──────┤
-      │                              ↓
-      └─[Frame]────────────────→ Fusion → GUI
-
 ### Key Design Patterns
 
 1. **Multiprocessing Architecture**: Parallel processing with proper daemon handling
@@ -104,6 +109,7 @@ Camera → Frame Router → RetinaFace Detector ↘
 4. **Shared Memory Buffers**: Efficient frame sharing between processes
 5. **Configuration-Driven**: All settings in `youquantipy_config.json`
 6. **Automatic Mode Selection**: Seamless switching between architectures
+7. **Graceful Degradation**: Falls back to standard mode if enhanced requirements not met
 
 ### Configuration
 
@@ -113,7 +119,13 @@ Key settings:
 - `startup_mode.enable_face_recognition`: Enables enhanced mode
 - `advanced_detection.retinaface_model`: Path to RetinaFace model
 - `advanced_detection.arcface_model`: Path to ArcFace model
+- `advanced_detection.landmark_worker_count`: Number of landmark workers (default: 4)
 - `cameras`: Camera configuration and participant limits
+- `camera_settings`: Resolution and FPS targets
+- `video_recording` / `audio_recording`: Recording configurations
+
+Runtime state file: `recording_state.json`
+- Tracks current recording status and active cameras
 
 ### Model Requirements
 
@@ -129,15 +141,17 @@ Enhanced Mode (additional):
 
 1. **Camera FPS**: System handles low FPS cameras with warnings
 2. **Queue Management**: Automatic overflow handling for smooth operation
-3. **Track Limiting**: Prevents track explosion in unstable conditions
+3. **Track Limiting**: Prevents track explosion (max 2x participant count)
 4. **Frame Skipping**: Preview updates every other frame for performance
 5. **Worker Pool Size**: 4 landmark workers by default (configurable)
+6. **Detection Intervals**: Configurable intervals for face detection in enhanced mode
 
 ### Common Issues & Solutions
 
 1. **No Face/Pose Overlays**
    - Check preview data format matches GUI expectations
    - Verify queue connections between workers and GUI
+   - Ensure models are properly loaded
 
 2. **Low FPS Warning**
    - Camera hardware limitation, not processing issue
@@ -151,20 +165,34 @@ Enhanced Mode (additional):
    - Increased timeout for result collection
    - Automatic queue clearing on overflow
 
+5. **Enhanced Mode Not Working**
+   - Verify model files exist at specified paths
+   - Check `enable_face_recognition` is true in config
+   - Review console for model loading errors
+
 ### Debugging Tips
 
 1. Enable debug logging by checking frame_count modulo prints
 2. Monitor worker stats in console output
 3. Check participant ID assignment (-1 means not enrolled yet)
 4. Verify model files exist at specified paths
+5. Use `analyze_enhanced_architecture.py` for architecture analysis
+6. Check `recording_state.json` for runtime state
 
 ### Module Status
 
 **Active Modules**: All files listed in Core, Standard, and Enhanced components
 
-**Deprecated**: 
+**Deprecated** (`deprecated/` directory): 
+- Previous implementations of parallel workers and participant managers
 - `tileddetector.py` (replaced by retinaface_detector.py)
 
+**Experimental** (`experimental_enhanced/` directory):
+- Alternative enhanced architecture implementations
+- Use `use_enhanced_architecture.py` to enable
+
 **Test Files**:
-- `test_enhanced.py`
-- `test_retinaface_model.py`
+- `test_standard_mode.py`: Standard mode testing
+- `test_enhanced_current.py`: Enhanced mode testing
+- `tests/test_enhanced.py`: Additional enhanced tests
+- `tests/test_retinaface_model.py`: Model-specific tests

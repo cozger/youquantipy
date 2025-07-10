@@ -7,12 +7,12 @@
     },
     "camera_settings": {
         "target_fps": 30,
-        "resolution": "480p"
+        "resolution": "1080p"
     },
     "startup_mode": {
         "multi_face": false,
-        "participant_count": 2,
-        "camera_count": 2,
+        "participant_count": 1,
+        "camera_count": 1,
         "enable_mesh": false,
         "enable_pose": true,
         "enable_face_recognition": true
@@ -22,7 +22,7 @@
     },
     "audio_recording": {
         "enabled": false,
-        "standalone_audio": false,
+        "standalone_audio": true,
         "audio_with_video": false,
         "sample_rate": 44100,
         "channels": 1
@@ -33,7 +33,7 @@
         "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
         "tile_size": 640,
         "tile_overlap": 0.2,
-        "detection_confidence": 0.5,
+        "detection_confidence": 0.98,
         "nms_threshold": 0.4,
         "max_detection_workers": 4,
         "tracker_settings": {

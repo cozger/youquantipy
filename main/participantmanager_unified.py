@@ -44,7 +44,10 @@ class GlobalParticipantManager:
         # Enhanced mode specific
         if self.use_advanced_features:
             self.track_to_participant = {}  # {(camera_idx, track_id): participant_id}
-            self.participant_embeddings = {}  # {participant_id: [embeddings]}
+            self.participant_embeddings = {}  # {participant_id: deque of embeddings}
+            self.embedding_cache = {}  # {participant_id: averaged embedding}
+            self.max_embeddings_per_participant = 10
+            self.embedding_similarity_threshold = 0.65
             self.match_stats = {
                 'position_matches': 0,
                 'shape_matches': 0,
@@ -86,14 +89,77 @@ class GlobalParticipantManager:
         with self.lock:
             self.participant_names = names_dict.copy()
     
-    def update_participant(self, camera_idx, local_tracker_id, centroid, shape=None):
+    def update_participant_embedding(self, participant_id: int, embedding: np.ndarray):
+        """Store and update participant embedding for face recognition"""
+        if not self.use_advanced_features:
+            return
+        
+        with self.lock:
+            if participant_id not in self.participant_embeddings:
+                from collections import deque
+                self.participant_embeddings[participant_id] = deque(maxlen=self.max_embeddings_per_participant)
+            
+            # Store embedding
+            self.participant_embeddings[participant_id].append(embedding)
+            
+            # Update cached average embedding
+            embeddings = np.array(list(self.participant_embeddings[participant_id]))
+            self.embedding_cache[participant_id] = np.mean(embeddings, axis=0)
+            
+            # Update participant info if exists
+            if participant_id in self.participants:
+                if isinstance(self.participants[participant_id], self.ParticipantInfo):
+                    self.participants[participant_id].embedding_mean = self.embedding_cache[participant_id]
+                    self.participants[participant_id].enrollment_status = 'enrolled'
+    
+    def find_matching_participant_by_embedding(self, query_embedding: np.ndarray) -> Tuple[Optional[int], float]:
+        """Find participant with most similar embedding"""
+        if not self.use_advanced_features or not self.embedding_cache:
+            return None, 0.0
+        
+        with self.lock:
+            best_match_id = None
+            best_similarity = 0.0
+            
+            for participant_id, cached_embedding in self.embedding_cache.items():
+                similarity = self._cosine_similarity(query_embedding, cached_embedding)
+                
+                if similarity > best_similarity and similarity > self.embedding_similarity_threshold:
+                    best_similarity = similarity
+                    best_match_id = participant_id
+            
+            if best_match_id:
+                self.match_stats['recognition_matches'] += 1
+            
+            return best_match_id, best_similarity
+    
+    @staticmethod
+    def _cosine_similarity(embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """Compute cosine similarity between two embeddings"""
+        embedding1 = embedding1.flatten()
+        embedding2 = embedding2.flatten()
+        
+        dot_product = np.dot(embedding1, embedding2)
+        norm1 = np.linalg.norm(embedding1)
+        norm2 = np.linalg.norm(embedding2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+    
+    def update_participant(self, camera_idx, local_tracker_id, centroid, shape=None, embedding=None):
         """
         Standard mode update - maintains backward compatibility.
         Returns the global participant ID (1, 2, 3, etc.)
         """
         with self.lock:
-            if self.use_advanced_features:
-                # In advanced mode, still support legacy calls
+            if self.use_advanced_features and embedding is not None:
+                # Enhanced mode with embeddings
+                return self._match_or_create_participant_with_embedding(
+                    camera_idx, local_tracker_id, centroid, shape, embedding)
+            elif self.use_advanced_features:
+                # Advanced mode without embeddings
                 return self._match_or_create_participant(camera_idx, local_tracker_id, centroid, shape)
             else:
                 # Standard mode logic (original implementation)
@@ -432,6 +498,64 @@ class GlobalParticipantManager:
                 return least_confident_id
         
         return 1  # Default fallback
+    
+    def _match_or_create_participant_with_embedding(self, camera_idx, track_id, centroid, shape, embedding):
+        """Enhanced matching with embeddings, shape, and position"""
+        current_time = time.time()
+        
+        # First try embedding matching
+        embedding_match_id, embedding_similarity = self.find_matching_participant_by_embedding(embedding)
+        
+        # Then try shape/position matching
+        shape_match_id = None
+        shape_score = float('inf')
+        
+        for pid, participant in self.participants.items():
+            if isinstance(participant, self.ParticipantInfo):
+                # Calculate combined shape/position score
+                score = self._combined_score(centroid, participant.centroid, shape, participant.shape)
+                if score < shape_score:
+                    shape_score = score
+                    shape_match_id = pid
+        
+        # Combine matching results
+        if embedding_match_id and embedding_similarity > 0.8:
+            # Strong embedding match - trust it
+            participant_id = embedding_match_id
+            self.match_stats['recognition_matches'] += 1
+        elif shape_match_id and shape_score < 0.3:
+            # Strong shape match
+            participant_id = shape_match_id
+            self.match_stats['shape_matches'] += 1
+        elif embedding_match_id and shape_match_id == embedding_match_id:
+            # Both methods agree
+            participant_id = embedding_match_id
+            self.match_stats['recognition_matches'] += 1
+        else:
+            # No good match - create new participant
+            participant_id = self._get_next_available_id()
+            if participant_id is None:
+                return None
+            
+            participant = self.ParticipantInfo(participant_id, camera_idx, centroid, shape)
+            participant.track_ids.add((camera_idx, track_id))
+            self.participants[participant_id] = participant
+            self.match_stats['new_participants'] += 1
+        
+        # Update participant
+        if participant_id in self.participants:
+            participant = self.participants[participant_id]
+            if isinstance(participant, self.ParticipantInfo):
+                participant.camera = camera_idx
+                participant.centroid = centroid
+                participant.shape = shape
+                participant.last_seen = current_time
+                participant.track_ids.add((camera_idx, track_id))
+            
+            # Update embedding
+            self.update_participant_embedding(participant_id, embedding)
+        
+        return participant_id
     
     def _create_participant_from_recognition(self, participant_id, camera_idx, 
                                            track_id, centroid, shape):
