@@ -7,7 +7,7 @@
     },
     "camera_settings": {
         "target_fps": 30,
-        "resolution": "1080p"
+        "resolution": "720p"
     },
     "startup_mode": {
         "multi_face": false,
@@ -29,11 +29,11 @@
     },
     "audio_devices": {},
     "advanced_detection": {
-        "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
+        "retinaface_model": "D:/Projects/youquantipy/FaceDetector.onnx",
         "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
         "tile_size": 640,
         "tile_overlap": 0.2,
-        "detection_confidence": 0.98,
+        "detection_confidence": 0.3,
         "nms_threshold": 0.4,
         "max_detection_workers": 4,
         "tracker_settings": {

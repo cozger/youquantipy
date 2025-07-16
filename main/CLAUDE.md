@@ -17,18 +17,6 @@ The application supports two architecture modes:
 python gui.py
 ```
 
-### Running Tests
-```bash
-# Test standard mode
-python test_standard_mode.py
-
-# Test enhanced mode
-python test_enhanced_current.py
-
-# Run specific tests in tests/ directory
-python tests/test_enhanced.py
-python tests/test_retinaface_model.py
-```
 
 ### Installing Dependencies
 ```bash
@@ -145,30 +133,6 @@ Enhanced Mode (additional):
 4. **Frame Skipping**: Preview updates every other frame for performance
 5. **Worker Pool Size**: 4 landmark workers by default (configurable)
 6. **Detection Intervals**: Configurable intervals for face detection in enhanced mode
-
-### Common Issues & Solutions
-
-1. **No Face/Pose Overlays**
-   - Check preview data format matches GUI expectations
-   - Verify queue connections between workers and GUI
-   - Ensure models are properly loaded
-
-2. **Low FPS Warning**
-   - Camera hardware limitation, not processing issue
-   - Consider lower resolution or different camera
-
-3. **"Daemonic processes" Error**
-   - Enhanced worker processes are now non-daemon
-   - Allows proper child process spawning
-
-4. **Result Queue Full**
-   - Increased timeout for result collection
-   - Automatic queue clearing on overflow
-
-5. **Enhanced Mode Not Working**
-   - Verify model files exist at specified paths
-   - Check `enable_face_recognition` is true in config
-   - Review console for model loading errors
 
 ### Debugging Tips
 

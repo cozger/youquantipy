@@ -71,7 +71,8 @@ def camera_worker_enhanced(cam_idx: int,
         model_path=retinaface_model_path or "retinaface.onnx",
         tile_size=640,
         overlap=0.15,
-        confidence_threshold=0.7,
+        confidence_threshold=0.3,  # Lowered from 0.7 to match standalone
+        nms_threshold=0.4,  # Added NMS threshold
         max_workers=4
     )
     

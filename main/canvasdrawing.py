@@ -135,6 +135,14 @@ class CanvasDrawingManager:
             }
         cache = self.canvas_objects[canvas_idx]
         
+        # Ensure all required keys exist (for backward compatibility)
+        if 'last_seen' not in cache:
+            cache['last_seen'] = {}
+        if 'face_lines' not in cache:
+            cache['face_lines'] = {}
+        if 'face_labels' not in cache:
+            cache['face_labels'] = {}
+        
         # Get video bounds for coordinate transformation
         video_bounds = self.transform_cache.get(canvas_idx, {}).get('video_bounds')
         if not video_bounds:
@@ -344,6 +352,10 @@ class CanvasDrawingManager:
     
     def _hide_inactive_faces(self, canvas: tk.Canvas, cache: Dict, active_ids: set) -> None:
         """Hide faces that are no longer active."""
+        # Ensure face_lines exists
+        if 'face_lines' not in cache:
+            return
+            
         for face_id in list(cache['face_lines'].keys()):
             if face_id not in active_ids:
                 # Hide lines
@@ -354,12 +366,13 @@ class CanvasDrawingManager:
                         pass
                 
                 # Hide label
-                label_id = cache['face_labels'].get(face_id)
-                if label_id:
-                    try:
-                        canvas.itemconfig(label_id, state='hidden')
-                    except:
-                        pass
+                if 'face_labels' in cache:
+                    label_id = cache['face_labels'].get(face_id)
+                    if label_id:
+                        try:
+                            canvas.itemconfig(label_id, state='hidden')
+                        except:
+                            pass
     
     def _delete_face_objects(self, canvas: tk.Canvas, cache: Dict, face_id: Any) -> None:
         """Delete all canvas objects for a face."""

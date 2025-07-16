@@ -161,7 +161,7 @@ def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, tar
         frame_brightnesses.append(mean_brightness)
 
         # Sample camera values periodically
-        if frame_count % 10 == 0:
+        if frame_count % 240 == 0:
             exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
             brightness = cap.get(cv2.CAP_PROP_BRIGHTNESS)
             gain = cap.get(cv2.CAP_PROP_GAIN)
@@ -298,18 +298,18 @@ class FrameDistributor:
                             try:
                                 if sub['full_res']:
                                     sub['queue'].put_nowait(frame_data_full)
-                                    if frame_count % 30 == 0 and sub['name'] == 'face':
+                                    if frame_count % 240 == 0 and sub['name'] == 'face':
                                         print(f"[Frame Distributor] Sent full res to {sub['name']}, BGR shape: {frame_data_full['bgr'].shape}")
                                 else:
                                     sub['queue'].put_nowait(frame_data_downsampled)
-                                    if frame_count % 30 == 0 and sub['name'] == 'face':
+                                    if frame_count % 240 == 0 and sub['name'] == 'face':
                                         print(f"[Frame Distributor] Sent downsampled to {sub['name']}, BGR shape: {frame_data_downsampled['bgr'].shape}")
                             except:
                                 pass
                     
                     frame_count += 1
                     
-                    if frame_count % 30 == 0:
+                    if frame_count % 240 == 0:
                         print(f"[Frame Distributor] Distributed frame {frame_count} to {len(self.subscribers)} subscribers")
             else:
                 time.sleep(0.001)
@@ -330,8 +330,8 @@ def face_detection_process(detection_queue: MPQueue,
         model_path=retinaface_model_path,
         tile_size=640,  # Will be adjusted to 640x608 internally to match model
         overlap=0.1,  # Reduced overlap to minimize duplicate detections
-        confidence_threshold=0.9,  # Lowered threshold to allow full-face detections
-        nms_threshold=0.2,  # More aggressive NMS for overlapping tiles
+        confidence_threshold=0.5,  # Lowered threshold to detect more faces
+        nms_threshold=0.4,  # Standard NMS threshold
         max_workers=4,
         debug_queue=debug_queue  # DEBUG_RETINAFACE: Pass debug queue
     )
@@ -360,7 +360,7 @@ def face_detection_process(detection_queue: MPQueue,
         # Submit for detection at intervals
         if frame_id % detection_interval == 0:
             if detector.submit_frame(rgb, frame_id):
-                if frame_id % 30 == 0:
+                if frame_id % 240 == 0:
                     print(f"[FACE DETECTOR] Submitted frame {frame_id} for detection")
         
         # Check for detection results
@@ -450,7 +450,7 @@ def face_landmark_process(roi_queue: MPQueue,
         processed_count += 1
         
         # Debug output
-        if processed_count % 30 == 0:
+        if processed_count % 240 == 0:
             print(f"[FACE LANDMARK] Processed {processed_count} ROIs, landmarks found: {len(face_result.face_landmarks) if face_result.face_landmarks else 0}")
         
         if face_result.face_landmarks:
@@ -495,7 +495,7 @@ def face_landmark_process(roi_queue: MPQueue,
                 landmark_result_queue.put_nowait(result)
                 processed_count += 1
                 
-                if processed_count % 30 == 0:
+                if processed_count % 240 == 0:
                     print(f"[FACE LANDMARK] Processed {processed_count} ROIs")
             except:
                 pass
@@ -590,6 +590,8 @@ def face_worker_process(frame_queue: MPQueue,
         
         frame_count = 0
         latest_detections = {}
+        latest_detection_time = 0
+        latest_detection_data = []  # Store most recent detections
         
         while True:
             # Check for control messages
@@ -615,7 +617,7 @@ def face_worker_process(frame_queue: MPQueue,
             frame_id = frame_data.get('frame_id', frame_count)
             
             # Debug: Check if BGR is present
-            if frame_count % 30 == 0:
+            if frame_count % 240 == 0:
                 has_bgr = 'bgr' in frame_data and frame_data['bgr'] is not None
                 print(f"[FACE WORKER] Frame {frame_id}: BGR present: {has_bgr}, keys: {list(frame_data.keys())}")
             
@@ -629,19 +631,35 @@ def face_worker_process(frame_queue: MPQueue,
             try:
                 det_result = detection_result_queue.get_nowait()
                 latest_detections[det_result['frame_id']] = det_result['detections']
+                latest_detection_time = time.time()
+                latest_detection_data = det_result['detections']
                 print(f"[FACE WORKER] Received {len(det_result['detections'])} detections for frame {det_result['frame_id']}")
             except:
                 pass
             
-            # Get detections for current frame or use empty list
-            detections = latest_detections.get(frame_id, [])
+            # Use most recent detections if they're fresh (within 0.5 seconds)
+            # This handles the async nature of the detection pipeline
+            current_time = time.time()
+            if latest_detection_time > 0 and current_time - latest_detection_time < 0.5 and latest_detection_data:
+                detections = latest_detection_data
+                if frame_count % 240 == 0:
+                    print(f"[FACE WORKER] Using recent detections ({len(detections)} faces) for tracking")
+            else:
+                # No recent detections, use empty list for tracking continuity
+                detections = []
+                # Clear stale detection data to prevent confusion
+                if latest_detection_time > 0 and current_time - latest_detection_time > 1.0:
+                    latest_detection_data = []
+                    if frame_count % 240 == 0:
+                        print(f"[FACE WORKER] No recent detections. Detection age: {current_time - latest_detection_time if latest_detection_time > 0 else 'never'}s")
             
             # If no detections for this frame, use empty list but still update tracker
             # This allows tracking to continue between detection frames
             tracked_objects = tracker.update(rgb, detections)
             
-            if frame_count % 30 == 0:
-                print(f"[FACE WORKER] Frame {frame_id}: {len(detections)} detections -> {len(tracked_objects)} tracked objects")
+            if frame_count % 240 == 0:
+                detection_age = current_time - latest_detection_time if latest_detection_time > 0 else -1
+                print(f"[FACE WORKER] Frame {frame_id}: {len(detections)} detections (age: {detection_age:.2f}s) -> {len(tracked_objects)} tracked objects")
             
             # Extract ROIs for tracked objects
             rois_extracted = 0
@@ -679,7 +697,7 @@ def face_worker_process(frame_queue: MPQueue,
                             timestamp
                         )
             
-            if frame_count % 30 == 0 and rois_extracted > 0:
+            if frame_count % 240 == 0 and rois_extracted > 0:
                 print(f"[FACE WORKER] Extracted {rois_extracted} ROIs for landmarks")
             
             # Collect landmark results
@@ -730,10 +748,11 @@ def face_worker_process(frame_queue: MPQueue,
                 except:
                     break
             
-            if frame_count % 30 == 0:
+            if frame_count % 240 == 0:
                 print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects, {landmarks_collected} landmark results -> {len(face_data)} faces")
                 if len(tracked_objects) == 0:
-                    print(f"[FACE WORKER] No tracked objects. Detections received: {len(latest_detections)} frames with detections")
+                    detection_info = f"age: {current_time - latest_detection_time:.2f}s" if latest_detection_time > 0 else "none"
+                    print(f"[FACE WORKER] No tracked objects. Latest detection: {detection_info}, Total detection frames: {len(latest_detections)}")
             
             # Create face data from tracked objects even if no landmarks yet
             # This ensures faces are shown immediately while landmarks are processed
@@ -772,7 +791,7 @@ def face_worker_process(frame_queue: MPQueue,
             }
             
             # Debug: Check if BGR is being sent
-            if frame_count % 30 == 0:
+            if frame_count % 240 == 0:
                 print(f"[FACE WORKER] Sending result with BGR: {bgr_frame is not None}, shape: {bgr_frame.shape if bgr_frame is not None else 'None'}")
             
             try:
@@ -1021,7 +1040,7 @@ def pose_worker_process(frame_queue: MPQueue,
         
         # Report FPS periodically
         current_time = time.time()
-        if current_time - last_fps_report > 10.0:
+        if current_time - last_fps_report > 240.0:
             elapsed = current_time - last_fps_report
             fps = frame_count / elapsed
             print(f"[POSE WORKER] FPS: {fps:.1f}, Detection rate: {detection_count/frame_count:.2f}")
@@ -1124,7 +1143,7 @@ def fusion_process(face_result_queue: MPQueue,
             # Extract frame if available
             if 'frame_bgr' in result and result['frame_bgr'] is not None:
                 latest_frame_bgr = result['frame_bgr']
-            elif frame_count % 60 == 0:
+            elif frame_count % 240 == 0:
                 print(f"[FUSION DEBUG] No frame_bgr in face result. Keys: {list(result.keys())}")
             
             # DEBUG_RETINAFACE: Extract debug detections if available
@@ -1153,7 +1172,7 @@ def fusion_process(face_result_queue: MPQueue,
                     embedding = face.get('embedding')
                     
                     # Debug embedding availability
-                    if frame_count % 60 == 0 and track_id == 0:
+                    if frame_count % 240 == 0 and track_id == 0:
                         print(f"[FUSION] Track {track_id}: participant_id={participant_id}, has_embedding={embedding is not None}")
                     
                     if participant_id < 0:
@@ -1244,7 +1263,7 @@ def fusion_process(face_result_queue: MPQueue,
                     face['id'] = global_id  # Add 'id' field for GUI compatibility
                     latest_face_data.append(face)
                     
-                    if frame_count % 60 == 0 and i == 0:
+                    if frame_count % 240 == 0 and i == 0:
                         print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to face {i}")
                 
                 if frame_count % 30 == 0 and len(latest_face_data) > 0:
@@ -1306,22 +1325,36 @@ def fusion_process(face_result_queue: MPQueue,
                     pose['id'] = global_id  # Add 'id' field for GUI compatibility
                     latest_pose_data.append(pose)
                     
-                    if frame_count % 60 == 0 and i == 0:
+                    if frame_count % 240 == 0 and i == 0:
                         print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to pose {i}")
         
         # Send preview at limited rate
         current_time = time.time()
         if current_time - last_preview_time > preview_interval:
+            # Ensure frame is downsampled for GUI preview
+            preview_frame = latest_frame_bgr
+            if preview_frame is not None:
+                h, w = preview_frame.shape[:2]
+                downscale_width = 640
+                downscale_height = 480
+                
+                # Only downsample if needed
+                if w > downscale_width or h > downscale_height:
+                    scale = min(downscale_width / w, downscale_height / h)
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    preview_frame = cv2.resize(preview_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
             preview_data = {
                 'cam_idx': cam_idx,
                 'faces': latest_face_data,  # Changed from 'face_data' to 'faces' to match GUI
                 'all_poses': latest_pose_data if enable_pose else [],  # Changed from 'pose_data' to 'all_poses'
                 'timestamp': current_time,
-                'frame_bgr': latest_frame_bgr,  # Already downsampled by distributor
+                'frame_bgr': preview_frame,  # Now properly downsampled for GUI
                 'debug_detections': latest_debug_detections  # DEBUG_RETINAFACE: Include debug detections
             }
             
-            if frame_count % 300 == 0:  # Reduced debug frequency
+            if frame_count % 240 == 0:  # Reduced debug frequency
                 print(f"[FUSION DEBUG] Sending preview: {len(latest_face_data)} faces, {len(latest_pose_data)} poses, frame: {latest_frame_bgr is not None}, frame shape: {latest_frame_bgr.shape if latest_frame_bgr is not None else 'None'}")
             
             try:

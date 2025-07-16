@@ -1189,7 +1189,7 @@ class YouQuantiPyGUI(tk.Tk):
                 continue
             
             # Check if we should skip this frame (FPS limiting)
-            if self.drawingmanager .should_skip_frame(idx):
+            if self.drawingmanager.should_skip_frame(idx):
                 continue
             
             # Get latest frame (with batching)
@@ -1223,7 +1223,7 @@ class YouQuantiPyGUI(tk.Tk):
                 # Render frame
                 frame_bgr = latest_msg.get('frame_bgr')
                 if frame_bgr is not None:
-                    self.drawingmanager .render_frame_to_canvas(frame_bgr, canvas, idx)
+                    self.drawingmanager.render_frame_to_canvas(frame_bgr, canvas, idx)
                 else:
                     # Debug when frame is missing
                     if hasattr(self, '_frame_debug_count'):
@@ -1244,7 +1244,7 @@ class YouQuantiPyGUI(tk.Tk):
                             labels[global_id] = self.global_participant_manager.get_participant_name(global_id)
                     
                     # Draw faces with optimization
-                    self.drawingmanager .draw_faces_optimized(
+                    self.drawingmanager.draw_faces_optimized(
                         canvas, faces, idx, 
                         labels=labels,
                         participant_count=self.participant_count.get(),
@@ -1254,7 +1254,7 @@ class YouQuantiPyGUI(tk.Tk):
                 # Draw pose overlays
                 if self.enable_pose.get():
                     all_poses = latest_msg.get('all_poses', [])
-                    self.drawingmanager .draw_poses_optimized(
+                    self.drawingmanager.draw_poses_optimized(
                         canvas, all_poses, idx, 
                         enabled=True
                     )
@@ -1285,7 +1285,7 @@ class YouQuantiPyGUI(tk.Tk):
             return
         
         print(f"\n[Canvas Debug] Canvas {canvas_idx}:")
-        stats = self.drawingmanager .get_stats(canvas_idx)
+        stats = self.drawingmanager.get_stats(canvas_idx)
         for key, value in stats.items():
             print(f"  {key}: {value}")
     

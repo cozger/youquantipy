@@ -104,7 +104,14 @@ class LightweightTracker:
             List of tracked objects with IDs
         """
         self.frame_count += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if self.frame_count % 30 == 0 or len(detections) > 0:
+            print(f"[TRACKER] update() called: frame {self.frame_count}, {len(detections)} detections")
+            if len(detections) > 0:
+                print(f"[TRACKER] First detection: {detections[0]}")
+        
+        # Enhanced mode passes RGB frames, not BGR
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         
         # Predict new locations of existing tracks
         for track in self.tracks:
@@ -117,6 +124,10 @@ class LightweightTracker:
         # Match detections to tracks
         matched, unmatched_dets, unmatched_trks = self._match_detections(detections)
         
+        if self.frame_count % 30 == 0 or len(detections) > 0:
+            print(f"[TRACKER] Frame {self.frame_count}: {len(detections)} detections, {len(self.tracks)} tracks")
+            print(f"[TRACKER] Matching: {len(matched)} matched, {len(unmatched_dets)} unmatched dets, {len(unmatched_trks)} unmatched tracks")
+        
         # Update matched tracks
         for m in matched:
             self._update_with_detection(self.tracks[m[1]], detections[m[0]], frame)
@@ -125,6 +136,7 @@ class LightweightTracker:
         for i in unmatched_dets:
             trk = self._init_track(detections[i])
             self.tracks.append(trk)
+            print(f"[TRACKER] Created new track {trk.track_id} at frame {self.frame_count}")
         
         # Handle unmatched tracks
         for i in unmatched_trks:
@@ -150,6 +162,9 @@ class LightweightTracker:
                     'landmarks': track.landmarks.tolist() if track.landmarks is not None else None
                 }
                 results.append(result)
+                
+        if self.frame_count % 30 == 0 and len(results) > 0:
+            print(f"[TRACKER] Returning {len(results)} confirmed tracks at frame {self.frame_count}")
         
         self.prev_gray = gray
         return results

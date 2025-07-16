@@ -23,14 +23,15 @@ except ImportError:
 class SimpleRetinaFaceDetector:
     """Simplified RetinaFace detector for testing."""
     
-    def __init__(self, model_path: str, confidence_threshold: float = 0.98):
+    def __init__(self, model_path: str, confidence_threshold: float = 0.3):
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = 0.4
         
-        # Model dimensions (standard RetinaFace)
+        # Model dimensions (will be detected from model)
         self.model_width = 640
-        self.model_height = 608
+        self.model_height = 640  # Changed default to 640
+        self.model_format = 'NCHW'  # Default to NCHW based on error
         
         # Anchor parameters
         self.anchors = None
@@ -40,7 +41,7 @@ class SimpleRetinaFaceDetector:
         self._init_model()
         
     def _init_model(self):
-        """Initialize ONNX model."""
+        """Initialize ONNX model and detect format."""
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
             
@@ -49,19 +50,95 @@ class SimpleRetinaFaceDetector:
         self.input_name = self.model.get_inputs()[0].name
         self.output_names = [out.name for out in self.model.get_outputs()]
         
-        # Print model info
+        # Analyze model input format
         input_info = self.model.get_inputs()[0]
-        print(f"Model input: {self.input_name}, shape: {input_info.shape}")
+        input_shape = input_info.shape
+        print(f"Model input: {self.input_name}, shape: {input_shape}, type: {input_info.type}")
+        
+        # Detect format from shape
+        if isinstance(input_shape, list) and len(input_shape) == 4:
+            # Look for dimension with value 3 (channels)
+            for i, dim in enumerate(input_shape):
+                if isinstance(dim, (int, float)) and dim == 3:
+                    if i == 1:
+                        self.model_format = 'NCHW'
+                        print("Detected NCHW format (channels at index 1)")
+                    elif i == 3:
+                        self.model_format = 'NHWC'
+                        print("Detected NHWC format (channels at index 3)")
+                    break
+            
+            # Extract height and width
+            # For NCHW: [batch, channels, height, width]
+            # For NHWC: [batch, height, width, channels]
+            numeric_dims = []
+            for dim in input_shape:
+                if isinstance(dim, (int, float)) and dim > 3:  # Skip batch and channel dims
+                    numeric_dims.append(int(dim))
+                elif isinstance(dim, str) and dim.isdigit():
+                    numeric_dims.append(int(dim))
+            
+            if len(numeric_dims) >= 2:
+                # Assume the two largest dimensions are height and width
+                sorted_dims = sorted(numeric_dims, reverse=True)
+                self.model_width = sorted_dims[0]
+                self.model_height = sorted_dims[1] if len(sorted_dims) > 1 else sorted_dims[0]
+            elif len(numeric_dims) == 1:
+                # Square input
+                self.model_width = numeric_dims[0]
+                self.model_height = numeric_dims[0]
+            
+            # Handle common RetinaFace input sizes
+            if self.model_format == 'NCHW':
+                # Try to extract from known positions
+                if len(input_shape) == 4:
+                    # Check if dimensions 2 and 3 are numeric
+                    if isinstance(input_shape[2], (int, float)) and input_shape[2] > 0:
+                        self.model_height = int(input_shape[2])
+                    if isinstance(input_shape[3], (int, float)) and input_shape[3] > 0:
+                        self.model_width = int(input_shape[3])
+        
+        print(f"Detected model format: {self.model_format}")
+        print(f"Model dimensions: {self.model_width}x{self.model_height}")
         print(f"Model outputs: {[(out.name, out.shape) for out in self.model.get_outputs()]}")
         
-        # Generate anchors
+        # Generate anchors based on model dimensions
         self._generate_anchors()
         print(f"Generated {len(self.anchors)} anchors")
         
     def _generate_anchors(self):
-        """Generate anchors for RetinaFace (15960 configuration)."""
-        min_sizes = [[64, 96, 128], [128, 192], [256, 384], [384, 512, 640]]
-        steps = [8, 16, 32, 64]
+        """Generate anchors for RetinaFace."""
+        # Try to detect anchor configuration from model outputs
+        output_shapes = [out.shape for out in self.model.get_outputs()]
+        print(f"Output shapes: {output_shapes}")
+        
+        # Default configuration for 640x640 model
+        if self.model_width == 640 and self.model_height == 640:
+            min_sizes = [[16, 32], [64, 128], [256, 512]]
+            steps = [8, 16, 32]
+        else:
+            # Original configuration for other sizes
+            min_sizes = [[64, 96, 128], [128, 192], [256, 384], [384, 512, 640]]
+            steps = [8, 16, 32, 64]
+        
+        # Check if we can determine anchor count from output shapes
+        if output_shapes and len(output_shapes) > 0:
+            first_output_shape = output_shapes[0]
+            if isinstance(first_output_shape, list) and len(first_output_shape) >= 2:
+                # Try to find the anchor dimension
+                for dim in first_output_shape:
+                    if isinstance(dim, (int, float)) and dim > 1000:
+                        anchor_count = int(dim)
+                        print(f"Detected {anchor_count} anchors from output shape")
+                        
+                        # Adjust configuration based on anchor count
+                        if anchor_count == 16800:  # Common for 640x640
+                            min_sizes = [[16, 32], [64, 128], [256, 512]]
+                            steps = [8, 16, 32]
+                        elif anchor_count == 25600:  # Another common configuration
+                            min_sizes = [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]]
+                            steps = [8, 16, 32, 64]
+                        break
         
         anchors = []
         
@@ -92,8 +169,24 @@ class SimpleRetinaFaceDetector:
         img = img.astype(np.float32)
         img -= (104, 117, 123)  # ImageNet mean subtraction
         
-        # Add batch dimension (NHWC format)
-        img = np.expand_dims(img, axis=0)
+        # Format based on model requirements
+        if self.model_format == 'NCHW':
+            # Transpose from HWC to CHW
+            img = img.transpose(2, 0, 1)
+            # Add batch dimension -> [1, 3, H, W]
+            img = np.expand_dims(img, axis=0)
+        else:  # NHWC
+            # Add batch dimension -> [1, H, W, 3]
+            img = np.expand_dims(img, axis=0)
+        
+        # Only print shape on first call
+        if not hasattr(self, '_preprocess_count'):
+            self._preprocess_count = 0
+        self._preprocess_count += 1
+        
+        if self._preprocess_count == 1:
+            print(f"Preprocessed image shape: {img.shape} (format: {self.model_format})")
+            print(f"Expected format: {self.model_format}")
         
         return img
         
@@ -105,7 +198,13 @@ class SimpleRetinaFaceDetector:
         input_tensor = self.preprocess(image)
         
         # Run inference
-        outputs = self.model.run(self.output_names, {self.input_name: input_tensor})
+        try:
+            outputs = self.model.run(self.output_names, {self.input_name: input_tensor})
+        except Exception as e:
+            print(f"Inference error: {e}")
+            print(f"Input tensor shape: {input_tensor.shape}")
+            print(f"Expected input name: {self.input_name}")
+            raise
         
         # Parse detections
         detections = self._parse_detections(outputs, w, h)
@@ -119,66 +218,175 @@ class SimpleRetinaFaceDetector:
         """Parse model outputs."""
         detections = []
         
+        # Only print output info on first detection
+        if not hasattr(self, '_parse_count'):
+            self._parse_count = 0
+        self._parse_count += 1
+        
+        if self._parse_count == 1:
+            print(f"\nParsing outputs: {len(outputs)} arrays")
+            for i, out in enumerate(outputs):
+                print(f"Output {i}: shape={out.shape}, dtype={out.dtype}, name={self.model.get_outputs()[i].name}")
+        
         if len(outputs) >= 2:
-            boxes = outputs[0]
-            scores = outputs[1]
+            # Try to identify which output is boxes and which is scores
+            boxes = None
+            scores = None
+            landmarks = None
             
-            # Remove batch dimension if present
-            if len(boxes.shape) == 3:
-                boxes = boxes[0]
-            if len(scores.shape) == 3:
-                scores = scores[0]
+            for i, out in enumerate(outputs):
+                out_name = self.model.get_outputs()[i].name.lower()
                 
-            # Apply softmax to scores
-            if scores.shape[1] == 2:
+                # Remove batch dimension if present
+                if len(out.shape) == 3 and out.shape[0] == 1:
+                    out = out[0]
+                
+                # Identify by name or shape
+                if 'box' in out_name or 'loc' in out_name or 'bbox' in out_name:
+                    boxes = out
+                    if self._parse_count == 1:
+                        print(f"Identified boxes by name: shape={boxes.shape}")
+                elif 'score' in out_name or 'conf' in out_name or 'cls' in out_name or 'class' in out_name:
+                    scores = out
+                    if self._parse_count == 1:
+                        print(f"Identified scores by name: shape={scores.shape}")
+                elif 'landmark' in out_name or 'ldmk' in out_name:
+                    landmarks = out
+                    if self._parse_count == 1:
+                        print(f"Identified landmarks by name: shape={landmarks.shape}")
+            
+            # If name matching fails, use shape-based detection
+            if boxes is None or scores is None:
+                for i, out in enumerate(outputs):
+                    # Remove batch dimension if present
+                    if len(out.shape) == 3 and out.shape[0] == 1:
+                        out = out[0]
+                    
+                    # Check shape patterns
+                    if boxes is None and len(out.shape) == 2 and out.shape[-1] == 4:
+                        boxes = out
+                        if self._parse_count == 1:
+                            print(f"Identified boxes by shape: shape={boxes.shape}")
+                    elif scores is None and len(out.shape) == 2 and out.shape[-1] in [1, 2]:
+                        scores = out
+                        if self._parse_count == 1:
+                            print(f"Identified scores by shape: shape={scores.shape}")
+                    elif landmarks is None and len(out.shape) == 2 and out.shape[-1] == 10:
+                        landmarks = out
+                        if self._parse_count == 1:
+                            print(f"Identified landmarks by shape: shape={landmarks.shape}")
+            
+            # Final fallback to positional
+            if boxes is None and scores is None:
+                boxes = outputs[0]
+                scores = outputs[1] if len(outputs) > 1 else None
+                
+                # Remove batch dimensions
+                if len(boxes.shape) == 3:
+                    boxes = boxes[0]
+                if scores is not None and len(scores.shape) == 3:
+                    scores = scores[0]
+            
+            if boxes is None or scores is None:
+                print("Could not identify boxes and scores in outputs")
+                return detections
+                
+            # Process scores
+            if len(scores.shape) == 2 and scores.shape[1] == 2:
+                # Apply softmax for two-class scores
                 scores_exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
                 scores_softmax = scores_exp / np.sum(scores_exp, axis=1, keepdims=True)
                 scores = scores_softmax[:, 1]  # Face class
+            elif len(scores.shape) == 2 and scores.shape[1] == 1:
+                # Single score per detection
+                scores = scores.flatten()
+            elif len(scores.shape) == 1:
+                # Already single scores
+                pass
+            else:
+                if self._parse_count == 1:
+                    print(f"Unexpected score shape: {scores.shape}")
+                # Try to use as-is
+                if scores.shape[-1] > 1:
+                    scores = scores[:, -1]  # Take last column
+                else:
+                    scores = scores.flatten()
                 
             # Scale factors
             scale_x = img_w / self.model_width
             scale_y = img_h / self.model_height
             
+            if self._parse_count % 30 == 1:  # Print every 30 frames
+                print(f"Processing {len(scores)} detections, threshold={self.confidence_threshold}")
+                print(f"Max score: {np.max(scores):.3f}, scores > threshold: {np.sum(scores > self.confidence_threshold)}")
+            
             # Process high-confidence detections
             for i in range(len(scores)):
                 if scores[i] > self.confidence_threshold:
-                    if i < len(self.anchors):
+                    box = boxes[i]
+                    
+                    # Check if box values look like they need anchor decoding
+                    box_range = np.max(np.abs(box))
+                    
+                    if box_range < 10 and self.anchors is not None and i < len(self.anchors):
+                        # Small values suggest anchor-relative encoding
                         anchor = self.anchors[i]
-                        box = boxes[i]
                         
-                        # Decode box
+                        # Decode box using anchors
                         cx = anchor[0] + box[0] * self.variances[0] * anchor[2]
                         cy = anchor[1] + box[1] * self.variances[0] * anchor[3]
                         w = anchor[2] * np.exp(box[2] * self.variances[1])
                         h = anchor[3] * np.exp(box[3] * self.variances[1])
                         
-                        # Convert to corner format and scale
-                        x1 = (cx - w / 2) * self.model_width * scale_x
-                        y1 = (cy - h / 2) * self.model_height * scale_y
-                        x2 = (cx + w / 2) * self.model_width * scale_x
-                        y2 = (cy + h / 2) * self.model_height * scale_y
+                        # Convert to corner format
+                        x1 = (cx - w / 2) * self.model_width
+                        y1 = (cy - h / 2) * self.model_height
+                        x2 = (cx + w / 2) * self.model_width
+                        y2 = (cy + h / 2) * self.model_height
+                    else:
+                        # Values look like direct coordinates or normalized coordinates
+                        if box_range <= 1.0:
+                            # Normalized coordinates [0, 1]
+                            x1, y1, x2, y2 = box
+                            x1 *= self.model_width
+                            y1 *= self.model_height
+                            x2 *= self.model_width
+                            y2 *= self.model_height
+                        else:
+                            # Direct pixel coordinates
+                            x1, y1, x2, y2 = box
+                    
+                    # Scale to original image size
+                    x1 *= scale_x
+                    y1 *= scale_y
+                    x2 *= scale_x
+                    y2 *= scale_y
+                    
+                    # Clamp to image bounds
+                    x1 = max(0, min(x1, img_w - 1))
+                    y1 = max(0, min(y1, img_h - 1))
+                    x2 = max(0, min(x2, img_w - 1))
+                    y2 = max(0, min(y2, img_h - 1))
+                    
+                    # Filter by size and aspect ratio
+                    face_w = x2 - x1
+                    face_h = y2 - y1
+                    
+                    if face_w < 20 or face_h < 20:  # Too small
+                        continue
                         
-                        # Clamp to image bounds
-                        x1 = max(0, min(x1, img_w - 1))
-                        y1 = max(0, min(y1, img_h - 1))
-                        x2 = max(0, min(x2, img_w - 1))
-                        y2 = max(0, min(y2, img_h - 1))
+                    aspect_ratio = face_w / face_h if face_h > 0 else 0
+                    if aspect_ratio < 0.4 or aspect_ratio > 2.5:  # Bad aspect ratio
+                        continue
                         
-                        # Filter by size and aspect ratio
-                        face_w = x2 - x1
-                        face_h = y2 - y1
-                        
-                        if face_w < 30 or face_h < 30:  # Too small
-                            continue
-                            
-                        aspect_ratio = face_w / face_h if face_h > 0 else 0
-                        if aspect_ratio < 0.5 or aspect_ratio > 2.0:  # Bad aspect ratio
-                            continue
-                            
-                        detections.append({
-                            'bbox': [x1, y1, x2, y2],
-                            'confidence': float(scores[i])
-                        })
+                    detections.append({
+                        'bbox': [x1, y1, x2, y2],
+                        'confidence': float(scores[i])
+                    })
+                    
+                    # Debug first few detections
+                    if len(detections) <= 3 and self._parse_count == 1:
+                        print(f"Detection {i}: score={scores[i]:.3f}, box={box}, decoded=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]")
                         
         return detections
         
@@ -269,7 +477,7 @@ def draw_detections(image: np.ndarray, detections: List[Dict], fps: float = 0) -
 def main():
     parser = argparse.ArgumentParser(description="Test RetinaFace detection")
     parser.add_argument('--model', type=str, 
-                       default='D:/Projects/youquantipy/retinaface.onnx',
+                       default='D:/Projects/youquantipy/FaceDetector.onnx',
                        help='Path to RetinaFace ONNX model')
     parser.add_argument('--camera', type=int, default=0,
                        help='Camera index (default: 0)')
@@ -277,8 +485,8 @@ def main():
                        help='Video file path (overrides camera)')
     parser.add_argument('--image', type=str, default=None,
                        help='Image file path (overrides camera/video)')
-    parser.add_argument('--confidence', type=float, default=0.98,
-                       help='Confidence threshold (default: 0.98)')
+    parser.add_argument('--confidence', type=float, default=0.3,
+                       help='Confidence threshold (default: 0.3)')
     parser.add_argument('--width', type=int, default=1920,
                        help='Camera width (default: 1920 for 1080p)')
     parser.add_argument('--height', type=int, default=1080,
