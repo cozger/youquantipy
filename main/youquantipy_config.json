@@ -14,28 +14,21 @@
         "participant_count": 1,
         "camera_count": 1,
         "enable_mesh": false,
-        "enable_pose": true,
-        "enable_face_recognition": true
+        "enable_pose": true
     },
     "paths": {
-        "model_path": "D:/Projects/youquantipy/face_landmarker.task"
+        "model_path": "D:/Projects/youquantipy/face_landmarker.task",
+        "pose_model_path": "D:/Projects/youquantipy/pose_landmarker_heavy.task"
     },
-    "audio_recording": {
-        "enabled": false,
-        "standalone_audio": true,
-        "audio_with_video": false,
-        "sample_rate": 44100,
-        "channels": 1
-    },
-    "audio_devices": {},
     "advanced_detection": {
-        "retinaface_model": "D:/Projects/youquantipy/FaceDetector.onnx",
+        "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
         "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
         "tile_size": 640,
         "tile_overlap": 0.2,
         "detection_confidence": 0.3,
         "nms_threshold": 0.4,
         "max_detection_workers": 4,
+        "landmark_worker_count": 4,
         "tracker_settings": {
             "max_age": 30,
             "min_hits": 3,
@@ -67,6 +60,14 @@
             "improvement_window": 20
         }
     },
+    "audio_recording": {
+        "enabled": false,
+        "standalone_audio": true,
+        "audio_with_video": false,
+        "sample_rate": 44100,
+        "channels": 1
+    },
+    "audio_devices": {},
     "camera_resolutions": {
         "480p": [
             640,

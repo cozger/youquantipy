@@ -105,20 +105,9 @@ class ROIProcessor:
             return self.output_queue.get(timeout=timeout)
         except queue.Empty:
             return None
-    
+
     def extract_roi(self, frame: np.ndarray, bbox: List[float], track_id: int, timestamp: float) -> Optional[Dict]:
-        """
-        Synchronous ROI extraction for compatibility.
-        
-        Args:
-            frame: Input frame
-            bbox: Bounding box [x1, y1, x2, y2]
-            track_id: Track identifier
-            timestamp: Frame timestamp
-            
-        Returns:
-            Dictionary with ROI data or None
-        """
+        """Synchronous ROI extraction with frame dimensions"""
         track_data = {
             'bbox': bbox,
             'track_id': track_id
@@ -130,19 +119,21 @@ class ROIProcessor:
         if roi_data is None:
             return None
             
-        # Convert to expected format
+        # Convert to expected format with frame dimensions
         return {
             'roi': roi_data.roi_image,
             'transform': {
                 'scale': roi_data.transform_matrix[0, 0],
                 'offset_x': roi_data.transform_matrix[0, 2],
-                'offset_y': roi_data.transform_matrix[1, 2]
+                'offset_y': roi_data.transform_matrix[1, 2],
+                'frame_width': frame.shape[1],  # Add frame dimensions
+                'frame_height': frame.shape[0]
             },
             'quality_score': roi_data.quality_score,
             'original_bbox': roi_data.original_bbox,
             'padded_bbox': roi_data.padded_bbox
-        }
-    
+        }    
+
     def _processing_loop(self):
         """Main processing loop."""
         while self.is_running:

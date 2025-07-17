@@ -15,18 +15,55 @@ class ConfigHandler:
         },
         "camera_settings": {
             "target_fps": 30,
-            "resolution": "480p"
+            "resolution": "720p"
         },
         "startup_mode": {
             "multi_face": False,
             "participant_count": 2,
             "camera_count": 2,
             "enable_mesh": False,
-            "enable_pose": True,
-            "enable_face_recognition": True
+            "enable_pose": True
         },
         "paths": {
-            "model_path":  "D:/Projects/youquantipy/face_landmarker.task" 
+            "model_path": "D:/Projects/youquantipy/face_landmarker.task",
+            "pose_model_path": "D:/Projects/youquantipy/pose_landmarker_heavy.task"
+        },
+        "advanced_detection": {
+            "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
+            "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
+            "tile_size": 640,
+            "tile_overlap": 0.2,
+            "detection_confidence": 0.3,
+            "nms_threshold": 0.4,
+            "max_detection_workers": 4,
+            "landmark_worker_count": 4,
+            "tracker_settings": {
+                "max_age": 30,
+                "min_hits": 3,
+                "iou_threshold": 0.3,
+                "max_drift": 50.0,
+                "drift_correction_rate": 0.1
+            },
+            "roi_settings": {
+                "target_size": [256, 256],
+                "padding_ratio": 0.3,
+                "min_quality_score": 0.5,
+                "max_roi_workers": 4
+            },
+            "recognition_settings": {
+                "embedding_dim": 512,
+                "max_embeddings_per_person": 50,
+                "similarity_threshold": 0.5,
+                "update_threshold": 0.7
+            },
+            "enrollment_settings": {
+                "min_samples": 10,
+                "min_quality": 0.7,
+                "min_consistency": 0.85,
+                "min_stability": 0.8,
+                "collection_timeout": 30.0,
+                "improvement_window": 20
+            }
         },
         "audio_recording": {
             "enabled": False,
@@ -38,6 +75,12 @@ class ConfigHandler:
         "audio_devices": {
             # Will be populated with device assignments like "cam0": device_index
         },
+        "camera_resolutions": {
+            "480p": [640, 480],
+            "720p": [1280, 720],
+            "1080p": [1920, 1080],
+            "4K": [3840, 2160]
+        }
     }
     
     def __init__(self, config_file="./youquantipy_config.json"):

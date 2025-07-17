@@ -41,7 +41,8 @@ class LightweightTracker:
                  drift_correction_rate: float = 0.1,
                  detection_interval: int = 7,
                  min_hits_in_window: int = 3,
-                 window_cycles: int = 4):
+                 window_cycles: int = 4,
+                 max_tracks: int = None):
         """
         Lightweight tracker with optical flow and drift correction.
         
@@ -54,6 +55,7 @@ class LightweightTracker:
             detection_interval: How often detection runs (every N frames)
             min_hits_in_window: Minimum hits required within sliding window
             window_cycles: Number of detection cycles for sliding window
+            max_tracks: Maximum number of tracks to maintain (None for unlimited)
         """
         self.max_age = max_age
         self.min_hits = min_hits  # Keep for backward compatibility
@@ -63,6 +65,7 @@ class LightweightTracker:
         self.detection_interval = detection_interval
         self.min_hits_in_window = min_hits_in_window
         self.window_size = detection_interval * window_cycles  # Adaptive window size
+        self.max_tracks = max_tracks
         
         self.tracks: List[Track] = []
         self.track_id_counter = 0
@@ -105,12 +108,12 @@ class LightweightTracker:
         """
         self.frame_count += 1
         
-        if self.frame_count % 30 == 0 or len(detections) > 0:
+        if self.frame_count % 240 == 0 or len(detections) > 0:
             print(f"[TRACKER] update() called: frame {self.frame_count}, {len(detections)} detections")
             if len(detections) > 0:
                 print(f"[TRACKER] First detection: {detections[0]}")
         
-        # Enhanced mode passes RGB frames, not BGR
+        # Frame distributor passes RGB frames, not BGR
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         
         # Predict new locations of existing tracks
@@ -124,7 +127,7 @@ class LightweightTracker:
         # Match detections to tracks
         matched, unmatched_dets, unmatched_trks = self._match_detections(detections)
         
-        if self.frame_count % 30 == 0 or len(detections) > 0:
+        if self.frame_count % 240 == 0 or len(detections) > 0:
             print(f"[TRACKER] Frame {self.frame_count}: {len(detections)} detections, {len(self.tracks)} tracks")
             print(f"[TRACKER] Matching: {len(matched)} matched, {len(unmatched_dets)} unmatched dets, {len(unmatched_trks)} unmatched tracks")
         
@@ -134,6 +137,11 @@ class LightweightTracker:
         
         # Create new tracks for unmatched detections
         for i in unmatched_dets:
+            # Check if we're at max tracks limit
+            if self.max_tracks is not None and len(self.tracks) >= self.max_tracks:
+                print(f"[TRACKER] Cannot create new track - at max_tracks limit ({self.max_tracks})")
+                continue
+            
             trk = self._init_track(detections[i])
             self.tracks.append(trk)
             print(f"[TRACKER] Created new track {trk.track_id} at frame {self.frame_count}")
@@ -163,7 +171,7 @@ class LightweightTracker:
                 }
                 results.append(result)
                 
-        if self.frame_count % 30 == 0 and len(results) > 0:
+        if self.frame_count % 240 == 0 and len(results) > 0:
             print(f"[TRACKER] Returning {len(results)} confirmed tracks at frame {self.frame_count}")
         
         self.prev_gray = gray
@@ -205,7 +213,7 @@ class LightweightTracker:
         kf.statePost = kf.statePre.copy()
         
         track = Track(
-            track_id=self.track_id_counter,
+            track_id=self.track_id_counter + 1,
             bbox=bbox,
             kalman=kf,
             confidence=detection['confidence'],

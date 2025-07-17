@@ -23,7 +23,8 @@ from LSLHelper import lsl_helper_process
 from videorecorder import VideoRecorderProcess
 from audiorecorder import AudioRecorder, VideoAudioRecorder, AudioDeviceManager
 from guireliability import setup_reliability_monitoring, GUIReliabilityMonitor
-from advanced_detection_integration import create_participant_manager, create_parallel_worker, parallel_participant_worker_auto
+from participantmanager_unified import GlobalParticipantManager
+from parallelworker_unified import parallel_participant_worker
 from tkinter import filedialog, messagebox
 from confighandler import ConfigHandler 
 from datetime import datetime
@@ -181,19 +182,14 @@ class YouQuantiPyGUI(tk.Tk):
         self.participant_update_queue = MPQueue()
         self.participant_mapping_pipes = {} 
         
-        # Initialize participant manager (will use advanced if configured)
-        self.global_participant_manager = create_participant_manager(
-            max_participants=self.participant_count.get()
+        # Initialize participant manager with face recognition
+        self.global_participant_manager = GlobalParticipantManager(
+            max_participants=self.participant_count.get(),
+            shape_weight=0.5,
+            position_weight=0.2,
+            recognition_weight=0.3
         )
-        # Check which manager we got
-        if hasattr(self.global_participant_manager, 'update_from_advanced_detection'):
-            print("[GUI] Using ADVANCED participant manager with face recognition")
-        else:
-            # Set weights for standard manager
-            if hasattr(self.global_participant_manager, 'shape_weight'):
-                self.global_participant_manager.shape_weight = 0.7
-                self.global_participant_manager.position_weight = 0.3
-            print("[GUI] Using standard participant manager")
+        print("[GUI] Using participant manager with face recognition")
 
         # NOW start participant update processor after queue is created
         self.participant_update_thread = threading.Thread(
@@ -482,7 +478,10 @@ class YouQuantiPyGUI(tk.Tk):
     def _start_monitoring(self):
         """Start reliability monitoring after GUI is ready"""
         self.reliability_monitor.start_monitoring()
-        print("[GUI] Reliability monitoring started")
+        
+        # The recording protection is already checking recovery state on init
+        # but we can add periodic state saves during recording
+        print("[GUI] Reliability monitoring and recording protection active")
 
     def _process_participant_updates(self):
         """Process participant updates from workers in the main thread"""
@@ -535,7 +534,7 @@ class YouQuantiPyGUI(tk.Tk):
                 # Store bbox if available
                 if 'bbox' in update:
                     self.participant_bboxes[(camera_idx, global_id)] = update['bbox']
-                    if update_count % 30 == 0:
+                    if update_count % 240 == 0:
                         print(f"[GUI] Stored bbox for participant {global_id}: {update['bbox']}")
                 
                 # Send response back to worker
@@ -575,6 +574,20 @@ class YouQuantiPyGUI(tk.Tk):
         for idx, info in enumerate(self.frames):
             if info.get('control_conn'):
                 info['control_conn'].send('get_stats')
+        
+        # Get reliability monitor stats
+        if hasattr(self, 'reliability_monitor'):
+            stats = self.reliability_monitor.get_stats()
+            if stats.get('should_report'):
+                print("\n[Reliability Monitor] Performance Report:")
+                print(f"  Uptime: {stats['uptime']}")
+                print(f"  Preview FPS: {stats['preview_fps']:.1f}")
+                print(f"  Total frames: {stats['total_preview_updates']}")
+                print(f"  Dropped frames: {stats['total_dropped_frames']} ({stats['drop_rate']:.1%})")
+                print(f"  Queue overflows: {stats['total_queue_overflows']}")
+                print(f"  Memory warnings: {stats['total_memory_warnings']}")
+                print(f"  GUI freeze warnings: {stats['total_gui_freeze_warnings']}")
+                print(f"  Emergency cleanups: {stats['total_emergency_cleanups']}")
                 
         # Schedule next update
         self.after(5000, self.update_performance_stats) 
@@ -611,9 +624,7 @@ class YouQuantiPyGUI(tk.Tk):
         for info in self.frames:
             if info.get('meta_label'):
                 fps = self.desired_fps.get()
-                resolution = self.res_map.get(res_label)
-                info['meta_label'].config(text=f"Camera → {info['camera_index']} ({resolution[0]}x{resolution[1]}@{fps}fps)")
-
+                info['meta_label'].config(text=f"Camera → {info['camera_index']} (Capture: {capture_res[0]}x{capture_res[1]}@{fps}fps)")
 
     def on_closing(self):
         """Save configuration before closing"""
@@ -915,7 +926,7 @@ class YouQuantiPyGUI(tk.Tk):
                         other_proc.join(timeout=2.0)
                         other_info['proc'] = None
 
-            pv_q = MPQueue(maxsize=2)
+            pv_q = MPQueue(maxsize=1)  # Reduced to 1 for real-time display
             rec_q = MPQueue(maxsize=10)
 
             # Update queues
@@ -954,9 +965,13 @@ class YouQuantiPyGUI(tk.Tk):
             if not self.correlation_monitor_proc or not self.correlation_monitor_proc.is_alive():
                 self._start_correlation_monitor()
 
-            # Start worker process with queues and pipes (auto-selects standard or advanced)
+            # Start worker process with queues and pipes
+            # Get model paths from configuration
+            retinaface_model = self.config.get('advanced_detection.retinaface_model')
+            arcface_model = self.config.get('advanced_detection.arcface_model')
+            
             proc = Process(
-                target=parallel_participant_worker_auto,
+                target=parallel_participant_worker,
                 args=(cam_idx, self.MODEL_PATH, self.POSE_MODEL_PATH,
                     fps, self.enable_mesh.get(), self.enable_pose.get(),
                     pv_q, score_buffer_name, child_conn,
@@ -964,7 +979,10 @@ class YouQuantiPyGUI(tk.Tk):
                     self.participant_update_queue,
                     worker_pipe, self.correlation_queue,
                     max_participants,
-                    resolution),
+                    resolution,
+                    retinaface_model,  # retinaface_model_path
+                    arcface_model,     # arcface_model_path
+                    True),             # enable_recognition=True
                 daemon=False
             )
             proc.start()
@@ -989,6 +1007,15 @@ class YouQuantiPyGUI(tk.Tk):
             # Canvas
             canvas = tk.Canvas(frame, bg='black', highlightthickness=0, borderwidth=0)
             canvas.grid(row=1, column=0, sticky='nsew', padx=2, pady=2)
+            self.drawingmanager.initialize_canvas(canvas, i)
+            # Force initial transform cache
+            canvas.update_idletasks()
+            W, H = canvas.winfo_width(), canvas.winfo_height()
+            if W > 1 and H > 1:
+                if i not in self.drawingmanager.transform_cache:
+                    self.drawingmanager.transform_cache[i] = {}
+                self.drawingmanager.transform_cache[i]['video_bounds'] = (0, 0, W, H)
+
 
             # Meta label
             meta = ttk.Label(frame, text="Camera not selected")
@@ -1176,36 +1203,87 @@ class YouQuantiPyGUI(tk.Tk):
         print("=== END DIAGNOSIS ===\n")
     
     def schedule_preview(self):
-        """Enhanced preview updates using the drawing manager."""
-        # Schedule next update
-        self.after(GUI_scheduler_time, self.schedule_preview)
+        """Preview updates using the drawing manager."""
+        # Schedule next update - balanced for low FPS cameras
+        self.after(33, self.schedule_preview)  # ~30 FPS checking rate
         
         # Update GUI responsiveness timestamp
         if hasattr(self, 'reliability_monitor'):
             self.reliability_monitor.update_gui_timestamp()
+
+        if not hasattr(self, '_preview_debug_counter'):
+            self._preview_debug_counter = 0
+    
+        # Add canvas diagnostic
+        if not hasattr(self, '_canvas_diagnostic_counter'):
+            self._canvas_diagnostic_counter = 0
+        
+        self._canvas_diagnostic_counter += 1
+        if self._canvas_diagnostic_counter % 300 == 0:  # Every 10 seconds at 30fps
+            for idx, info in enumerate(self.frames[:1]):  # Just first camera
+                canvas = info['canvas']
+                print(f"\n[GUI Canvas Diagnostic] Canvas {idx}:")
+                print(f"  Canvas size: {canvas.winfo_width()}x{canvas.winfo_height()}")
+                print(f"  Canvas exists: {canvas.winfo_exists()}")
+                
+                # Check what's actually on the canvas
+                all_items = canvas.find_all()
+                print(f"  Total items on canvas: {len(all_items)}")
+                
+                # Count by tag
+                overlay_items = canvas.find_withtag('overlay')
+                face_items = canvas.find_withtag('face_line')
+                print(f"  Overlay items: {len(overlay_items)}")
+                print(f"  Face line items: {len(face_items)}")
+                
+                # Check item visibility
+                if len(overlay_items) > 0:
+                    for item in overlay_items[:5]:  # First 5 items
+                        coords = canvas.coords(item)
+                        state = canvas.itemcget(item, 'state')
+                        print(f"    Item {item}: coords={coords[:4] if len(coords) >= 4 else coords}, state={state}")
+        
+        
+        # Process multiple cameras in one update cycle
+        cameras_processed = 0
+        max_cameras_per_cycle = 4  # Process up to 4 cameras per cycle
         
         for idx, q in enumerate(self.preview_queues):
             if not q or idx >= len(self.frames):
                 continue
             
+            if cameras_processed >= max_cameras_per_cycle:
+                break
+                
             # Check if we should skip this frame (FPS limiting)
             if self.drawingmanager.should_skip_frame(idx):
                 continue
             
-            # Get latest frame (with batching)
+            # Get latest frame (keep only the most recent)
             latest_msg = None
             drop_count = 0
-            max_drain = 20
             
             try:
-                while drop_count < max_drain:
+                # Get the most recent frame, dropping older ones
+                temp_msg = None
+                while True:
                     try:
-                        if q.empty():
-                            break
-                        latest_msg = q.get_nowait()
-                        drop_count += 1
+                        temp_msg = q.get_nowait()
+                        if latest_msg:
+                            drop_count += 1
+                        latest_msg = temp_msg
                     except queue.Empty:
                         break
+                        
+                # Log excessive drops only
+                if drop_count > 5:
+                    if not hasattr(self, '_drop_warning_count'):
+                        self._drop_warning_count = {}
+                    if idx not in self._drop_warning_count:
+                        self._drop_warning_count[idx] = 0
+                    self._drop_warning_count[idx] += 1
+                    if self._drop_warning_count[idx] % 10 == 0:
+                        print(f"[GUI Preview {idx}] Excessive drops: {drop_count} frames")
             except Exception as e:
                 print(f"[GUI Preview {idx}] Queue error: {e}")
                 continue
@@ -1219,55 +1297,88 @@ class YouQuantiPyGUI(tk.Tk):
             
             try:
                 canvas = self.frames[idx]['canvas']
+
+                self._preview_debug_counter += 1
+                if self._preview_debug_counter % 60 == 0 and idx == 0:  # Only for first camera
+                    faces = latest_msg.get('faces', [])
+                    print(f"\n[GUI DIAGNOSTIC] Frame {self._preview_debug_counter}")
+                    print(f"  Canvas {idx}: {len(faces)} faces in preview data")
+                    for i, face in enumerate(faces[:2]):  # First 2 faces only
+                        print(f"  Face {i}:")
+                        print(f"    ID: {face.get('id', 'NO_ID')}")
+                        print(f"    Global ID: {face.get('global_id', 'NO_GLOBAL_ID')}")
+                        print(f"    Track ID: {face.get('track_id', 'NO_TRACK_ID')}")
+                        print(f"    Has landmarks: {len(face.get('landmarks', [])) > 0}")
+                        print(f"    Landmark count: {len(face.get('landmarks', []))}")
+                        print(f"    Has centroid: {'centroid' in face}")
+                        print(f"    Has bbox: {'bbox' in face}")
+                        if 'bbox' in face:
+                            print(f"    Bbox: {face['bbox']}")
+                    
+                    # Check transform cache
+                    transform_info = self.drawingmanager.transform_cache.get(idx, {})
+                    print(f"  Transform cache for canvas {idx}: {transform_info.keys()}")
+                    if 'video_bounds' in transform_info:
+                        print(f"    Video bounds: {transform_info['video_bounds']}")
                 
-                # Render frame
+                
+                # CRITICAL: Render frame BEFORE drawing overlays
                 frame_bgr = latest_msg.get('frame_bgr')
+                original_res = latest_msg.get('original_resolution')  
                 if frame_bgr is not None:
-                    self.drawingmanager.render_frame_to_canvas(frame_bgr, canvas, idx)
+                    photo = self.drawingmanager.render_frame_to_canvas(
+                        frame_bgr, canvas, idx, 
+                        original_resolution=original_res  # Pass it through
+                    )
+                    # Only draw overlays if frame was successfully rendered
+                    if photo is not None:
+                        # Draw face overlays
+                        faces = latest_msg.get('faces', [])
+                        if faces:
+                            # Get labels
+                            labels = {}
+                            for face in faces:
+                                global_id = face.get('id')
+                                if global_id and not isinstance(global_id, str):
+                                    labels[global_id] = self.global_participant_manager.get_participant_name(global_id)
+                            
+                            # Draw faces with optimization
+                            self.drawingmanager.draw_faces_optimized(
+                                canvas, faces, idx, 
+                                labels=labels,
+                                participant_count=self.participant_count.get(),
+                                participant_names=self.participant_names
+                            )
+                        
+                        # Draw pose overlays
+                        if self.enable_pose.get():
+                            all_poses = latest_msg.get('all_poses', [])
+                            self.drawingmanager.draw_poses_optimized(
+                                canvas, all_poses, idx, 
+                                enabled=True
+                            )
+                        
+                        # DEBUG_RETINAFACE: Draw raw detections if enabled
+                        if self.debug_retinaface:
+                            debug_detections = latest_msg.get('debug_detections')
+                            if debug_detections:
+                                self.drawingmanager.draw_debug_detections(canvas, debug_detections, idx)
                 else:
                     # Debug when frame is missing
-                    if hasattr(self, '_frame_debug_count'):
-                        self._frame_debug_count += 1
-                    else:
-                        self._frame_debug_count = 1
-                    if self._frame_debug_count % 30 == 0:
+                    if not hasattr(self, '_frame_missing_count'):
+                        self._frame_missing_count = {}
+                    if idx not in self._frame_missing_count:
+                        self._frame_missing_count[idx] = 0
+                    self._frame_missing_count[idx] += 1
+                    if self._frame_missing_count[idx] % 30 == 0:
                         print(f"[GUI DEBUG] Camera {idx}: No frame_bgr in preview data. Keys: {list(latest_msg.keys())}")
                 
-                # Draw face overlays
-                faces = latest_msg.get('faces', [])
-                if faces:
-                    # Get labels
-                    labels = {}
-                    for face in faces:
-                        global_id = face.get('id')
-                        if global_id and not isinstance(global_id, str):
-                            labels[global_id] = self.global_participant_manager.get_participant_name(global_id)
-                    
-                    # Draw faces with optimization
-                    self.drawingmanager.draw_faces_optimized(
-                        canvas, faces, idx, 
-                        labels=labels,
-                        participant_count=self.participant_count.get(),
-                        participant_names=self.participant_names
-                    )
-                
-                # Draw pose overlays
-                if self.enable_pose.get():
-                    all_poses = latest_msg.get('all_poses', [])
-                    self.drawingmanager.draw_poses_optimized(
-                        canvas, all_poses, idx, 
-                        enabled=True
-                    )
-                
-                # DEBUG_RETINAFACE: Draw raw detections if enabled
-                if self.debug_retinaface:
-                    debug_detections = latest_msg.get('debug_detections')
-                    if debug_detections:
-                        self.drawingmanager.draw_debug_detections(canvas, debug_detections, idx)
-                
-                # Track successful update
+                # Track successful preview update
                 if hasattr(self, 'reliability_monitor'):
                     self.reliability_monitor.track_preview_update()
+                
+                # Increment cameras processed
+                cameras_processed += 1
                     
             except Exception as e:
                 print(f"[GUI Preview {idx}] Error: {e}")
@@ -1518,6 +1629,10 @@ class YouQuantiPyGUI(tk.Tk):
         if not self.record_video.get() and not self.immediate_recording:
             return
         self.recording_active = True
+        
+        # Save recording state for recovery protection
+        if hasattr(self, 'recording_protection'):
+            self.recording_protection._save_emergency_state()
             
         # Create save directory if it doesn't exist
         save_path = Path(self.save_dir.get())
@@ -2140,6 +2255,9 @@ class YouQuantiPyGUI(tk.Tk):
         
         self.streaming = True
         
+        # Start performance monitoring
+        self.after(1000, self.update_performance_stats)
+        
         # Notify LSL helper that streaming started
         self.lsl_command_queue.put({
             'type': 'streaming_started',
@@ -2210,11 +2328,13 @@ class YouQuantiPyGUI(tk.Tk):
         print(f"[GUI] Started LSL streaming - streams will be created dynamically with mesh={'enabled' if self.enable_mesh.get() else 'disabled'}")
     
     def _shutdown_all_processes(self, timeout=3.0):
-        """UPDATED: Enhanced shutdown with reliability monitoring"""
+        """Shutdown with reliability monitoring"""
         print("\n[GUI] === COMPREHENSIVE SHUTDOWN INITIATED ===")
         
         # Stop reliability monitoring first
         if hasattr(self, 'reliability_monitor'):
+            # Perform emergency cleanup if needed
+            self.reliability_monitor.emergency_cleanup()
             self.reliability_monitor.stop_monitoring()
         
         # 1. Stop streaming flag first

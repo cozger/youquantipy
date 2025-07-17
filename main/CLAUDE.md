@@ -4,159 +4,124 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-YouQuantiPy is a real-time multi-participant face and pose tracking application with GUI, designed for quantitative behavioral analysis. It uses MediaPipe for detection, implements sophisticated tracking algorithms with Procrustes shape analysis, and supports Lab Streaming Layer (LSL) for real-time data streaming.
+YouQuantiPy is a multimodal data capture and analysis system for real-time face detection, tracking, and analysis with Lab Streaming Layer (LSL) integration. It supports multiple cameras, multiple participants, and provides facial landmarks, blend shapes, and pose estimation data.
 
-The application supports two architecture modes:
-1. **Standard Mode**: Basic MediaPipe detection for normal resolution video
-2. **Enhanced Mode**: Advanced detection with face recognition for high-resolution video (1080p, 2K, 4K)
-
-## Commands
+## Key Commands
 
 ### Running the Application
 ```bash
+# Start the main GUI application
 python gui.py
+
+# Test RetinaFace detection standalone
+python test_retinaface_standalone.py --camera 0 --confidence 0.3
+python test_retinaface_standalone.py --video path/to/video.mp4
+python test_retinaface_standalone.py --image path/to/image.jpg
 ```
 
-
-### Installing Dependencies
-```bash
-pip install pillow opencv-python numpy mediapipe pygrabber pylsl scipy onnxruntime
-```
-
-### Code Organization
-```bash
-# Organize deprecated and experimental files
-python cleanup_codebase.py
-```
+### Development Tasks
+Since the project lacks formal build tools, common tasks are performed manually:
+- **Install Dependencies**: No requirements.txt exists. Key dependencies:
+  - `opencv-python` (computer vision)
+  - `numpy` (array operations)
+  - `onnxruntime` (neural network inference)
+  - `mediapipe` (facial landmarks and pose)
+  - `pylsl` (Lab Streaming Layer)
+  - `tkinter` (GUI framework)
+  - `pillow` (image processing)
+  - `pygrabber` (DirectShow camera enumeration)
+- **Run Tests**: Execute test scripts directly (e.g., `python test_retinaface_standalone.py`)
+- **No Linting/Formatting**: No automated tools configured
 
 ## Architecture Overview
 
-### Architecture Selection
-The system automatically selects the appropriate architecture based on:
-1. `enable_face_recognition` setting in `youquantipy_config.json`
-2. Availability of required model files (RetinaFace and ArcFace ONNX models)
-3. Graceful fallback to standard mode if enhanced requirements aren't met
+The system uses RetinaFace for face detection and ArcFace for face recognition, with MediaPipe for facial landmarks and pose estimation. Files with `_unified.py` suffix are the current implementation (the suffix is historical).
 
-### Core Components (Both Modes)
-- **gui.py**: Main entry point - Tkinter-based GUI that orchestrates the entire application
-- **confighandler.py**: Configuration management system
-- **tracker.py**: Unified tracking using Procrustes shape analysis and Hungarian assignment
-- **participantmanager_unified.py**: Global participant state management across cameras
-- **sharedbuffer.py**: Efficient frame sharing between processes using shared memory
-- **canvasdrawing.py**: GUI canvas drawing and overlay rendering
-- **LSLHelper.py**: Lab Streaming Layer integration for real-time data output
-- **correlator.py**: Real-time correlation calculation between participants
-- **guireliability.py**: GUI performance monitoring and recovery
-- **videorecorder.py**: Video recording functionality
-- **audiorecorder.py**: Audio recording functionality
+### Multi-Process Architecture
+1. **Main Process** (`gui.py`): Tkinter GUI managing the entire system
+2. **Worker Processes** (`parallelworker_unified.py`): One per camera for video processing
+3. **LSL Process** (`LSLHelper.py`): Manages all Lab Streaming Layer outputs
+4. **Recording Processes**: Separate processes for video/audio recording
+5. **Correlation Process**: Real-time correlation analysis between participants
 
-### Standard Mode Components
-- **parallelworker_unified.py**: Unified parallel processing (standard mode path)
-- Uses direct MediaPipe detection on full frames
-- Simple face/pose tracking without identity recognition
+### Communication Patterns
+- **Multiprocessing Queues**: Frame data, scores, participant updates
+- **Pipes**: Bidirectional control communication
+- **Shared Memory** (`sharedbuffer.py`): Real-time data like blend scores
+- **Global Participant Manager**: Maintains consistent IDs across cameras
 
-### Enhanced Mode Components
-Enhanced mode uses a sophisticated multi-tier architecture:
+### Core Module Responsibilities
 
-#### Detection & Tracking Layer
-- **retinaface_detector.py**: Async tiled detection for high-resolution video
-- **lightweight_tracker.py**: Optical flow tracking with drift correction
-- **frame_router.py**: Intelligent frame routing and buffering
-- **roi_manager.py**: ROI extraction and coordinate transformation
+#### Detection Pipeline
+- `retinaface_detector.py`: Face detection using ONNX models (see FACEDETECTOR.md for detailed specs)
+- `face_recognition_process.py`: ArcFace embeddings for face recognition
+- `roi_processor.py`: Region of Interest processing for detection
+- `lightweight_tracker.py`: Fast face tracking across frames
+- `enrollment_manager.py`: Face enrollment for recognition
 
-#### Processing Layer
-- **landmark_worker_pool_unified.py**: Adaptive multiprocessing pool for landmarks
-- **face_recognition_process.py**: Separate process for ArcFace embeddings
-- **enrollment_manager.py**: Progressive enrollment state machine
-- **result_aggregator.py**: Aggregates results from multiple processing pipelines
+#### Worker System
+- `parallelworker_unified.py`: Main worker handling camera capture and processing
+- `landmark_worker_pool_unified.py`: Pool of workers for landmark processing
+- `participantmanager_unified.py`: Global participant ID management
 
-#### Integration Layer
-- **camera_worker_enhanced.py**: Main enhanced processing pipeline
-- **parallelworker_unified.py**: Unified worker (enhanced mode path)
-- **advanced_detection_integration.py**: Automatic mode selection and factory
+#### Data Output
+- `LSLHelper.py`: All LSL stream management (scores, landmarks, tracking)
+- `videorecorder.py`: Video recording with codec support
+- `audiorecorder.py`: Audio recording with device selection
+- `correlator.py`: Real-time correlation calculations
 
-### Data Flow
+#### GUI Components
+- `gui.py`: Main application window and control logic
+- `canvasdrawing.py`: Optimized overlay rendering
+- `guireliability.py`: System monitoring (memory, queues, performance)
 
-#### Standard Mode Flow
-```
-Camera → Frame Distribution → Face/Pose Workers → Fusion Process → GUI/LSL
-```
+### Configuration System
+- Main config: `youquantipy_config.json`
+- Key sections: video_recording, camera_settings, startup_mode, advanced_detection, audio_recording
+- Model paths (typically in parent directory):
+  - `face_landmarker.task` (MediaPipe facial landmarks)
+  - `pose_landmarker_heavy.task` (MediaPipe pose estimation)
+  - `retinaface.onnx` (RetinaFace face detection)
+  - `arcface.onnx` (ArcFace face recognition)
+- Configuration handled by `confighandler.py`
 
-#### Enhanced Mode Flow
-```
-Camera → Frame Router → RetinaFace Detector ↘
-                      ↓                       → Result Aggregator → GUI/LSL
-                   Tracker → ROI Manager → Landmark Pool ↗
-```
+### Common Development Patterns
 
-### Key Design Patterns
+#### Adding New Features
+1. **New Detection Method**: Create detector class similar to `retinaface_detector.py`
+2. **New LSL Stream**: Add to `LSLHelper.py` with proper stream info
+3. **New UI Control**: Add to `gui.py` control panel layout
+4. **New Configuration**: Add to JSON config and `confighandler.py`
 
-1. **Multiprocessing Architecture**: Parallel processing with proper daemon handling
-2. **Adaptive Worker Pools**: Fixed pool size with dynamic task distribution
-3. **Queue Management**: Non-blocking operations with overflow protection
-4. **Shared Memory Buffers**: Efficient frame sharing between processes
-5. **Configuration-Driven**: All settings in `youquantipy_config.json`
-6. **Automatic Mode Selection**: Seamless switching between architectures
-7. **Graceful Degradation**: Falls back to standard mode if enhanced requirements not met
+#### Debugging
+- Many modules have `DEBUG_` flags for verbose output
+- Use `diagnose_pipeline()` in GUI for system status
+- Monitor reliability panel for performance metrics
+- Check console output for module-specific debug info
 
-### Configuration
+#### Performance Tuning
+- Adjust `max_detection_workers` and `landmark_worker_count` in config
+- Tune `tile_size` for detection performance vs accuracy
+- Configure `detection_confidence` and `tracking_confidence` thresholds
+- Enable/disable features: mesh data, pose estimation, recognition
 
-Main configuration file: `youquantipy_config.json`
+### Critical Implementation Notes
 
-Key settings:
-- `startup_mode.enable_face_recognition`: Enables enhanced mode
-- `advanced_detection.retinaface_model`: Path to RetinaFace model
-- `advanced_detection.arcface_model`: Path to ArcFace model
-- `advanced_detection.landmark_worker_count`: Number of landmark workers (default: 4)
-- `cameras`: Camera configuration and participant limits
-- `camera_settings`: Resolution and FPS targets
-- `video_recording` / `audio_recording`: Recording configurations
+1. **Process Cleanup**: Always ensure proper cleanup of processes and shared memory
+2. **Queue Management**: Use throttling to prevent queue overflow
+3. **Camera Handling**: Robust error handling for camera disconnections
+4. **Model Loading**: Verify model paths before starting workers
+5. **Module Testing**: Ensure all detection and tracking features work correctly
+6. **Memory Leaks**: Monitor with reliability system, implement proper cleanup
 
-Runtime state file: `recording_state.json`
-- Tracks current recording status and active cameras
+### Testing Approach
+- No formal test framework; tests are standalone scripts
+- Test with different camera counts and participant counts
+- Verify LSL output with external LSL tools
+- Check recording outputs for synchronization
 
-### Model Requirements
-
-Standard Mode:
-- Face: `D:\Projects\youquantipy\face_landmarker.task`
-- Pose: `D:\Projects\youquantipy\pose_landmarker_heavy.task`
-
-Enhanced Mode (additional):
-- RetinaFace: `D:\Projects\youquantipy\retinaface.onnx`
-- ArcFace: `D:\Projects\youquantipy\arcface.onnx`
-
-### Performance Considerations
-
-1. **Camera FPS**: System handles low FPS cameras with warnings
-2. **Queue Management**: Automatic overflow handling for smooth operation
-3. **Track Limiting**: Prevents track explosion (max 2x participant count)
-4. **Frame Skipping**: Preview updates every other frame for performance
-5. **Worker Pool Size**: 4 landmark workers by default (configurable)
-6. **Detection Intervals**: Configurable intervals for face detection in enhanced mode
-
-### Debugging Tips
-
-1. Enable debug logging by checking frame_count modulo prints
-2. Monitor worker stats in console output
-3. Check participant ID assignment (-1 means not enrolled yet)
-4. Verify model files exist at specified paths
-5. Use `analyze_enhanced_architecture.py` for architecture analysis
-6. Check `recording_state.json` for runtime state
-
-### Module Status
-
-**Active Modules**: All files listed in Core, Standard, and Enhanced components
-
-**Deprecated** (`deprecated/` directory): 
-- Previous implementations of parallel workers and participant managers
-- `tileddetector.py` (replaced by retinaface_detector.py)
-
-**Experimental** (`experimental_enhanced/` directory):
-- Alternative enhanced architecture implementations
-- Use `use_enhanced_architecture.py` to enable
-
-**Test Files**:
-- `test_standard_mode.py`: Standard mode testing
-- `test_enhanced_current.py`: Enhanced mode testing
-- `tests/test_enhanced.py`: Additional enhanced tests
-- `tests/test_retinaface_model.py`: Model-specific tests
+### Known Issues
+- No dependency management (requirements.txt)
+- No automated testing or CI/CD
+- Limited error recovery in some edge cases
+- Performance varies with participant count and enabled features

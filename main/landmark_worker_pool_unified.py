@@ -1,6 +1,6 @@
 """
-Unified Landmark Worker Pool supporting both standard and adaptive modes.
-Pool of processes for parallel landmark detection on ROIs.
+Landmark Worker Pool for parallel landmark detection on ROIs.
+Pool of processes for parallel landmark detection using enhanced mode.
 """
 
 import multiprocessing as mp
@@ -45,8 +45,7 @@ def landmark_worker_process(worker_id: int,
                           result_queue: Queue,
                           control_pipe,
                           face_model_path: str,
-                          enable_mesh: bool = False,
-                          adaptive_mode: bool = False):
+                          enable_mesh: bool = False):
     """
     Individual landmark worker process.
     Runs MediaPipe on single face ROIs.
@@ -58,65 +57,36 @@ def landmark_worker_process(worker_id: int,
         control_pipe: Pipe for control messages
         face_model_path: Path to face landmarker model
         enable_mesh: Whether to output mesh data
-        adaptive_mode: Whether to use adaptive/enhanced features
     """
-    mode = "ADAPTIVE" if adaptive_mode else "STANDARD"
-    print(f"[Landmark Worker {worker_id}] Starting in {mode} mode")
+    print(f"[Landmark Worker {worker_id}] Starting")
     
-    # Initialize MediaPipe based on mode
+    # Initialize MediaPipe
     face_landmarker = None
     try:
-        if adaptive_mode:
-            # Enhanced mode initialization
-            base_options = python.BaseOptions(model_asset_path=face_model_path)
-            options = vision.FaceLandmarkerOptions(
-                base_options=base_options,
-                running_mode=vision.RunningMode.IMAGE,
-                num_faces=1,
-                min_face_detection_confidence=0.5,
-                min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-                output_face_blendshapes=True,
-                output_facial_transformation_matrixes=False
-            )
-            face_landmarker = vision.FaceLandmarker.create_from_options(options)
-        else:
-            # Standard mode initialization
-            BaseOptions = mp_module.tasks.BaseOptions
-            FaceLandmarker = mp_module.tasks.vision.FaceLandmarker
-            FaceLandmarkerOptions = mp_module.tasks.vision.FaceLandmarkerOptions
-            VisionRunningMode = mp_module.tasks.vision.RunningMode
-            
-            options = FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=face_model_path),
-                running_mode=VisionRunningMode.VIDEO,
-                output_face_blendshapes=True,
-                output_facial_transformation_matrixes=True,
-                num_faces=1  # Single face per ROI
-            )
-            
-            face_landmarker = FaceLandmarker.create_from_options(options)
+        base_options = python.BaseOptions(model_asset_path=face_model_path)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=True,
+            output_facial_transformation_matrixes=False
+        )
+        face_landmarker = vision.FaceLandmarker.create_from_options(options)
     except Exception as e:
         print(f"[Landmark Worker {worker_id}] Failed to initialize: {e}")
         return
     
-    # Timestamp generator for MediaPipe (standard mode)
-    class TimestampGenerator:
-        def __init__(self):
-            self.timestamp = 0
-        def next(self):
-            self.timestamp += 1
-            return self.timestamp
-    
-    ts_gen = TimestampGenerator()
     task_count = 0
     idle_count = 0
-    max_idle_iterations = 100 if adaptive_mode else 1000  # Different idle thresholds
+    max_idle_iterations = 100
     
     try:
         while True:
             # Check for control commands
-            if control_pipe.poll(0 if adaptive_mode else None):
+            if control_pipe.poll(0):
                 cmd = control_pipe.recv()
                 if cmd == 'stop':
                     break
@@ -131,8 +101,8 @@ def landmark_worker_process(worker_id: int,
                 idle_count = 0  # Reset idle counter
             except:
                 idle_count += 1
-                if adaptive_mode and idle_count > max_idle_iterations:
-                    # Adaptive mode can consider shutting down after being idle
+                if idle_count > max_idle_iterations:
+                    # Consider shutting down after being idle
                     print(f"[Landmark Worker {worker_id}] Idle for too long, considering shutdown")
                 continue
             
@@ -149,50 +119,25 @@ def landmark_worker_process(worker_id: int,
                 )
                 
                 # Detect landmarks
-                if adaptive_mode:
-                    # Enhanced mode - direct detection
-                    detection_result = face_landmarker.detect(mp_image)
-                else:
-                    # Standard mode - video detection with timestamp
-                    detection_result = face_landmarker.detect_for_video(
-                        mp_image, ts_gen.next()
-                    )
+                detection_result = face_landmarker.detect(mp_image)
                 
                 if detection_result.face_landmarks:
                     # Extract landmarks (first face only)
                     face_landmarks = detection_result.face_landmarks[0]
                     
                     # Convert to numpy array
-                    if adaptive_mode:
-                        landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks])
-                    else:
-                        landmarks = np.array([
-                            [lm.x, lm.y, lm.z] for lm in face_landmarks
-                        ], dtype=np.float32)
+                    landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks])
                     
                     # Extract blendshapes
                     blendshapes = None
                     if detection_result.face_blendshapes:
                         blend_list = detection_result.face_blendshapes[0]
-                        if adaptive_mode:
-                            # Enhanced mode - numpy array
-                            blendshapes = np.array([b.score for b in blend_list[:52]], dtype=np.float32)
-                        else:
-                            # Standard mode - list
-                            blendshapes = [b.score for b in blend_list[:52]]
-                            # Pad to 52 if needed
-                            blendshapes += [0.0] * (52 - len(blendshapes))
+                        blendshapes = np.array([b.score for b in blend_list[:52]], dtype=np.float32)
                     
                     # Mesh data if enabled
                     mesh_data = None
                     if enable_mesh:
-                        if adaptive_mode:
-                            mesh_data = landmarks.flatten()  # Flatten for transmission
-                        else:
-                            # Standard mode - flatten x,y,z coordinates
-                            mesh_data = []
-                            for lm in face_landmarks:
-                                mesh_data.extend([lm.x, lm.y, lm.z])
+                        mesh_data = landmarks.flatten()  # Flatten for transmission
                     
                     # Create result
                     result = LandmarkResult(
@@ -250,10 +195,10 @@ def landmark_worker_process(worker_id: int,
 
 class LandmarkWorkerPool:
     """
-    Unified pool of landmark detection workers supporting both standard and adaptive modes.
+    Pool of landmark detection workers using enhanced mode.
     """
     def __init__(self, num_workers: int = 4, face_model_path: str = None,
-                 enable_mesh: bool = False, adaptive_mode: bool = False,
+                 enable_mesh: bool = False,
                  max_queue_size: int = 100):
         """
         Initialize landmark worker pool.
@@ -262,13 +207,11 @@ class LandmarkWorkerPool:
             num_workers: Number of worker processes
             face_model_path: Path to face landmarker model
             enable_mesh: Whether to output mesh data
-            adaptive_mode: Whether to use adaptive/enhanced features
             max_queue_size: Maximum size of task/result queues
         """
         self.num_workers = num_workers
         self.face_model_path = face_model_path
         self.enable_mesh = enable_mesh
-        self.adaptive_mode = adaptive_mode
         self.max_queue_size = max_queue_size
         
         # Queues and processes
@@ -290,7 +233,7 @@ class LandmarkWorkerPool:
             'avg_processing_time': 0.0
         }
         
-        # Result collection thread (adaptive mode)
+        # Result collection thread
         self.result_thread = None
         self.result_callbacks = {}
         
@@ -299,8 +242,7 @@ class LandmarkWorkerPool:
         if self.running:
             return
             
-        print(f"[LandmarkWorkerPool] Starting {self.num_workers} workers in "
-              f"{'ADAPTIVE' if self.adaptive_mode else 'STANDARD'} mode")
+        print(f"[LandmarkWorkerPool] Starting {self.num_workers} workers")
         
         self.running = True
         
@@ -310,20 +252,19 @@ class LandmarkWorkerPool:
             worker = mp.Process(
                 target=landmark_worker_process,
                 args=(i, self.task_queue, self.result_queue, child_pipe,
-                      self.face_model_path, self.enable_mesh, self.adaptive_mode),
-                daemon=not self.adaptive_mode  # Adaptive mode uses non-daemon
+                      self.face_model_path, self.enable_mesh),
+                daemon=False
             )
             worker.start()
             self.workers.append(worker)
             self.control_pipes.append(parent_pipe)
         
-        # Start result collection thread for adaptive mode
-        if self.adaptive_mode:
-            self.result_thread = threading.Thread(
-                target=self._result_collector_thread,
-                daemon=True
-            )
-            self.result_thread.start()
+        # Start result collection thread
+        self.result_thread = threading.Thread(
+            target=self._result_collector_thread,
+            daemon=True
+        )
+        self.result_thread.start()
         
         print(f"[LandmarkWorkerPool] Started successfully")
     
@@ -401,8 +342,8 @@ class LandmarkWorkerPool:
             self.task_queue.put_nowait(task)
             self.stats['tasks_submitted'] += 1
             
-            # Register callback for adaptive mode
-            if self.adaptive_mode and callback:
+            # Register callback if provided
+            if callback:
                 self.result_callbacks[task_id] = callback
             
             return True
@@ -411,7 +352,8 @@ class LandmarkWorkerPool:
     
     def get_result(self, timeout: float = 0.001) -> Optional[LandmarkResult]:
         """
-        Get a result from the pool (standard mode).
+        Get a result from the pool.
+        Note: This is primarily for backward compatibility as callbacks are preferred.
         
         Args:
             timeout: Timeout in seconds
@@ -419,10 +361,6 @@ class LandmarkWorkerPool:
         Returns:
             LandmarkResult or None if no result available
         """
-        if self.adaptive_mode:
-            # Adaptive mode uses callbacks
-            return None
-            
         try:
             result = self.result_queue.get(timeout=timeout)
             self._update_stats(result)
@@ -431,10 +369,7 @@ class LandmarkWorkerPool:
             return None
     
     def get_all_results(self, max_results: int = 100) -> List[LandmarkResult]:
-        """Get all available results (standard mode)."""
-        if self.adaptive_mode:
-            return []
-            
+        """Get all available results."""
         results = []
         for _ in range(max_results):
             result = self.get_result(timeout=0.001)
@@ -457,7 +392,7 @@ class LandmarkWorkerPool:
         return self.stats.copy()
     
     def _result_collector_thread(self):
-        """Collect results and invoke callbacks (adaptive mode)."""
+        """Collect results and invoke callbacks."""
         while self.running:
             try:
                 result = self.result_queue.get(timeout=0.1)
@@ -500,6 +435,6 @@ class LandmarkWorkerPool:
             pass
 
 
-# Backward compatibility aliases
+# Backward compatibility alias
 LandmarkWorkerPoolStandard = LandmarkWorkerPool
-LandmarkWorkerPoolAdaptive = lambda *args, **kwargs: LandmarkWorkerPool(*args, adaptive_mode=True, **kwargs)
+LandmarkWorkerPoolAdaptive = LandmarkWorkerPool

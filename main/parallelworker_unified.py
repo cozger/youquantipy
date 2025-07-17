@@ -1,4 +1,4 @@
-# Unified parallel worker supporting both standard and enhanced modes
+# Parallel worker for face detection and processing
 
 import cv2
 import time
@@ -8,68 +8,70 @@ import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from collections import deque
-from multiprocessing import Process, Queue as MPQueue, Pipe
+from multiprocessing import Process, Queue as MPQueue, Pipe, SimpleQueue
 import queue
 from sharedbuffer import NumpySharedBuffer
 from tracker import UnifiedTracker
+# Removed queue_manager imports - using native queue methods instead
 import warnings
 import os
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Import enhanced mode components conditionally
-try:
-    from retinaface_detector import RetinaFaceDetector
-    from lightweight_tracker import LightweightTracker
-    from roi_processor import ROIProcessor
-    from face_recognition_process import FaceRecognitionProcess
-    from enrollment_manager import EnrollmentManager
-    ENHANCED_COMPONENTS_AVAILABLE = True
-except ImportError:
-    ENHANCED_COMPONENTS_AVAILABLE = False
-    print("[ParallelWorker] Enhanced components not available, will use standard mode only")
+# Enable enhanced queue debugging
+DEBUG_QUEUES = True
+QUEUE_STATS_INTERVAL = 5.0  # Print queue stats every 5 seconds
+
+# Import detection components
+from retinaface_detector import RetinaFaceDetector
+from lightweight_tracker import LightweightTracker
+from roi_processor import ROIProcessor
+from face_recognition_process import FaceRecognitionProcess
+from enrollment_manager import EnrollmentManager
 
 # Import participant manager for direct access
-try:
-    from participantmanager_unified import GlobalParticipantManager
-    PARTICIPANT_MANAGER_AVAILABLE = True
-except ImportError:
-    GlobalParticipantManager = None
-    PARTICIPANT_MANAGER_AVAILABLE = False
-    print("[ParallelWorker] GlobalParticipantManager not available")
+from participantmanager_unified import GlobalParticipantManager
+from confighandler import ConfigHandler
 
-
-class SyncParticipantManager:
-    """Synchronous wrapper for participant management in fusion process"""
-    def __init__(self, max_participants=10):
-        self.participant_manager = GlobalParticipantManager(max_participants=max_participants) if PARTICIPANT_MANAGER_AVAILABLE else None
-        self.camera_participant_cache = {}  # (cam_idx, local_id) -> global_id
-        self.last_update = {}  # (cam_idx, local_id) -> timestamp
-        self.cache_timeout = 0.5  # seconds
-        
-    def get_participant_id(self, cam_idx, local_id, centroid, shape=None, embedding=None, timestamp=None):
-        """Get global participant ID synchronously"""
-        if not self.participant_manager:
-            # Fallback to simple ID assignment
-            return local_id + 1
-        
-        current_time = timestamp or time.time()
-        cache_key = (cam_idx, local_id)
-        
-        # Check cache (but not if we have a new embedding)
-        if embedding is None and cache_key in self.camera_participant_cache:
-            last_time = self.last_update.get(cache_key, 0)
-            if current_time - last_time < self.cache_timeout:
-                return self.camera_participant_cache[cache_key]
-        
-        # Get ID from participant manager
-        global_id = self.participant_manager.update_participant(cam_idx, local_id, centroid, shape, embedding)
-        
-        # Update cache
-        if global_id is not None:
-            self.camera_participant_cache[cache_key] = global_id
-            self.last_update[cache_key] = current_time
-        
-        return global_id if global_id is not None else local_id + 1
+class LatestOnlyQueue:
+    """Queue that only keeps the latest item"""
+    def __init__(self):
+        self._queue = MPQueue(maxsize=1)
+        self._lock = threading.Lock()
+    
+    def put(self, item, block=True, timeout=None):
+        """Put item, dropping previous if full"""
+        with self._lock:
+            # Try to remove old item first
+            try:
+                self._queue.get_nowait()
+            except:
+                pass
+            # Put new item
+            self._queue.put(item, block=False)
+    
+    def put_nowait(self, item):
+        """Put without blocking"""
+        self.put(item, block=False)
+    
+    def get(self, block=True, timeout=None):
+        """Get item"""
+        return self._queue.get(block=block, timeout=timeout)
+    
+    def get_nowait(self):
+        """Get without blocking"""
+        return self._queue.get(block=False, timeout=0)
+    
+    def qsize(self):
+        """Get queue size"""
+        return self._queue.qsize()
+    
+    def empty(self):
+        """Check if empty"""
+        return self._queue.empty()
+    
+    def full(self):
+        """Check if full"""
+        return self._queue.full()
 
 
 def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, target_brightness_range=(30, 200), max_attempts=1):
@@ -209,25 +211,17 @@ def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, tar
 
     return cap
 
-
 class FrameDistributor:
-    """Distributes frames to multiple processing pipelines with dual-stream output"""
+    """Distributes frames to multiple processing pipelines - LATEST ONLY"""
     def __init__(self, camera_index, resolution, fps):
         self.camera_index = camera_index
         self.resolution = resolution
         self.fps = fps
         self.subscribers = []
         self.running = False
-        self.target_interval = 1.0 / 30.0  # 30Hz distribution
         
     def add_subscriber(self, info):
-        """Add a subscriber with its configuration
-        info = {
-            'queue': queue object,
-            'full_res': bool,  # True for full resolution, False for downsampled
-            'name': str  # For debugging
-        }
-        """
+        """Add a subscriber with its configuration"""
         self.subscribers.append(info)
         
     def start(self):
@@ -242,103 +236,106 @@ class FrameDistributor:
         if hasattr(self, 'thread'):
             self.thread.join(timeout=2.0)
             
+# In parallelworker_unified.py, update the FrameDistributor._capture_loop method:
+
     def _capture_loop(self):
-        """Capture and distribute frames to all subscribers"""
+        """Capture and distribute frames - LATEST ONLY"""
         cap = robust_initialize_camera(self.camera_index, self.fps, self.resolution)
         
-        # Downsampled resolution for pose and preview
-        downscale_width = 640
-        downscale_height = 480
-        
         frame_count = 0
-        last_frame_bgr = None
         
         while self.running:
             ret, frame_bgr = cap.read()
             if ret:
-                # Only process new frames (avoid processing duplicates)
-                if last_frame_bgr is None or not np.array_equal(frame_bgr, last_frame_bgr):
-                    # Convert once
-                    rgb_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    
-                    # Create downsampled version
-                    h, w = frame_bgr.shape[:2]
-                    if w > downscale_width or h > downscale_height:
-                        scale = min(downscale_width / w, downscale_height / h)
-                        new_w = int(w * scale)
-                        new_h = int(h * scale)
-                        bgr_downsampled = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                        rgb_downsampled = cv2.cvtColor(bgr_downsampled, cv2.COLOR_BGR2RGB)
-                    else:
-                        bgr_downsampled = frame_bgr
-                        rgb_downsampled = rgb_full
-                    
-                    last_frame_bgr = frame_bgr.copy()
-                    
-                    current_time = time.time()
-                    
-                    # Prepare frame data
-                    frame_data_full = {
-                        'bgr': frame_bgr,
-                        'rgb': rgb_full,
-                        'timestamp': current_time,
-                        'frame_id': frame_count
-                    }
-                    
-                    frame_data_downsampled = {
-                        'bgr': bgr_downsampled,
-                        'rgb': rgb_downsampled,
-                        'timestamp': current_time,
-                        'frame_id': frame_count
-                    }
-                    
-                    # Send to all subscribers based on their needs
-                    for sub in self.subscribers:
-                        if not sub['queue'].full():
-                            try:
-                                if sub['full_res']:
-                                    sub['queue'].put_nowait(frame_data_full)
-                                    if frame_count % 240 == 0 and sub['name'] == 'face':
-                                        print(f"[Frame Distributor] Sent full res to {sub['name']}, BGR shape: {frame_data_full['bgr'].shape}")
-                                else:
-                                    sub['queue'].put_nowait(frame_data_downsampled)
-                                    if frame_count % 240 == 0 and sub['name'] == 'face':
-                                        print(f"[Frame Distributor] Sent downsampled to {sub['name']}, BGR shape: {frame_data_downsampled['bgr'].shape}")
-                            except:
-                                pass
-                    
-                    frame_count += 1
-                    
-                    if frame_count % 240 == 0:
-                        print(f"[Frame Distributor] Distributed frame {frame_count} to {len(self.subscribers)} subscribers")
-            else:
-                time.sleep(0.001)
+                # Convert once
+                rgb_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 
+                # ALWAYS create 480p version for GUI preview
+                h, w = frame_bgr.shape[:2]
+                gui_max_width = 640
+                gui_max_height = 480
+                scale = min(gui_max_width / w, gui_max_height / h, 1.0)
+                
+                if scale < 1.0:
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    bgr_gui = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    rgb_gui = cv2.cvtColor(bgr_gui, cv2.COLOR_BGR2RGB)
+                else:
+                    bgr_gui = frame_bgr
+                    rgb_gui = rgb_full
+                
+                current_time = time.time()
+                
+                # Prepare frame data
+                frame_data_full = {
+                    'bgr': frame_bgr,
+                    'rgb': rgb_full,
+                    'timestamp': current_time,
+                    'frame_id': frame_count,
+                    'original_resolution': (w, h) 
+                }
+                
+                frame_data_gui = {
+                    'bgr': bgr_gui,  # Always 480p max
+                    'rgb': rgb_gui,  # Always 480p max
+                    'timestamp': current_time,
+                    'frame_id': frame_count,
+                    'original_resolution': (w, h) 
+                }
+                
+                # Send to subscribers
+                for sub in self.subscribers:
+                    # Fusion/preview always gets GUI resolution
+                    if sub['name'] == 'fusion':
+                        data = frame_data_gui
+                    else:
+                        # Face detection gets full resolution
+                        data = frame_data_full if sub['full_res'] else frame_data_gui
+                    
+                    # Always try to send latest frame
+                    try:
+                        # First try to clear old frame
+                        try:
+                            sub['queue'].get_nowait()
+                        except:
+                            pass
+                        
+                        # Then put new frame
+                        sub['queue'].put_nowait(data)
+                        
+                    except Exception as e:
+                        # Queue is busy, skip this frame
+                        pass
+                
+                frame_count += 1
+                
+                if frame_count % 240 == 0:
+                    print(f"[Frame Distributor] Distributed frame {frame_count}")
+        
         cap.release()
 
-
-def face_detection_process(detection_queue: MPQueue,
-                          detection_result_queue: MPQueue,
-                          retinaface_model_path: str,
-                          control_pipe,
-                          debug_queue=None):  # DEBUG_RETINAFACE: Add debug queue parameter
-    """Dedicated process for face detection using RetinaFace"""
-    print("[FACE DETECTOR] Starting RetinaFace detection process")
+def face_detection_process(detection_queue, detection_result_queue, 
+                          retinaface_model_path: str, control_pipe, debug_queue=None):
+    """Face detection - LATEST FRAME ONLY"""
+    print("[FACE DETECTOR] Starting with LATEST FRAME ONLY approach")
+    
+    # Get configuration
+    config = ConfigHandler()
+    confidence_threshold = config.get('advanced_detection.detection_confidence', 0.3)
+    nms_threshold = config.get('advanced_detection.nms_threshold', 0.4)
     
     # Initialize detector
     detector = RetinaFaceDetector(
         model_path=retinaface_model_path,
-        tile_size=640,  # Will be adjusted to 640x608 internally to match model
-        overlap=0.1,  # Reduced overlap to minimize duplicate detections
-        confidence_threshold=0.5,  # Lowered threshold to detect more faces
-        nms_threshold=0.4,  # Standard NMS threshold
-        max_workers=4,
-        debug_queue=debug_queue  # DEBUG_RETINAFACE: Pass debug queue
+        confidence_threshold=confidence_threshold,
+        nms_threshold=nms_threshold,
+        debug_queue=debug_queue
     )
     detector.start()
     
     frame_count = 0
-    detection_interval = 7  # Detect every N frames
+    detection_interval = 7
     
     while True:
         # Check for control messages
@@ -347,11 +344,27 @@ def face_detection_process(detection_queue: MPQueue,
             if msg == 'stop':
                 break
         
-        # Get frame for detection
-        try:
-            frame_data = detection_queue.get(timeout=0.1)
-        except:
-            continue
+        # Always get LATEST frame only
+        frame_data = None
+        dropped = 0
+        
+        # Drain queue to get latest
+        while True:
+            try:
+                frame_data = detection_queue.get_nowait()
+                dropped += 1
+            except:
+                break
+        
+        if frame_data is None:
+            # No frame available, wait for one
+            try:
+                frame_data = detection_queue.get(timeout=0.1)
+            except:
+                continue
+        
+        if dropped > 1:
+            print(f"[FACE DETECTOR] Dropped {dropped-1} old frames")
         
         rgb = frame_data['rgb']
         frame_id = frame_data['frame_id']
@@ -359,40 +372,38 @@ def face_detection_process(detection_queue: MPQueue,
         
         # Submit for detection at intervals
         if frame_id % detection_interval == 0:
-            if detector.submit_frame(rgb, frame_id):
-                if frame_id % 240 == 0:
-                    print(f"[FACE DETECTOR] Submitted frame {frame_id} for detection")
+            detector.submit_frame(rgb, frame_id)
         
-        # Check for detection results
+        # Check for results
         detection_result = detector.get_detections(timeout=0.001)
         if detection_result:
             det_frame_id, detections = detection_result
-            if len(detections) > 0:
-                print(f"[FACE DETECTOR] Frame {det_frame_id}: Found {len(detections)} faces")
-                
-                # Send detection results
+            
+            # Send result - drop old if queue full
+            try:
+                # Clear old result
                 try:
-                    detection_result_queue.put_nowait({
-                        'frame_id': det_frame_id,
-                        'detections': detections,
-                        'timestamp': timestamp
-                    })
+                    detection_result_queue.get_nowait()
                 except:
                     pass
+                    
+                # Put new result
+                detection_result_queue.put_nowait({
+                    'frame_id': det_frame_id,
+                    'detections': detections,
+                    'timestamp': timestamp
+                })
+            except:
+                pass
         
         frame_count += 1
     
-    # Cleanup
-    print("[FACE DETECTOR] Stopping...")
     detector.stop()
 
 
-def face_landmark_process(roi_queue: MPQueue,
-                         landmark_result_queue: MPQueue,
-                         model_path: str,
-                         enable_mesh: bool,
-                         control_pipe):
-    """Dedicated process for face landmark extraction from ROIs"""
+def face_landmark_process(roi_queue, landmark_result_queue, model_path: str,
+                         enable_mesh: bool, control_pipe):
+    """Face landmark extraction - fixed queue handling"""
     print("[FACE LANDMARK] Starting landmark extraction process")
     
     # Initialize MediaPipe
@@ -404,17 +415,16 @@ def face_landmark_process(roi_queue: MPQueue,
         base_options=base_opts,
         output_face_blendshapes=True,
         running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,  # One face per ROI
+        num_faces=1,
         min_face_detection_confidence=0.5,
         min_face_presence_confidence=0.5,
         min_tracking_confidence=0.5
     )
     face_landmarker = vision.FaceLandmarker.create_from_options(face_options)
     
-    # Use real-time based timestamp generation for ROIs
     start_time = time.time()
-    
     processed_count = 0
+    failed_count = 0
     last_debug_time = time.time()
     
     while True:
@@ -431,6 +441,11 @@ def face_landmark_process(roi_queue: MPQueue,
         try:
             roi_data = roi_queue.get(timeout=0.1)
         except:
+            # Debug output
+            current_time = time.time()
+            if current_time - last_debug_time > 5.0:
+                print(f"[FACE LANDMARK] Processed {processed_count} ROIs, {failed_count} failed")
+                last_debug_time = current_time
             continue
         
         roi = roi_data['roi']
@@ -438,497 +453,366 @@ def face_landmark_process(roi_queue: MPQueue,
         roi_timestamp = roi_data['timestamp']
         transform = roi_data['transform']
         quality_score = roi_data.get('quality_score', 0.5)
+        frame_id = roi_data.get('frame_id', -1)
         
-        # Generate timestamp based on when we process the ROI
+        # Generate timestamp
         current_time = time.time()
         timestamp_ms = int((current_time - start_time) * 1000)
         
-        # Process ROI
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi)
-        face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
-        
-        processed_count += 1
-        
-        # Debug output
-        if processed_count % 240 == 0:
-            print(f"[FACE LANDMARK] Processed {processed_count} ROIs, landmarks found: {len(face_result.face_landmarks) if face_result.face_landmarks else 0}")
-        
-        if face_result.face_landmarks:
-            # Process first face in ROI
-            face_landmarks = face_result.face_landmarks[0]
-            blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
+        try:
+            # Process ROI
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi)
+            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
             
-            # Transform landmarks back to original coordinates
-            landmarks = []
-            for lm in face_landmarks:
-                x = lm.x * transform['scale'] + transform['offset_x']
-                y = lm.y * transform['scale'] + transform['offset_y']
-                landmarks.append((x, y, lm.z))
-            
-            # Calculate centroid
-            x_coords = [l[0] for l in landmarks]
-            y_coords = [l[1] for l in landmarks]
-            centroid = (np.mean(x_coords), np.mean(y_coords))
-            
-            # Blend scores
-            blend_scores = [b.score for b in blendshapes][:52]
-            blend_scores += [0.0] * (52 - len(blend_scores))
-            
-            # Mesh data
-            mesh_data = []
-            if enable_mesh:
-                for l in landmarks:
-                    mesh_data.extend(l)
-            
-            # Send result
-            result = {
-                'track_id': track_id,
-                'landmarks': landmarks,
-                'blend': blend_scores,
-                'centroid': centroid,
-                'mesh': mesh_data if enable_mesh else None,
-                'timestamp': roi_timestamp,
-                'quality_score': quality_score
-            }
-            
-            try:
-                landmark_result_queue.put_nowait(result)
-                processed_count += 1
+            if face_result.face_landmarks and len(face_result.face_landmarks) > 0:
+                # Process first face in ROI
+                face_landmarks = face_result.face_landmarks[0]
+                blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
                 
-                if processed_count % 240 == 0:
-                    print(f"[FACE LANDMARK] Processed {processed_count} ROIs")
-            except:
-                pass
+                # Transform landmarks back to original coordinates
+                landmarks = []
+                for lm in face_landmarks:
+                    # Apply transform
+                    x = lm.x * roi.shape[1]  # Convert from normalized to pixel coords
+                    y = lm.y * roi.shape[0]
+                    
+                    # Transform to original frame coordinates
+                    x_orig = x * transform['scale'] + transform['offset_x']
+                    y_orig = y * transform['scale'] + transform['offset_y']
+                    
+                    # Normalize back to 0-1 range for original frame
+                    x_norm = x_orig / transform.get('frame_width', 1280)
+                    y_norm = y_orig / transform.get('frame_height', 720) #Defaults for 720p
+                    
+                    landmarks.append((x_norm, y_norm, lm.z))
+                
+                # Calculate centroid
+                x_coords = [l[0] for l in landmarks]
+                y_coords = [l[1] for l in landmarks]
+                centroid = (np.mean(x_coords), np.mean(y_coords))
+                
+                # Blend scores
+                blend_scores = [b.score for b in blendshapes][:52]
+                blend_scores += [0.0] * (52 - len(blend_scores))
+                
+                # Mesh data
+                mesh_data = []
+                if enable_mesh:
+                    for l in landmarks:
+                        mesh_data.extend(l)
+                
+                # Send result
+                result = {
+                    'track_id': track_id,
+                    'landmarks': landmarks,
+                    'blend': blend_scores,
+                    'centroid': centroid,
+                    'mesh': mesh_data if enable_mesh else None,
+                    'timestamp': roi_timestamp,
+                    'quality_score': quality_score,
+                    'frame_id': frame_id
+                }
+                
+                # Always try to send, drop old if needed
+                if landmark_result_queue.full():
+                    try:
+                        landmark_result_queue.get_nowait()  # Drop oldest
+                    except:
+                        pass
+                
+                try:
+                    landmark_result_queue.put_nowait(result)
+                    processed_count += 1
+                    
+                    if processed_count % 30 == 0:
+                        print(f"[FACE LANDMARK] Processed {processed_count} ROIs successfully")
+                except Exception as e:
+                    print(f"[FACE LANDMARK] Failed to send result: {e}")
+            else:
+                failed_count += 1
+                if failed_count % 30 == 0:
+                    print(f"[FACE LANDMARK] No landmarks found in ROI (total failed: {failed_count})")
+                    
+        except Exception as e:
+            print(f"[FACE LANDMARK] Error processing ROI: {e}")
+            failed_count += 1
     
-    print("[FACE LANDMARK] Stopping...")
+    print(f"[FACE LANDMARK] Stopping... Processed {processed_count} ROIs")
 
-
-def face_worker_process(frame_queue: MPQueue, 
-                       result_queue: MPQueue,
-                       model_path: str,
-                       enable_mesh: bool,
-                       control_pipe,
-                       enhanced_mode: bool = False,
+def face_worker_process(frame_queue, result_queue, model_path: str,
+                       enable_mesh: bool, control_pipe,
                        retinaface_model_path: str = None,
                        arcface_model_path: str = None,
                        enable_recognition: bool = False,
                        detection_interval: int = 7,
-                       downscale_resolution: tuple = (640, 480)):
-    """
-    Unified face worker process supporting both standard and enhanced modes.
+                       downscale_resolution: tuple = (640, 480),
+                       max_participants: int = 10):
+    """Face worker process - fixed ROI extraction"""
+    print(f"[FACE WORKER] Starting with max_participants={max_participants}")
     
-    In enhanced mode: Manages parallel detection and landmark extraction
-    """
-    mode = "ENHANCED" if enhanced_mode else "STANDARD"
-    print(f"[FACE WORKER] Starting in {mode} mode")
+    # Create internal queues with appropriate sizes
+    detection_queue = MPQueue(maxsize=10)
+    detection_result_queue = MPQueue(maxsize=10)
+    roi_queue = MPQueue(maxsize=10)
+    landmark_result_queue = MPQueue(maxsize=10)
+    debug_detection_queue = MPQueue(maxsize=10)
     
-    if enhanced_mode and ENHANCED_COMPONENTS_AVAILABLE:
-        # Enhanced mode - parallel architecture
-        print(f"[FACE WORKER] Initializing enhanced parallel pipeline...")
-        
-        # Create internal queues
-        detection_queue = MPQueue(maxsize=2)
-        detection_result_queue = MPQueue(maxsize=5)
-        roi_queue = MPQueue(maxsize=10)
-        landmark_result_queue = MPQueue(maxsize=10)
-        debug_detection_queue = MPQueue(maxsize=5)  # DEBUG_RETINAFACE: Queue for raw detections
-        
-        # Create control pipes for sub-processes
-        detector_parent, detector_child = Pipe()
-        landmark_parent, landmark_child = Pipe()
-        
-        # Start detection process
-        detector_proc = Process(
-            target=face_detection_process,
-            args=(detection_queue, detection_result_queue, retinaface_model_path, detector_child, debug_detection_queue)  # DEBUG_RETINAFACE: Pass debug queue
+    # Create control pipes for sub-processes
+    detector_parent, detector_child = Pipe()
+    landmark_parent, landmark_child = Pipe()
+    
+    # Start detection process
+    detector_proc = Process(
+        target=face_detection_process,
+        args=(detection_queue, detection_result_queue, retinaface_model_path, detector_child, debug_detection_queue)
+    )
+    detector_proc.start()
+    
+    # Start landmark process
+    landmark_proc = Process(
+        target=face_landmark_process,
+        args=(roi_queue, landmark_result_queue, model_path, enable_mesh, landmark_child)
+    )
+    landmark_proc.start()
+    
+    # Initialize tracker - THIS WAS MISSING!
+    tracker = LightweightTracker(
+        max_age=14,
+        min_hits=1,
+        iou_threshold=0.4,
+        detection_interval=detection_interval,
+        min_hits_in_window=3,
+        window_cycles=4,
+        max_tracks=max_participants  # Use the actual max_participants value
+    )
+    print(f"[FACE WORKER] Tracker initialized with max_tracks={max_participants}")
+    
+    # Initialize ROI processor
+    roi_processor = ROIProcessor(
+        target_size=(256, 256),
+        padding_ratio=0.3,
+        min_quality_score=0.5
+    )
+    roi_processor.start()
+    
+    # Initialize face recognition if enabled
+    face_recognition = None
+    enrollment_manager = None
+    if enable_recognition and arcface_model_path and os.path.exists(arcface_model_path):
+        face_recognition = FaceRecognitionProcess(
+            model_path=arcface_model_path,
+            embedding_dim=512,
+            similarity_threshold=0.5
         )
-        detector_proc.start()
+        face_recognition.start()
         
-        # Start landmark process
-        landmark_proc = Process(
-            target=face_landmark_process,
-            args=(roi_queue, landmark_result_queue, model_path, enable_mesh, landmark_child)
+        enrollment_manager = EnrollmentManager(
+            min_samples_for_enrollment=10,
+            min_quality_score=0.7
         )
-        landmark_proc.start()
+    
+    frame_count = 0
+    latest_detections = {}
+    latest_detection_time = 0
+    latest_detection_data = []
+    
+    # Track landmark results
+    landmark_results_cache = {}  # track_id -> landmark_data
+    
+    while True:
+        # Check for control messages
+        if control_pipe.poll():
+            msg = control_pipe.recv()
+            if msg == 'stop':
+                detector_parent.send('stop')
+                landmark_parent.send('stop')
+                break
+            elif isinstance(msg, tuple) and msg[0] == 'set_mesh':
+                landmark_parent.send(msg)
+                enable_mesh = msg[1]
         
-        # Initialize tracker and ROI processor
-        # Adjusted parameters for detection every 7 frames:
-        # - sliding window: 3 hits in 4 detection cycles
-        # - max_age=14: Keep tracks for 2 detection cycles (7*2)
-        # - iou_threshold=0.3: Standard IOU threshold
-        tracker = LightweightTracker(
-            max_age=14,
-            min_hits=1,  # Kept for backward compatibility
-            iou_threshold=0.3,
-            detection_interval=detection_interval,
-            min_hits_in_window=3,
-            window_cycles=4
-        )
+        # Get frame
+        try:
+            frame_data = frame_queue.get(timeout=0.1)
+        except Exception as e:
+            continue
         
-        roi_processor = ROIProcessor(
-            target_size=(256, 256),
-            padding_ratio=0.3,
-            min_quality_score=0.5
-        )
-        roi_processor.start()
+        rgb = frame_data['rgb']
+        timestamp = frame_data['timestamp']
+        frame_id = frame_data.get('frame_id', frame_count)
         
-        # Initialize face recognition if enabled
-        face_recognition = None
-        enrollment_manager = None
-        if enable_recognition and arcface_model_path and os.path.exists(arcface_model_path):
-            face_recognition = FaceRecognitionProcess(
-                model_path=arcface_model_path,
-                embedding_dim=512,
-                similarity_threshold=0.5
-            )
-            face_recognition.start()
-            
-            enrollment_manager = EnrollmentManager(
-                min_samples_for_enrollment=10,
-                min_quality_score=0.7
-            )
-        
-        frame_count = 0
-        latest_detections = {}
-        latest_detection_time = 0
-        latest_detection_data = []  # Store most recent detections
-        
-        while True:
-            # Check for control messages
-            if control_pipe.poll():
-                msg = control_pipe.recv()
-                if msg == 'stop':
-                    # Forward stop to sub-processes
-                    detector_parent.send('stop')
-                    landmark_parent.send('stop')
-                    break
-                elif isinstance(msg, tuple) and msg[0] == 'set_mesh':
-                    # Forward to landmark process
-                    landmark_parent.send(msg)
-            
-            # Get frame
-            try:
-                frame_data = frame_queue.get(timeout=0.1)
-            except:
-                continue
-            
-            rgb = frame_data['rgb']
-            timestamp = frame_data['timestamp']
-            frame_id = frame_data.get('frame_id', frame_count)
-            
-            # Debug: Check if BGR is present
-            if frame_count % 240 == 0:
-                has_bgr = 'bgr' in frame_data and frame_data['bgr'] is not None
-                print(f"[FACE WORKER] Frame {frame_id}: BGR present: {has_bgr}, keys: {list(frame_data.keys())}")
-            
-            # Send frame to detector (it will handle detection interval)
+        # Send frame to detector
+        if not detection_queue.full():
             try:
                 detection_queue.put_nowait(frame_data)
             except:
                 pass
-            
-            # Check for detection results
-            try:
-                det_result = detection_result_queue.get_nowait()
-                latest_detections[det_result['frame_id']] = det_result['detections']
-                latest_detection_time = time.time()
-                latest_detection_data = det_result['detections']
-                print(f"[FACE WORKER] Received {len(det_result['detections'])} detections for frame {det_result['frame_id']}")
-            except:
-                pass
-            
-            # Use most recent detections if they're fresh (within 0.5 seconds)
-            # This handles the async nature of the detection pipeline
-            current_time = time.time()
-            if latest_detection_time > 0 and current_time - latest_detection_time < 0.5 and latest_detection_data:
-                detections = latest_detection_data
-                if frame_count % 240 == 0:
-                    print(f"[FACE WORKER] Using recent detections ({len(detections)} faces) for tracking")
-            else:
-                # No recent detections, use empty list for tracking continuity
-                detections = []
-                # Clear stale detection data to prevent confusion
-                if latest_detection_time > 0 and current_time - latest_detection_time > 1.0:
-                    latest_detection_data = []
-                    if frame_count % 240 == 0:
-                        print(f"[FACE WORKER] No recent detections. Detection age: {current_time - latest_detection_time if latest_detection_time > 0 else 'never'}s")
-            
-            # If no detections for this frame, use empty list but still update tracker
-            # This allows tracking to continue between detection frames
-            tracked_objects = tracker.update(rgb, detections)
-            
-            if frame_count % 240 == 0:
-                detection_age = current_time - latest_detection_time if latest_detection_time > 0 else -1
-                print(f"[FACE WORKER] Frame {frame_id}: {len(detections)} detections (age: {detection_age:.2f}s) -> {len(tracked_objects)} tracked objects")
-            
-            # Extract ROIs for tracked objects
-            rois_extracted = 0
-            for track_dict in tracked_objects:
-                # Get ROI
-                roi_result = roi_processor.extract_roi(
-                    rgb,
-                    track_dict['bbox'],
-                    track_dict['track_id'],
-                    timestamp
-                )
+        
+        # Check for detection results
+        try:
+            det_result = detection_result_queue.get_nowait()
+            latest_detections[det_result['frame_id']] = det_result['detections']
+            latest_detection_time = time.time()
+            latest_detection_data = det_result['detections']
+            print(f"[FACE WORKER] Got {len(det_result['detections'])} detections for frame {det_result['frame_id']}")
+        except:
+            pass
+        
+        # Use most recent detections
+        current_time = time.time()
+        if latest_detection_time > 0 and current_time - latest_detection_time < 0.5 and latest_detection_data:
+            detections = latest_detection_data
+        else:
+            detections = []
+        
+        # Update tracker
+        tracked_objects = tracker.update(rgb, detections)
+        
+        if tracked_objects and frame_count % 60 == 0:
+            print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects")
+        
+        # Extract ROIs for tracked objects
+        rois_extracted = 0
+        for track_dict in tracked_objects:
+            # Skip if track is too new (not confirmed)
+            if track_dict.get('age', 0) < 2:
+                continue
                 
-                if roi_result and roi_result.get('roi') is not None:
-                    rois_extracted += 1
-                    # Send ROI to landmark process
-                    roi_data = {
-                        'roi': roi_result['roi'],
-                        'track_id': track_dict['track_id'],
-                        'timestamp': timestamp,
-                        'transform': roi_result['transform'],
-                        'quality_score': roi_result.get('quality_score', 0.5)
-                    }
-                    
+            # Get ROI
+            roi_result = roi_processor.extract_roi(
+                rgb,
+                track_dict['bbox'],
+                track_dict['track_id'],
+                timestamp
+            )
+            
+            if roi_result and roi_result.get('roi') is not None:
+                rois_extracted += 1
+
+                # DEBUG: Verify ROI dimensions
+                roi_shape = roi_result['roi'].shape
+                if frame_count % 60 == 0:
+                    print(f"[FACE WORKER] ROI extracted: shape={roi_shape}, track_id={track_dict['track_id']}, "
+                        f"original_bbox={track_dict['bbox']}, quality={roi_result.get('quality_score', 0):.2f}")
+
+                # Send ROI to landmark process
+                roi_data = {
+                    'roi': roi_result['roi'],
+                    'track_id': track_dict['track_id'],
+                    'timestamp': timestamp,
+                    'transform': roi_result['transform'],
+                    'quality_score': roi_result.get('quality_score', 0.5),
+                    'frame_id': frame_id  # Add frame_id for debugging
+                }
+                
+                # Always try to send, drop old if needed
+                if roi_queue.full():
                     try:
-                        roi_queue.put_nowait(roi_data)
+                        roi_queue.get_nowait()  # Drop oldest
                     except:
                         pass
-                    
-                    # Also send to face recognition if enabled
-                    if face_recognition:
-                        face_recognition.submit_face(
-                            roi_result['roi'],
-                            track_dict['track_id'],
-                            roi_result.get('quality_score', 0.5),
-                            timestamp
-                        )
-            
-            if frame_count % 240 == 0 and rois_extracted > 0:
-                print(f"[FACE WORKER] Extracted {rois_extracted} ROIs for landmarks")
-            
-            # Collect landmark results
-            face_data = []
-            landmarks_collected = 0
-            while True:
+                
                 try:
-                    landmark_result = landmark_result_queue.get_nowait()
-                    landmarks_collected += 1
-                    
-                    # Find corresponding track
-                    track_info = None
-                    for track in tracked_objects:
-                        if track['track_id'] == landmark_result['track_id']:
-                            track_info = track
-                            break
-                    
-                    if track_info:
-                        face_info = {
-                            'track_id': landmark_result['track_id'],
-                            'landmarks': landmark_result['landmarks'],
-                            'blend': landmark_result['blend'],
-                            'centroid': landmark_result['centroid'],
-                            'mesh': landmark_result['mesh'],
-                            'timestamp': timestamp,
-                            'bbox': track_info['bbox'],
-                            'confidence': track_info['confidence'],
-                            'quality_score': landmark_result['quality_score']
-                        }
-                        
-                        # Add face recognition results if available
-                        if face_recognition:
-                            recog_result = face_recognition.get_result(timeout=0.001)
-                            if recog_result and recog_result['track_id'] == landmark_result['track_id']:
-                                face_info['embedding'] = recog_result['embedding']
-                                face_info['participant_id'] = recog_result.get('participant_id', -1)
-                                
-                                # Update enrollment if available
-                                if enrollment_manager and recog_result.get('embedding') is not None:
-                                    enrollment_manager.add_face_sample(
-                                        landmark_result['track_id'],
-                                        recog_result['embedding'],
-                                        landmark_result['quality_score'],
-                                        timestamp
-                                    )
-                        
-                        face_data.append(face_info)
-                except:
-                    break
-            
-            if frame_count % 240 == 0:
-                print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects, {landmarks_collected} landmark results -> {len(face_data)} faces")
-                if len(tracked_objects) == 0:
-                    detection_info = f"age: {current_time - latest_detection_time:.2f}s" if latest_detection_time > 0 else "none"
-                    print(f"[FACE WORKER] No tracked objects. Latest detection: {detection_info}, Total detection frames: {len(latest_detections)}")
-            
-            # Create face data from tracked objects even if no landmarks yet
-            # This ensures faces are shown immediately while landmarks are processed
-            if not face_data and tracked_objects:
-                for track in tracked_objects:
-                    face_info = {
-                        'track_id': track['track_id'],
-                        'bbox': track['bbox'],
-                        'confidence': track['confidence'],
-                        'landmarks': [],  # Will be filled by landmark process later
-                        'blend': [0.0] * 52,  # Empty blend scores initially
-                        'centroid': ((track['bbox'][0] + track['bbox'][2]) / 2, 
-                                   (track['bbox'][1] + track['bbox'][3]) / 2),
-                        'timestamp': timestamp
-                    }
-                    face_data.append(face_info)
-            
-            # DEBUG_RETINAFACE: Check for debug detections
-            debug_detections = None
-            try:
-                debug_data = debug_detection_queue.get_nowait()
-                debug_detections = debug_data
-                print(f"[FACE WORKER DEBUG] Got debug detections: {len(debug_data.get('raw_detections', []))} raw")
-            except:
-                pass
-            
-            # Always send results to ensure frame is displayed
-            bgr_frame = frame_data.get('bgr')
-            result = {
-                'type': 'face',
-                'mode': mode,
-                'data': face_data,
-                'timestamp': timestamp,
-                'frame_bgr': bgr_frame,
-                'debug_detections': debug_detections  # DEBUG_RETINAFACE: Include debug data
-            }
-            
-            # Debug: Check if BGR is being sent
-            if frame_count % 240 == 0:
-                print(f"[FACE WORKER] Sending result with BGR: {bgr_frame is not None}, shape: {bgr_frame.shape if bgr_frame is not None else 'None'}")
-            
-            try:
-                result_queue.put_nowait(result)
-            except:
-                pass
-            
-            frame_count += 1
-            
-            # Clean up old detections
-            if len(latest_detections) > 100:
-                # Keep only recent detections
-                sorted_frames = sorted(latest_detections.keys())
-                for old_frame in sorted_frames[:-50]:
-                    del latest_detections[old_frame]
+                    roi_queue.put_nowait(roi_data)
+                    if frame_count % 60 == 0:
+                        print(f"[FACE WORKER] Sent ROI for track {track_dict['track_id']}")
+                except Exception as e:
+                    print(f"[FACE WORKER] Failed to send ROI: {e}")
         
-        # Cleanup enhanced mode
-        print("[FACE WORKER] Stopping enhanced components...")
-        detector_proc.join(timeout=2.0)
-        landmark_proc.join(timeout=2.0)
-        roi_processor.stop()
-        if face_recognition:
-            face_recognition.stop()
-    
-    else:
-        # Standard mode processing - direct MediaPipe detection
-        # Initialize MediaPipe
-        with open(model_path, 'rb') as f:
-            model_buffer = f.read()
-        base_opts = python.BaseOptions(model_asset_buffer=model_buffer)
+        if rois_extracted > 0 and frame_count % 60 == 0:
+            print(f"[FACE WORKER] Extracted {rois_extracted} ROIs")
         
-        face_options = vision.FaceLandmarkerOptions(
-            base_options=base_opts,
-            output_face_blendshapes=True,
-            running_mode=vision.RunningMode.VIDEO,
-            num_faces=2,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        face_landmarker = vision.FaceLandmarker.create_from_options(face_options)
-        
-        # Monotonic timestamp
-        class MonotonicTS:
-            def __init__(self):
-                self.ts = int(time.monotonic() * 1000)
-                self.lock = threading.Lock()
-            def next(self):
-                with self.lock:
-                    now = int(time.monotonic() * 1000)
-                    if now <= self.ts:
-                        self.ts += 1
-                    else:
-                        self.ts = now
-                    return self.ts
-        
-        ts_gen = MonotonicTS()
-        frame_count = 0
-        
+        # Collect landmark results
+        landmarks_collected = 0
         while True:
-            # Check for control messages
-            if control_pipe.poll():
-                msg = control_pipe.recv()
-                if msg == 'stop':
-                    break
-                elif isinstance(msg, tuple) and msg[0] == 'set_mesh':
-                    enable_mesh = msg[1]
-                    print(f"[FACE WORKER] Mesh data {'enabled' if enable_mesh else 'disabled'}")
-            
-            # Get frame
             try:
-                frame_data = frame_queue.get(timeout=0.1)
+                landmark_result = landmark_result_queue.get_nowait()
+                landmarks_collected += 1
+                
+                # Cache the landmark result
+                track_id = landmark_result['track_id']
+                landmark_results_cache[track_id] = landmark_result
+                
+                if frame_count % 60 == 0:
+                    print(f"[FACE WORKER] Got landmarks for track {track_id}")
             except:
-                continue
+                break
+        
+        # Build face data from tracked objects with cached landmarks
+        face_data = []
+        for track in tracked_objects:
+            track_id = track['track_id']
             
-            rgb = frame_data['rgb']
-            timestamp = frame_data['timestamp']
-            timestamp_ms = ts_gen.next()
+            # Get cached landmark data if available
+            landmark_data = landmark_results_cache.get(track_id, {})
             
-            # Process
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
-            
-            # Extract data
-            face_data = []
-            if face_result.face_landmarks:
-                for i, face_landmarks in enumerate(face_result.face_landmarks):
-                    blendshapes = face_result.face_blendshapes[i] if face_result.face_blendshapes and i < len(face_result.face_blendshapes) else []
-                    
-                    # Calculate centroid
-                    x_coords = [lm.x for lm in face_landmarks]
-                    y_coords = [lm.y for lm in face_landmarks]
-                    face_centroid = (np.mean(x_coords), np.mean(y_coords))
-                    
-                    # Blend scores
-                    blend_scores = [b.score for b in blendshapes][:52]
-                    blend_scores += [0.0] * (52 - len(blend_scores))
-                    
-                    # Mesh data
-                    mesh_data = []
-                    if enable_mesh:
-                        for lm in face_landmarks:
-                            mesh_data.extend([lm.x, lm.y, lm.z])
-                    
-                    face_data.append({
-                        'landmarks': [(lm.x, lm.y, lm.z) for lm in face_landmarks],
-                        'blend': blend_scores,
-                        'centroid': face_centroid,
-                        'mesh': mesh_data if enable_mesh else None,
-                        'timestamp': timestamp
-                    })
-            
-            # Send result with frame
-            result = {
-                'type': 'face',
-                'mode': mode,
-                'data': face_data,
-                'timestamp': timestamp,
-                'frame_bgr': frame_data.get('bgr')
+            face_info = {
+                'track_id': track_id,
+                'bbox': track['bbox'],
+                'confidence': track['confidence'],
+                'landmarks': landmark_data.get('landmarks', []),
+                'blend': landmark_data.get('blend', [0.0] * 52),
+                'centroid': landmark_data.get('centroid', 
+                           ((track['bbox'][0] + track['bbox'][2]) / 2,
+                            (track['bbox'][1] + track['bbox'][3]) / 2)),
+                'mesh': landmark_data.get('mesh') if enable_mesh else None,
+                'timestamp': timestamp
             }
-            
-            try:
-                result_queue.put_nowait(result)
-            except:
-                pass
-            
-            frame_count += 1
+            face_data.append(face_info)
+
+        if face_data and frame_count % 60 == 0:
+            for face in face_data:
+                has_landmarks = len(face.get('landmarks', [])) > 0
+                print(f"[FACE WORKER] Sending face track_id={face['track_id']}, "
+                    f"has_landmarks={has_landmarks}, centroid={face.get('centroid')}")
+        
+        # Get debug detections
+        debug_detections = None
+        try:
+            debug_data = debug_detection_queue.get_nowait()
+            debug_detections = debug_data
+        except:
+            pass
+        
+        # Always send results
+        bgr_frame = frame_data.get('bgr')
+        result = {
+            'type': 'face',
+            'data': face_data,
+            'timestamp': timestamp,
+            'frame_bgr': bgr_frame,
+            'debug_detections': debug_detections
+        }
+        
+        try:
+            result_queue.put_nowait(result)
+            if frame_count % 60 == 0:
+                print(f"[FACE WORKER] Sent {len(face_data)} faces to fusion")
+        except Exception as e:
+            if frame_count % 60 == 0:
+                print(f"[FACE WORKER] Failed to send result: {e}")
+        
+        frame_count += 1
     
-    print(f"[FACE WORKER] Stopping {mode} mode...")
+    # Cleanup
+    print("[FACE WORKER] Stopping components...")
+    detector_proc.join(timeout=2.0)
+    landmark_proc.join(timeout=2.0)
+    roi_processor.stop()
+    if face_recognition:
+        face_recognition.stop()
+    
+    print("[FACE WORKER] Stopping...")
 
 
-def pose_worker_process(frame_queue: MPQueue,
-                       result_queue: MPQueue,
+def pose_worker_process(frame_queue,  # Can be MPQueue or RobustQueue
+                       result_queue,  # Can be MPQueue or RobustQueue
                        model_path: str,
                        control_pipe):
     """Dedicated process for pose detection"""
     print("[POSE WORKER] Starting")
+    print(f"[POSE WORKER] frame_queue type: {type(frame_queue)}")
+    print(f"[POSE WORKER] has get method: {hasattr(frame_queue, 'get')}")
     
     # Initialize pose landmarker
     with open(model_path, 'rb') as f:
@@ -986,7 +870,11 @@ def pose_worker_process(frame_queue: MPQueue,
         # Get frame
         try:
             frame_data = frame_queue.get(timeout=0.1)
-        except:
+            if frame_count == 0:
+                print(f"[POSE WORKER] Successfully got first frame")
+        except Exception as e:
+            if frame_count == 0:
+                print(f"[POSE WORKER] Error getting frame: {type(e).__name__}: {e}")
             continue
         
         rgb = frame_data['rgb']  # Already downsampled by distributor
@@ -1051,399 +939,181 @@ def pose_worker_process(frame_queue: MPQueue,
     print("[POSE WORKER] Stopping...")
 
 
-def fusion_process(face_result_queue: MPQueue,
-                  pose_result_queue: MPQueue,
-                  preview_queue: queue.Queue,
-                  score_buffer: NumpySharedBuffer,
-                  result_pipe,
-                  recording_queue: queue.Queue,
-                  lsl_queue: queue.Queue,
-                  participant_update_queue: queue.Queue,
-                  worker_pipe,
-                  correlation_queue: queue.Queue,
-                  cam_idx: int,
-                  enable_pose: bool,
-                  resolution: tuple,
+def fusion_process(face_result_queue, pose_result_queue, frame_queue,
+                  preview_queue, score_buffer: NumpySharedBuffer,
+                  result_pipe, recording_queue, lsl_queue,
+                  participant_update_queue, worker_pipe, correlation_queue,
+                  cam_idx: int, enable_pose: bool, resolution: tuple,
                   max_participants: int = 10):
-    """Fuses face and pose results, manages preview and output"""
-    print(f"[FUSION] Starting for camera {cam_idx}")
+    """Fusion with LATEST DATA ONLY approach"""
+    print(f"[FUSION] Starting LATEST ONLY for camera {cam_idx}")
     
-    # Initialize synchronous participant manager
-    sync_participant_manager = SyncParticipantManager(max_participants=max_participants)
+    # Initialize participant manager
+    global_participant_manager = GlobalParticipantManager(max_participants=max_participants)
     
-    # Debug tracking
-    frame_count = 0
-    
-    # Initialize trackers
-    face_tracker = UnifiedTracker(max_participants=10)
-    pose_tracker = UnifiedTracker(max_participants=10) if enable_pose else None
-    
-    # State
+    # State - only keep latest
     latest_face_data = []
     latest_pose_data = []
     latest_frame_bgr = None
-    latest_debug_detections = None  # DEBUG_RETINAFACE: Store latest debug detections
-    last_preview_time = 0
-    last_lsl_time = 0
-    preview_interval = 1.0 / 60  # 60 FPS preview cap
-    lsl_interval = 1.0 / 60  # 60 FPS LSL data cap
-    enable_mesh = False  # Track mesh state
+    latest_timestamp = 0
+    frame_count = 0
+    original_resolution = resolution 
     
-    # Result collection with timeout
-    def collect_results(timeout=0.05):
-        """Collect all available results within timeout"""
-        face_results = []
-        pose_results = []
+
+    
+    while True:
+        current_time = time.time()
         
-        # Collect face results
-        deadline = time.time() + timeout/2
-        while time.time() < deadline:
+        # Check control messages
+        if worker_pipe and worker_pipe.poll(timeout=0.001):
             try:
-                result = face_result_queue.get_nowait()
-                if result['type'] in ['face', 'face_advanced']:
-                    face_results.append(result)
+                msg = worker_pipe.recv()
+                if msg == 'stop':
+                    break
+            except:
+                pass
+        
+        # Get LATEST frame
+        frame_data = None
+        while True:
+            try:
+                frame_data = frame_queue.get_nowait()
             except:
                 break
         
-        # Collect pose results if enabled
+        if frame_data and 'bgr' in frame_data:
+            latest_frame_bgr = frame_data['bgr']
+            latest_timestamp = frame_data['timestamp']
+        
+        # Get LATEST face result
+        face_result = None
+        while True:
+            try:
+                face_result = face_result_queue.get_nowait()
+            except:
+                break
+                
+        if face_result and face_result['type'] == 'face':
+            # Process faces with participant manager
+            face_data = face_result['data']
+            tracked_faces = []
+            
+            for face in face_data:
+                # Your existing face processing logic
+                track_id = face.get('track_id', -1)
+                
+                # Calculate shape from landmarks
+                shape = None
+                if 'landmarks' in face and face['landmarks']:
+                    landmarks = np.array(face['landmarks'])
+                    if len(landmarks) > 0:
+                        shape = landmarks[:, :2]
+                
+                # Get global ID
+                global_id = global_participant_manager.update_participant(
+                    cam_idx, track_id, face['centroid'], shape=shape
+                )
+                
+                face['id'] = global_id
+                face['global_id'] = global_id
+                tracked_faces.append(face)
+            
+            latest_face_data = tracked_faces
+        
+        # Get LATEST pose result if enabled
         if enable_pose:
-            deadline = time.time() + timeout/2
-            while time.time() < deadline:
+            pose_result = None
+            while True:
                 try:
-                    result = pose_result_queue.get_nowait()
-                    if result['type'] == 'pose':
-                        pose_results.append(result)
+                    pose_result = pose_result_queue.get_nowait()
                 except:
                     break
-        
-        return face_results, pose_results
-    
-    print("[FUSION] Ready, processing results...")
-    
-    while True:
-        # Check for control messages
-        if worker_pipe.poll():
-            msg = worker_pipe.recv()
-            if msg == 'stop':
-                break
-            elif isinstance(msg, tuple) and msg[0] == 'set_mesh':
-                enable_mesh = msg[1]
-                print(f"[FUSION] Mesh data {'enabled' if enable_mesh else 'disabled'}")
-        
-        # Collect results
-        face_results, pose_results = collect_results()
-        
-        frame_count += 1  # Increment frame counter
-        
-        # Process face results
-        for result in face_results:
-            face_data = result['data']
-            timestamp = result['timestamp']
-            
-            # Extract frame if available
-            if 'frame_bgr' in result and result['frame_bgr'] is not None:
-                latest_frame_bgr = result['frame_bgr']
-            elif frame_count % 240 == 0:
-                print(f"[FUSION DEBUG] No frame_bgr in face result. Keys: {list(result.keys())}")
-            
-            # DEBUG_RETINAFACE: Extract debug detections if available
-            if 'debug_detections' in result and result['debug_detections'] is not None:
-                latest_debug_detections = result['debug_detections']
-                print(f"[FUSION DEBUG] Got debug detections: {len(latest_debug_detections.get('raw_detections', []))} raw")
-            
-            # Check if this is enhanced mode data
-            is_enhanced = any('track_id' in face for face in face_data)
-            
-            if is_enhanced:
-                # Enhanced mode - use synchronous participant manager
-                tracked_faces = []
-                for face in face_data:
-                    participant_id = face.get('participant_id', -1)
-                    track_id = face.get('track_id', -1)
                     
-                    # Calculate shape from landmarks
-                    shape = None
-                    if 'landmarks' in face and face['landmarks']:
-                        landmarks = np.array(face['landmarks'])
-                        if len(landmarks) > 0:
-                            shape = landmarks[:, :2]  # Use only x,y coordinates
-                    
-                    # Get embedding if available
-                    embedding = face.get('embedding')
-                    
-                    # Debug embedding availability
-                    if frame_count % 240 == 0 and track_id == 0:
-                        print(f"[FUSION] Track {track_id}: participant_id={participant_id}, has_embedding={embedding is not None}")
-                    
-                    if participant_id < 0:
-                        # Not yet enrolled by face recognition, use participant manager
-                        global_id = sync_participant_manager.get_participant_id(
-                            cam_idx=cam_idx,
-                            local_id=track_id,
-                            centroid=face['centroid'],
-                            shape=shape,
-                            embedding=embedding,
-                            timestamp=timestamp
-                        )
-                        face['global_id'] = global_id
-                        face['id'] = global_id
-                    else:
-                        # Use participant ID from face recognition (already 0-based)
-                        # But still update participant manager for consistency
-                        global_id = participant_id + 1  # Convert to 1-based
-                        face['global_id'] = global_id
-                        face['id'] = global_id
-                        
-                        # Update participant manager with recognized ID and embedding
-                        if sync_participant_manager.participant_manager:
-                            sync_participant_manager.participant_manager.participants[global_id] = {
-                                'camera': cam_idx,
-                                'centroid': face['centroid'],
-                                'shape': shape,
-                                'last_seen': timestamp,
-                                'local_id': track_id
-                            }
-                            # Update embedding if available
-                            if embedding is not None:
-                                sync_participant_manager.participant_manager.update_participant_embedding(global_id, embedding)
-                    
-                    tracked_faces.append(face)
-                
-                latest_face_data = tracked_faces
-                
-                if frame_count % 30 == 0 and len(tracked_faces) > 0:
-                    print(f"[FUSION DEBUG] Enhanced mode: {len(tracked_faces)} faces processed")
-            else:
-                # Standard mode - need tracking
-                detections = []
-                for i, face in enumerate(face_data):
-                    detections.append({
-                        'centroid': face['centroid'],
-                        'landmarks': face['landmarks'],
-                        'local_id': i
-                    })
-                
-                # Use synchronous participant manager for global ID assignment
-                latest_face_data = []
-                for i, face in enumerate(face_data):
-                    # Calculate shape array from landmarks for Procrustes matching
-                    shape = None
-                    if 'landmarks' in face and face['landmarks']:
-                        # Convert landmarks to numpy array for shape analysis
-                        landmarks = np.array(face['landmarks'])
-                        if len(landmarks) > 0:
-                            shape = landmarks[:, :2]  # Use only x,y coordinates
-                    
-                    # Get global ID from synchronous participant manager
-                    global_id = sync_participant_manager.get_participant_id(
-                        cam_idx=cam_idx,
-                        local_id=i,
-                        centroid=face['centroid'],
-                        shape=shape,
-                        timestamp=timestamp
-                    )
-                    
-                    # Also send to async queue for GUI updates (optional)
-                    if participant_update_queue:
-                        try:
-                            update_msg = {
-                                'camera_idx': cam_idx,
-                                'local_id': i,
-                                'centroid': face['centroid'],
-                                'landmarks': face['landmarks'],
-                                'shape': shape.tolist() if shape is not None else None,
-                                'global_id': global_id,  # Include assigned ID
-                                'timestamp': timestamp
-                            }
-                            participant_update_queue.put_nowait(update_msg)
-                        except:
-                            pass
-                    
-                    face['global_id'] = global_id
-                    face['id'] = global_id  # Add 'id' field for GUI compatibility
-                    latest_face_data.append(face)
-                    
-                    if frame_count % 240 == 0 and i == 0:
-                        print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to face {i}")
-                
-                if frame_count % 30 == 0 and len(latest_face_data) > 0:
-                    print(f"[FUSION DEBUG] Standard mode: {len(latest_face_data)} faces processed")
-        
-        # Process pose results
-        if enable_pose:
-            for result in pose_results:
-                pose_data = result['data']
-                
-                detections = []
-                for i, pose in enumerate(pose_data):
-                    detections.append({
-                        'centroid': pose['centroid'],
-                        'landmarks': pose['landmarks'],
-                        'local_id': i
-                    })
-                
-                # Use synchronous participant manager for pose tracking
+            if pose_result and pose_result['type'] == 'pose':
+                # Process poses
+                pose_data = pose_result['data']
                 latest_pose_data = []
+                
                 for i, pose in enumerate(pose_data):
-                    # For pose, we use subset of landmarks as shape
+                    # Your existing pose processing logic
                     shape = None
                     if 'landmarks' in pose and pose['landmarks']:
-                        # Use key pose points for shape matching (e.g., shoulders, hips)
                         landmarks = np.array(pose['landmarks'])
-                        if len(landmarks) >= 33:  # MediaPipe has 33 pose landmarks
-                            # Use shoulders (11,12), hips (23,24), nose (0)
+                        if len(landmarks) >= 33:
                             key_points = landmarks[[0, 11, 12, 23, 24], :2]
                             shape = key_points
                     
-                    # Get global ID from synchronous participant manager
-                    global_id = sync_participant_manager.get_participant_id(
-                        cam_idx=cam_idx,
-                        local_id=i,
-                        centroid=pose['centroid'],
-                        shape=shape,
-                        timestamp=timestamp
+                    global_id = global_participant_manager.update_participant(
+                        cam_idx, i, pose['centroid'], shape=shape
                     )
                     
-                    # Also send to async queue for GUI updates (optional)
-                    if participant_update_queue:
-                        try:
-                            update_msg = {
-                                'camera_idx': cam_idx,
-                                'local_id': i,
-                                'centroid': pose['centroid'],
-                                'landmarks': pose['landmarks'],
-                                'shape': shape.tolist() if shape is not None else None,
-                                'is_pose': True,  # Flag to indicate this is pose data
-                                'global_id': global_id,  # Include assigned ID
-                                'timestamp': timestamp
-                            }
-                            participant_update_queue.put_nowait(update_msg)
-                        except:
-                            pass
-                    
+                    pose['id'] = global_id
                     pose['global_id'] = global_id
-                    pose['id'] = global_id  # Add 'id' field for GUI compatibility
                     latest_pose_data.append(pose)
-                    
-                    if frame_count % 240 == 0 and i == 0:
-                        print(f"[FUSION] Camera {cam_idx}: Assigned global_id {global_id} to pose {i}")
         
-        # Send preview at limited rate
-        current_time = time.time()
-        if current_time - last_preview_time > preview_interval:
-            # Ensure frame is downsampled for GUI preview
-            preview_frame = latest_frame_bgr
-            if preview_frame is not None:
-                h, w = preview_frame.shape[:2]
-                downscale_width = 640
-                downscale_height = 480
-                
-                # Only downsample if needed
-                if w > downscale_width or h > downscale_height:
-                    scale = min(downscale_width / w, downscale_height / h)
-                    new_w = int(w * scale)
-                    new_h = int(h * scale)
-                    preview_frame = cv2.resize(preview_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
+        # Send preview - ALWAYS LATEST ONLY
+        if latest_frame_bgr is not None:
             preview_data = {
                 'cam_idx': cam_idx,
-                'faces': latest_face_data,  # Changed from 'face_data' to 'faces' to match GUI
-                'all_poses': latest_pose_data if enable_pose else [],  # Changed from 'pose_data' to 'all_poses'
-                'timestamp': current_time,
-                'frame_bgr': preview_frame,  # Now properly downsampled for GUI
-                'debug_detections': latest_debug_detections  # DEBUG_RETINAFACE: Include debug detections
+                'faces': latest_face_data,
+                'all_poses': latest_pose_data if enable_pose else [],
+                'timestamp': latest_timestamp,
+                'frame_bgr': latest_frame_bgr,
+                'original_resolution': original_resolution
             }
             
-            if frame_count % 240 == 0:  # Reduced debug frequency
-                print(f"[FUSION DEBUG] Sending preview: {len(latest_face_data)} faces, {len(latest_pose_data)} poses, frame: {latest_frame_bgr is not None}, frame shape: {latest_frame_bgr.shape if latest_frame_bgr is not None else 'None'}")
-            
+            # Drop old preview if queue full
             try:
+                try:
+                    preview_queue.get_nowait()
+                except:
+                    pass
                 preview_queue.put_nowait(preview_data)
-                last_preview_time = current_time
             except:
                 pass
         
-        # Send to other outputs (recording, LSL, correlation) at limited rate
-        if (latest_face_data or latest_pose_data) and current_time - last_lsl_time > lsl_interval:
-            output_data = {
-                'cam_idx': cam_idx,
-                'face_data': latest_face_data,
-                'pose_data': latest_pose_data,
-                'timestamp': current_time
-            }
-            
-            # Recording
-            try:
-                recording_queue.put_nowait(output_data)
-            except:
-                pass
-            
-            # LSL - send individual participant data in expected format
-            if latest_face_data:
-                for face in latest_face_data:
-                    if 'global_id' in face and 'blend' in face:
-                        lsl_data = {
-                            'type': 'participant_data',
-                            'participant_id': f"P{face['global_id']}",
-                            'global_id': face['global_id'],
-                            'blend_scores': face['blend'],
-                            'mesh_data': face.get('mesh', None) if enable_mesh else None
-                        }
-                        try:
-                            lsl_queue.put_nowait(lsl_data)
-                        except:
-                            pass
-            
-            # LSL - send pose data if enabled
-            if enable_pose and latest_pose_data:
-                for pose in latest_pose_data:
-                    if 'global_id' in pose and 'values' in pose:
-                        pose_lsl_data = {
-                            'type': 'pose_data',
-                            'participant_id': f"P{pose['global_id']}",
-                            'global_id': pose['global_id'],
-                            'pose_data': pose['values']
-                        }
-                        try:
-                            lsl_queue.put_nowait(pose_lsl_data)
-                        except:
-                            pass
-            
-            # Correlation - send individual face data in expected format
-            if latest_face_data:
-                for face in latest_face_data:
-                    if 'global_id' in face and 'blend' in face:
-                        correlation_data = {
-                            'participant_id': f"P{face['global_id']}",
-                            'blend_scores': face['blend'],
-                            'camera_index': cam_idx
-                        }
-                        try:
-                            correlation_queue.put_nowait(correlation_data)
-                        except:
-                            pass
-            
-            # Update LSL time after sending
-            last_lsl_time = current_time
-            
-            # Score buffer update
-            if latest_face_data:
-                # Update blend scores in shared buffer
-                for face in latest_face_data:
-                    if 'global_id' in face and 'blend' in face:
-                        participant_idx = face['global_id'] - 1
-                        if hasattr(score_buffer, 'shape') and len(score_buffer.shape) == 2:
-                            # Multi-participant buffer
-                            if 0 <= participant_idx < score_buffer.shape[1]:
-                                blend_scores = np.array(face['blend'][:52])
-                                score_buffer.update_column(participant_idx, blend_scores)
-                        else:
-                            # Single buffer - write first face only
-                            score_buffer.write(face['blend'])
-                            break
-    
-    print(f"[FUSION] Stopping for camera {cam_idx}...")
+        # Send to other outputs (simplified)
+        if latest_face_data:
+            # LSL
+            for face in latest_face_data:
+                if 'global_id' in face and 'blend' in face:
+                    lsl_data = {
+                        'type': 'participant_data',
+                        'participant_id': f"P{face['global_id']}",
+                        'global_id': face['global_id'],
+                        'blend_scores': face['blend']
+                    }
+                    try:
+                        lsl_queue.put_nowait(lsl_data)
+                    except:
+                        pass
 
+                if 'landmarks' not in face or not face['landmarks']:
+                    print(f"[FUSION] WARNING: Face {face.get('id', 'unknown')} missing landmarks")
+                
+                # Ensure centroid is present
+                if 'centroid' not in face:
+                    if 'bbox' in face:
+                        bbox = face['bbox']
+                        face['centroid'] = ((bbox[0] + bbox[2]) / 2 / resolution[0], 
+                                        (bbox[1] + bbox[3]) / 2 / resolution[1])
+                    else:
+                        face['centroid'] = (0.5, 0.5)
+            # Update score buffer
+            for face in latest_face_data:
+                if 'global_id' in face and 'blend' in face:
+                    try:
+                        score_buffer.write(face['blend'])
+                        break  # Only write first face
+                    except:
+                        pass
+        
+        frame_count += 1
+        
+        if frame_count % 240 == 0:
+            print(f"[FUSION] Frame {frame_count}: {len(latest_face_data)} faces, {len(latest_pose_data)} poses")
+    
+    print(f"[FUSION] Stopping for camera {cam_idx}")
 
 def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
                                fps, enable_mesh, enable_pose,
@@ -1453,34 +1123,29 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
                                worker_pipe, correlation_queue,
                                max_participants,
                                resolution,
-                               enhanced_mode=False,
                                retinaface_model_path=None,
                                arcface_model_path=None,
                                enable_recognition=False):
     """
-    Unified parallel participant worker supporting both standard and enhanced modes.
-    
-    This is the main entry point that spawns face/pose workers and fusion process.
+    Parallel participant worker with latest-frame-only approach
     """
-    mode = "ENHANCED" if enhanced_mode else "STANDARD"
     print(f"\n{'='*60}")
-    print(f"[PARALLEL WORKER] Camera {cam_idx} starting in {mode} mode")
-    print(f"[PARALLEL WORKER] Resolution: {resolution}")
-    print(f"[PARALLEL WORKER] FPS: {fps}")
-    print(f"[PARALLEL WORKER] Face: {'Enabled' if True else 'Disabled'}")
-    print(f"[PARALLEL WORKER] Pose: {'Enabled' if enable_pose else 'Disabled'}")
-    if enhanced_mode:
-        print(f"[PARALLEL WORKER] Face Recognition: {'Enabled' if enable_recognition else 'Disabled'}")
+    print(f"[PARALLEL WORKER] Camera {cam_idx} starting with LATEST FRAME ONLY")
     print(f"{'='*60}\n")
     
     # Initialize shared buffer
     score_buffer = NumpySharedBuffer(name=score_buffer_name)
     
-    # Create queues
-    face_frame_queue = MPQueue(maxsize=2)
-    pose_frame_queue = MPQueue(maxsize=2) if enable_pose else None
-    face_result_queue = MPQueue(maxsize=10)
-    pose_result_queue = MPQueue(maxsize=10) if enable_pose else None
+    # Use queue size 1 for all queues - latest frame only
+    face_frame_queue = MPQueue(maxsize=1)
+    pose_frame_queue = MPQueue(maxsize=1) if enable_pose else None
+    fusion_frame_queue = MPQueue(maxsize=1)
+    face_result_queue = MPQueue(maxsize=1)
+    pose_result_queue = MPQueue(maxsize=1) if enable_pose else None
+        
+    # No throttling - process frames at camera framerate
+    face_throttler = None
+    pose_throttler = None
     
     # Create control pipes
     face_control_parent, face_control_child = Pipe()
@@ -1489,20 +1154,28 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     # Start frame distributor with dual-stream configuration
     distributor = FrameDistributor(cam_idx, resolution, fps)
     
-    # Face gets full resolution in enhanced mode, downsampled in standard
+    # Face gets full resolution (from spinbox) with no throttling
     distributor.add_subscriber({
-        'queue': face_frame_queue,
-        'full_res': enhanced_mode,
-        'name': 'face'
-    })
-    
-    # Pose always gets downsampled
+    'queue': face_frame_queue,
+    'full_res': True,  # Always full resolution from spinbox
+    'name': 'face',
+    'throttler': None  # No throttling for face detection
+})
+    # Pose always gets downsampled to 480p max
     if enable_pose:
         distributor.add_subscriber({
             'queue': pose_frame_queue,
-            'full_res': False,
-            'name': 'pose'
+            'full_res': False,  # Always downsampled to 480p
+            'name': 'pose',
+            'throttler': None
         })
+
+    # Fusion/GUI always gets downsampled to 480p for preview
+    distributor.add_subscriber({
+        'queue': fusion_frame_queue,
+        'full_res': False,  # Always downsampled for GUI preview
+        'name': 'fusion'
+    })
     
     distributor.start()
     
@@ -1513,9 +1186,9 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     face_proc = Process(
         target=face_worker_process,
         args=(face_frame_queue, face_result_queue, face_model_path, enable_mesh, 
-              face_control_child, enhanced_mode, retinaface_model_path, 
+              face_control_child, retinaface_model_path, 
               arcface_model_path, enable_recognition),
-        kwargs={'downscale_resolution': (640, 480)}
+        kwargs={'downscale_resolution': (1920, 1080), 'max_participants': max_participants}
     )
     face_proc.start()
     processes.append(face_proc)
@@ -1532,7 +1205,7 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     # Fusion process
     fusion_proc = Process(
         target=fusion_process,
-        args=(face_result_queue, pose_result_queue, preview_queue, score_buffer,
+        args=(face_result_queue, pose_result_queue, fusion_frame_queue, preview_queue, score_buffer,
               result_pipe, recording_queue, lsl_queue, participant_update_queue,
               worker_pipe, correlation_queue, cam_idx, enable_pose, resolution, max_participants)
     )
@@ -1541,9 +1214,36 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     
     print(f"[PARALLEL WORKER] All processes started for camera {cam_idx}")
     
-    # Monitor loop
+    # Monitor loop with queue statistics
+    last_stats_time = time.time()
     try:
         while True:
+            # Print queue statistics periodically
+            current_time = time.time()
+            if DEBUG_QUEUES and current_time - last_stats_time > QUEUE_STATS_INTERVAL:
+                print(f"\n[QUEUE STATS] Camera {cam_idx}:")
+                for name, queue in [("face_frame", face_frame_queue),
+                                   ("face_result", face_result_queue),
+                                   ("fusion_frame", fusion_frame_queue)]:
+                    if queue:
+                        try:
+                            qsize = queue.qsize()
+                            full = queue.full()
+                            print(f"  {name}: size={qsize}, full={full}")
+                        except:
+                            print(f"  {name}: status unknown")
+                if enable_pose:
+                    for name, queue in [("pose_frame", pose_frame_queue),
+                                       ("pose_result", pose_result_queue)]:
+                        if queue:
+                            try:
+                                qsize = queue.qsize()
+                                full = queue.full()
+                                print(f"  {name}: size={qsize}, full={full}")
+                            except:
+                                print(f"  {name}: status unknown")
+                last_stats_time = current_time
+            
             # Check both control pipes (GUI sends on result_pipe)
             if result_pipe.poll():
                 msg = result_pipe.recv()
@@ -1612,18 +1312,7 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     print(f"[PARALLEL WORKER] Camera {cam_idx} stopped")
 
 
-# Factory function for backward compatibility
-def create_parallel_worker(enhanced_mode=False):
-    """Factory function to create appropriate worker based on mode"""
-    def worker(*args, **kwargs):
-        # Add enhanced mode parameters if not present
-        if 'enhanced_mode' not in kwargs:
-            kwargs['enhanced_mode'] = enhanced_mode
-        return parallel_participant_worker(*args, **kwargs)
-    return worker
-
-
 # Aliases for compatibility
-ParallelWorker = create_parallel_worker
+ParallelWorker = parallel_participant_worker
 parallel_participant_worker_standard = parallel_participant_worker
-parallel_participant_worker_advanced = lambda *args, **kwargs: parallel_participant_worker(*args, enhanced_mode=True, **kwargs)
+parallel_participant_worker_advanced = parallel_participant_worker

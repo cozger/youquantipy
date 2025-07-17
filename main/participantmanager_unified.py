@@ -1,4 +1,4 @@
-# Unified participant manager supporting both standard and enhanced modes
+# Participant manager with face recognition features
 
 import numpy as np
 from collections import defaultdict
@@ -10,30 +10,26 @@ from typing import Dict, Optional, Tuple, List
 
 class GlobalParticipantManager:
     """
-    Unified participant manager that supports both standard and enhanced modes.
+    Participant manager with face recognition features.
     Manages participant IDs globally across all cameras using Procrustes shape analysis
-    and optionally face recognition embeddings.
+    and face recognition embeddings.
     """
-    def __init__(self, max_participants=2, shape_weight=0.7, position_weight=0.3,
-                 recognition_weight=0.0, enable_recognition=False):
+    def __init__(self, max_participants=2, shape_weight=0.5, position_weight=0.2,
+                 recognition_weight=0.3):
         # Core participant tracking
         self.participants = {}  # {global_id: ParticipantInfo or dict}
         self.next_global_id = 1
         self.lock = threading.Lock()
         
-        # Mode configuration
-        self.enable_recognition = enable_recognition
-        self.use_advanced_features = enable_recognition
-        
         # Matching thresholds
         self.distance_threshold = 0.20  # 20% of screen for position matching
         self.procrustes_threshold = 0.02  # Procrustes distance threshold
-        self.recognition_threshold = 0.7  # Face recognition similarity (enhanced mode)
+        self.recognition_threshold = 0.7  # Face recognition similarity
         
         # Weights for matching
-        self.shape_weight = shape_weight if not enable_recognition else 0.5
-        self.position_weight = position_weight if not enable_recognition else 0.2
-        self.recognition_weight = recognition_weight if enable_recognition else 0.0
+        self.shape_weight = shape_weight
+        self.position_weight = position_weight
+        self.recognition_weight = recognition_weight
         
         # Tracking parameters
         self.max_participants = max_participants
@@ -41,22 +37,21 @@ class GlobalParticipantManager:
         self.recently_lost_timeout = 10.0
         self.participant_names = {}
         
-        # Enhanced mode specific
-        if self.use_advanced_features:
-            self.track_to_participant = {}  # {(camera_idx, track_id): participant_id}
-            self.participant_embeddings = {}  # {participant_id: deque of embeddings}
-            self.embedding_cache = {}  # {participant_id: averaged embedding}
-            self.max_embeddings_per_participant = 10
-            self.embedding_similarity_threshold = 0.65
-            self.match_stats = {
-                'position_matches': 0,
-                'shape_matches': 0,
-                'recognition_matches': 0,
-                'new_participants': 0
-            }
+        # Face recognition features
+        self.track_to_participant = {}  # {(camera_idx, track_id): participant_id}
+        self.participant_embeddings = {}  # {participant_id: deque of embeddings}
+        self.embedding_cache = {}  # {participant_id: averaged embedding}
+        self.max_embeddings_per_participant = 10
+        self.embedding_similarity_threshold = 0.65
+        self.match_stats = {
+            'position_matches': 0,
+            'shape_matches': 0,
+            'recognition_matches': 0,
+            'new_participants': 0
+        }
     
     class ParticipantInfo:
-        """Enhanced participant info for advanced mode"""
+        """Participant info with face recognition capabilities"""
         def __init__(self, global_id, camera, centroid, shape=None, local_id=None):
             self.global_id = global_id
             self.camera = camera
@@ -91,9 +86,6 @@ class GlobalParticipantManager:
     
     def update_participant_embedding(self, participant_id: int, embedding: np.ndarray):
         """Store and update participant embedding for face recognition"""
-        if not self.use_advanced_features:
-            return
-        
         with self.lock:
             if participant_id not in self.participant_embeddings:
                 from collections import deque
@@ -114,7 +106,7 @@ class GlobalParticipantManager:
     
     def find_matching_participant_by_embedding(self, query_embedding: np.ndarray) -> Tuple[Optional[int], float]:
         """Find participant with most similar embedding"""
-        if not self.use_advanced_features or not self.embedding_cache:
+        if not self.embedding_cache:
             return None, 0.0
         
         with self.lock:
@@ -150,41 +142,22 @@ class GlobalParticipantManager:
     
     def update_participant(self, camera_idx, local_tracker_id, centroid, shape=None, embedding=None):
         """
-        Standard mode update - maintains backward compatibility.
+        Update participant using face recognition features.
         Returns the global participant ID (1, 2, 3, etc.)
         """
         with self.lock:
-            if self.use_advanced_features and embedding is not None:
-                # Enhanced mode with embeddings
+            if embedding is not None:
+                # Update with embeddings
                 return self._match_or_create_participant_with_embedding(
                     camera_idx, local_tracker_id, centroid, shape, embedding)
-            elif self.use_advanced_features:
-                # Advanced mode without embeddings
-                return self._match_or_create_participant(camera_idx, local_tracker_id, centroid, shape)
             else:
-                # Standard mode logic (original implementation)
-                return self._update_participant_standard(camera_idx, local_tracker_id, centroid, shape)
+                # Update without embeddings
+                return self._match_or_create_participant(camera_idx, local_tracker_id, centroid, shape)
     
     def update_from_advanced_detection(self, camera_idx: int, face_data: List[Dict]) -> Dict[int, int]:
         """
-        Enhanced mode update - processes face detection results with recognition.
-        Only available in enhanced mode.
+        Process face detection results with recognition.
         """
-        if not self.use_advanced_features:
-            # Fallback to standard processing
-            track_to_participant = {}
-            for face in face_data:
-                track_id = face.get('track_id')
-                centroid = face.get('centroid')
-                landmarks = face.get('landmarks')
-                shape = np.array(landmarks)[:, :2] if landmarks else None
-                
-                global_id = self.update_participant(camera_idx, track_id, centroid, shape)
-                if global_id:
-                    track_to_participant[track_id] = global_id
-            return track_to_participant
-        
-        # Enhanced mode processing
         with self.lock:
             current_time = time.time()
             track_to_participant = {}
@@ -202,7 +175,7 @@ class GlobalParticipantManager:
                     shape = np.array(landmarks)[:, :2]
                 
                 # If face recognition assigned a participant ID
-                if self.enable_recognition and participant_id >= 0:
+                if participant_id >= 0:
                     # Check if this participant ID is already tracked
                     if participant_id in self.participants:
                         # Update existing participant
@@ -244,163 +217,9 @@ class GlobalParticipantManager:
             
             return track_to_participant
     
-    def _update_participant_standard(self, camera_idx, local_tracker_id, centroid, shape):
-        """Standard mode participant update logic"""
-        current_time = time.time()
-        
-        # First, try to match with existing active participants
-        best_match = None
-        best_score = float('inf')
-        
-        for global_id, info in self.participants.items():
-            # Handle both dict and ParticipantInfo
-            if isinstance(info, self.ParticipantInfo):
-                info_dict = info.to_dict()
-            else:
-                info_dict = info
-            
-            # Skip if from different camera and too recent
-            if info_dict['camera'] != camera_idx and current_time - info_dict['last_seen'] < 0.5:
-                continue
-            
-            # Calculate combined score
-            score = self._combined_score(
-                centroid, info_dict['centroid'],
-                shape, info_dict.get('shape')
-            )
-            
-            # Apply thresholds based on context
-            if info_dict['camera'] == camera_idx:
-                # Same camera - use standard thresholds
-                threshold = 0.5  # Combined score threshold
-            else:
-                # Different camera - be more strict with shape matching
-                if shape is not None and info_dict.get('shape') is not None:
-                    shape_dist = self._procrustes_distance(shape, info_dict['shape'])
-                    # Only accept cross-camera match if shape is very similar
-                    if shape_dist > self.procrustes_threshold:
-                        continue
-                threshold = 0.3
-            
-            if score < threshold and score < best_score:
-                best_score = score
-                best_match = global_id
-
-        if best_match:
-            # Update existing participant
-            if isinstance(self.participants[best_match], self.ParticipantInfo):
-                participant = self.participants[best_match]
-                old_shape = participant.shape
-                participant.camera = camera_idx
-                participant.centroid = centroid
-                participant.shape = shape if shape is not None else old_shape
-                participant.last_seen = current_time
-                participant.local_id = local_tracker_id
-            else:
-                old_shape = self.participants[best_match].get('shape')
-                self.participants[best_match] = {
-                    'camera': camera_idx,
-                    'centroid': centroid,
-                    'last_seen': current_time,
-                    'local_id': local_tracker_id,
-                    'shape': shape if shape is not None else old_shape
-                }
-            
-            return best_match
-        
-        # No match in active participants - check recently lost
-        best_lost_id = None
-        best_lost_score = float('inf')
-        
-        for lost_id, lost_info in self.recently_lost.items():
-            # Only consider IDs within our max range
-            if lost_id > self.max_participants:
-                continue
-            
-            # Calculate combined score
-            score = self._combined_score(
-                centroid, lost_info['centroid'],
-                shape, lost_info.get('shape')
-            )
-            
-            # For shape-based matching, prioritize shape over position
-            if shape is not None and lost_info.get('shape') is not None:
-                shape_dist = self._procrustes_distance(shape, lost_info['shape'])
-                # Strong shape match can override position
-                if shape_dist < self.procrustes_threshold:
-                    score = shape_dist  # Use shape score directly
-            
-            if score < best_lost_score:
-                best_lost_score = score
-                best_lost_id = lost_id
-        
-        # Use recently lost participant if good match
-        if best_lost_id is not None and best_lost_score < 0.3:  # Strict threshold
-            # Reactivate lost participant
-            lost_info = self.recently_lost[best_lost_id]
-            if self.use_advanced_features:
-                participant = self.ParticipantInfo(
-                    best_lost_id, camera_idx, centroid,
-                    shape if shape is not None else lost_info.get('shape'),
-                    local_tracker_id
-                )
-                self.participants[best_lost_id] = participant
-            else:
-                self.participants[best_lost_id] = {
-                    'camera': camera_idx,
-                    'centroid': centroid,
-                    'last_seen': current_time,
-                    'local_id': local_tracker_id,
-                    'shape': shape if shape is not None else lost_info.get('shape')
-                }
-            del self.recently_lost[best_lost_id]
-            
-            return best_lost_id
-        
-        # Count active participants
-        active_count = len([p for p in self.participants.values() 
-                          if current_time - (p.last_seen if isinstance(p, self.ParticipantInfo) 
-                             else p['last_seen']) < 1.0])
-        
-        if active_count >= self.max_participants:
-            print(f"[ParticipantManager] Max participants ({self.max_participants}) reached.")
-            return None
-        
-        # Create new participant - use the lowest available ID
-        new_id = None
-        for potential_id in range(1, self.max_participants + 1):
-            if (potential_id not in self.participants and 
-                potential_id not in self.recently_lost):
-                new_id = potential_id
-                break
-        
-        if new_id is None:
-            print(f"[ParticipantManager] Error: No available IDs within max_participants range")
-            return None
-        
-        # Create the participant
-        if self.use_advanced_features:
-            participant = self.ParticipantInfo(new_id, camera_idx, centroid, shape, local_tracker_id)
-            self.participants[new_id] = participant
-        else:
-            self.participants[new_id] = {
-                'camera': camera_idx,
-                'centroid': centroid,
-                'last_seen': current_time,
-                'local_id': local_tracker_id,
-                'shape': shape
-            }
-        
-        shape_info = "with shape" if shape is not None else "no shape"
-        print(f"[ParticipantManager] Created participant {new_id} ({shape_info})")
-        
-        return new_id
     
     def _match_or_create_participant(self, camera_idx, track_id, centroid, shape):
-        """Enhanced mode matching logic"""
-        if not self.use_advanced_features:
-            return self._update_participant_standard(camera_idx, track_id, centroid, shape)
-        
+        """Matching logic for participants"""
         current_time = time.time()
         
         # Try to match with existing participants
@@ -413,7 +232,7 @@ class GlobalParticipantManager:
                 participant = self._dict_to_participant_info(pid, participant)
                 self.participants[pid] = participant
             
-            # Skip if from same camera (can't be same person in enhanced mode)
+            # Skip if from same camera (can't be same person)
             if participant.camera == camera_idx:
                 continue
             
@@ -469,7 +288,7 @@ class GlobalParticipantManager:
             self.match_stats['new_participants'] += 1
             return new_id
         
-        # Find least confident participant to replace (enhanced mode only)
+        # Find least confident participant to replace
         if self.participants:
             least_confident_id = None
             min_confidence = float('inf')
@@ -500,7 +319,7 @@ class GlobalParticipantManager:
         return 1  # Default fallback
     
     def _match_or_create_participant_with_embedding(self, camera_idx, track_id, centroid, shape, embedding):
-        """Enhanced matching with embeddings, shape, and position"""
+        """Matching with embeddings, shape, and position"""
         current_time = time.time()
         
         # First try embedding matching
@@ -559,7 +378,7 @@ class GlobalParticipantManager:
     
     def _create_participant_from_recognition(self, participant_id, camera_idx, 
                                            track_id, centroid, shape):
-        """Create participant from face recognition result (enhanced mode)"""
+        """Create participant from face recognition result"""
         if participant_id not in self.participants:
             # Map recognition ID to our 1-based system
             if participant_id >= self.max_participants:
@@ -597,11 +416,8 @@ class GlobalParticipantManager:
             # Normalize by number of points
             normalized_distance = np.sqrt(disparity / len(shape1))
             
-            # Further normalize for enhanced mode
-            if self.use_advanced_features:
-                return normalized_distance / self.procrustes_threshold
-            
-            return normalized_distance
+            # Normalize distance
+            return normalized_distance / self.procrustes_threshold
             
         except Exception as e:
             print(f"[ParticipantManager] Procrustes error: {e}")
@@ -622,18 +438,12 @@ class GlobalParticipantManager:
             return pos_score
         
         # Weighted combination
-        if self.use_advanced_features:
-            # Enhanced mode: different weighting
-            total_weight = self.position_weight + self.shape_weight + self.recognition_weight
-            if total_weight > 0:
-                combined = (self.position_weight * pos_score + 
-                           self.shape_weight * shape_score) / (self.position_weight + self.shape_weight)
-            else:
-                combined = pos_score
+        total_weight = self.position_weight + self.shape_weight + self.recognition_weight
+        if total_weight > 0:
+            combined = (self.position_weight * pos_score + 
+                       self.shape_weight * shape_score) / (self.position_weight + self.shape_weight)
         else:
-            # Standard mode: original weighting
-            combined = (self.shape_weight * shape_score + 
-                       self.position_weight * pos_score)
+            combined = pos_score
         
         return combined
     
@@ -746,9 +556,9 @@ class GlobalParticipantManager:
             self.participants.clear()
             self.recently_lost.clear()
             self.next_global_id = 1
-            if self.use_advanced_features:
-                self.track_to_participant.clear()
-                self.participant_embeddings.clear()
+            self.track_to_participant.clear()
+            self.participant_embeddings.clear()
+            self.embedding_cache.clear()
     
     def get_active_participants(self):
         """Get list of currently active participant IDs"""
@@ -765,12 +575,9 @@ class GlobalParticipantManager:
                     active.append(global_id)
             return sorted(active)
     
-    # Enhanced mode specific methods
+    # Face recognition specific methods
     def update_enrollment_status(self, enrollment_status: Dict):
-        """Update enrollment status from face recognition (enhanced mode only)."""
-        if not self.use_advanced_features:
-            return
-            
+        """Update enrollment status from face recognition."""
         with self.lock:
             for participant_id, status in enrollment_status.items():
                 # Convert to 1-based ID
@@ -785,12 +592,11 @@ class GlobalParticipantManager:
                         )
     
     def get_all_participants(self):
-        """Get all active participants with their info (enhanced mode returns more details)."""
+        """Get all active participants with their info."""
         with self.lock:
             result = {}
             for pid, participant in self.participants.items():
                 if isinstance(participant, self.ParticipantInfo):
-                    # Enhanced mode
                     result[pid] = {
                         'camera': participant.camera,
                         'centroid': participant.centroid,
@@ -800,34 +606,32 @@ class GlobalParticipantManager:
                         'name': self.get_participant_name(pid)
                     }
                 else:
-                    # Standard mode
+                    # Convert old dict format to ParticipantInfo
+                    participant_info = self._dict_to_participant_info(pid, participant)
+                    self.participants[pid] = participant_info
                     result[pid] = {
-                        'camera': participant['camera'],
-                        'centroid': participant['centroid'],
-                        'last_seen': participant['last_seen'],
+                        'camera': participant_info.camera,
+                        'centroid': participant_info.centroid,
+                        'last_seen': participant_info.last_seen,
+                        'confidence': participant_info.confidence,
+                        'enrollment_status': participant_info.enrollment_status,
                         'name': self.get_participant_name(pid)
                     }
             return result
     
     def get_stats(self):
-        """Get matching statistics (enhanced mode only)."""
+        """Get matching statistics."""
         with self.lock:
-            if self.use_advanced_features:
-                return {
-                    'active_participants': len(self.participants),
-                    'recently_lost': len(self.recently_lost),
-                    'match_stats': self.match_stats.copy()
-                }
-            else:
-                return {
-                    'active_participants': len(self.participants),
-                    'recently_lost': len(self.recently_lost)
-                }
+            return {
+                'active_participants': len(self.participants),
+                'recently_lost': len(self.recently_lost),
+                'match_stats': self.match_stats.copy()
+            }
     
     # Backward compatibility methods
     def cleanup_stale_participants(self):
-        """Legacy cleanup method for enhanced mode compatibility."""
-        self.cleanup_old_participants(timeout=2.0 if self.use_advanced_features else 5.0)
+        """Legacy cleanup method for compatibility."""
+        self.cleanup_old_participants(timeout=2.0)
     
     def _get_next_available_id(self):
         """Get next available participant ID starting from 1."""
@@ -846,18 +650,21 @@ class GlobalParticipantManager:
             info_dict.get('local_id')
         )
         participant.last_seen = info_dict['last_seen']
+        participant.confidence = 1.0
+        participant.enrollment_status = 'unknown'
+        participant.appearance_count = 1
+        participant.embedding_mean = None
         return participant
 
 
 # For backward compatibility, keep the advanced class as an alias
 class GlobalParticipantManagerAdvanced(GlobalParticipantManager):
-    """Alias for unified manager with enhanced mode enabled by default"""
+    """Alias for unified manager"""
     def __init__(self, max_participants=10, shape_weight=0.5, position_weight=0.2, 
-                 recognition_weight=0.3, enable_recognition=True):
+                 recognition_weight=0.3):
         super().__init__(
             max_participants=max_participants,
             shape_weight=shape_weight,
             position_weight=position_weight,
-            recognition_weight=recognition_weight,
-            enable_recognition=enable_recognition
+            recognition_weight=recognition_weight
         )
