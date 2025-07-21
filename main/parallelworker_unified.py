@@ -1,4 +1,4 @@
-# Parallel worker for face detection and processing
+# Parallel worker for face detection and processing - GPU ONLY VERSION
 
 import cv2
 import time
@@ -12,7 +12,8 @@ from multiprocessing import Process, Queue as MPQueue, Pipe, SimpleQueue
 import queue
 from sharedbuffer import NumpySharedBuffer
 from tracker import UnifiedTracker
-# Removed queue_manager imports - using native queue methods instead
+from frame_distributor import FrameDistributor
+
 import warnings
 import os
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -21,8 +22,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 DEBUG_QUEUES = True
 QUEUE_STATS_INTERVAL = 5.0  # Print queue stats every 5 seconds
 
-# Import detection components
-from retinaface_detector import RetinaFaceDetector
+# Import detection components - GPU ONLY
+from retinaface_detector_gpu import RetinaFaceDetectorGPU
 from lightweight_tracker import LightweightTracker
 from roi_processor import ROIProcessor
 from face_recognition_process import FaceRecognitionProcess
@@ -211,185 +212,44 @@ def robust_initialize_camera(camera_index, fps, resolution, settle_time=2.0, tar
 
     return cap
 
-class FrameDistributor:
-    """Distributes frames to multiple processing pipelines - LATEST ONLY"""
-    def __init__(self, camera_index, resolution, fps):
-        self.camera_index = camera_index
-        self.resolution = resolution
-        self.fps = fps
-        self.subscribers = []
-        self.running = False
-        
-    def add_subscriber(self, info):
-        """Add a subscriber with its configuration"""
-        self.subscribers.append(info)
-        
-    def start(self):
-        """Start frame distribution in a separate thread"""
-        self.running = True
-        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.thread.start()
-        
-    def stop(self):
-        """Stop frame distribution"""
-        self.running = False
-        if hasattr(self, 'thread'):
-            self.thread.join(timeout=2.0)
-            
-    def _capture_loop(self):
-        """Capture and distribute frames - LATEST ONLY"""
-        cap = robust_initialize_camera(self.camera_index, self.fps, self.resolution)
-        
-        frame_count = 0
-        
-        while self.running:
-            ret, frame_bgr = cap.read()
-            if ret:
-                # Convert once
-                rgb_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                
-                # ALWAYS create 480p version for GUI preview
-                h, w = frame_bgr.shape[:2]
-                gui_max_width = 640
-                gui_max_height = 480
-                scale = min(gui_max_width / w, gui_max_height / h, 1.0)
-                
-                if scale < 1.0:
-                    new_w = int(w * scale)
-                    new_h = int(h * scale)
-                    bgr_gui = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                    rgb_gui = cv2.cvtColor(bgr_gui, cv2.COLOR_BGR2RGB)
-                else:
-                    bgr_gui = frame_bgr
-                    rgb_gui = rgb_full
-                
-                # Create 640x640 version for face detection
-                detection_size = 640
-                detection_scale = min(detection_size / w, detection_size / h)
-                
-                if detection_scale < 1.0:
-                    det_w = int(w * detection_scale)
-                    det_h = int(h * detection_scale)
-                    # Resize to fit within 640x640 maintaining aspect ratio
-                    bgr_detection = cv2.resize(frame_bgr, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
-                    # Pad to exact 640x640
-                    pad_h = (detection_size - det_h) // 2
-                    pad_w = (detection_size - det_w) // 2
-                    bgr_detection = cv2.copyMakeBorder(bgr_detection, pad_h, detection_size - det_h - pad_h,
-                                                     pad_w, detection_size - det_w - pad_w,
-                                                     cv2.BORDER_CONSTANT, value=(0, 0, 0))
-                    rgb_detection = cv2.cvtColor(bgr_detection, cv2.COLOR_BGR2RGB)
-                    
-                    # Calculate scale factors for coordinate transformation
-                    detection_scale_x = w / det_w
-                    detection_scale_y = h / det_h
-                    detection_offset_x = pad_w
-                    detection_offset_y = pad_h
-                else:
-                    # Frame is smaller than 640x640, pad it
-                    pad_h = (detection_size - h) // 2
-                    pad_w = (detection_size - w) // 2
-                    bgr_detection = cv2.copyMakeBorder(frame_bgr, pad_h, detection_size - h - pad_h,
-                                                     pad_w, detection_size - w - pad_w,
-                                                     cv2.BORDER_CONSTANT, value=(0, 0, 0))
-                    rgb_detection = cv2.cvtColor(bgr_detection, cv2.COLOR_BGR2RGB)
-                    
-                    detection_scale_x = 1.0
-                    detection_scale_y = 1.0
-                    detection_offset_x = pad_w
-                    detection_offset_y = pad_h
-                
-                current_time = time.time()
-                
-                # Prepare frame data
-                frame_data_full = {
-                    'bgr': frame_bgr,
-                    'rgb': rgb_full,
-                    'timestamp': current_time,
-                    'frame_id': frame_count,
-                    'original_resolution': (w, h) 
-                }
-                
-                frame_data_gui = {
-                    'bgr': bgr_gui,  # Always 480p max
-                    'rgb': rgb_gui,  # Always 480p max
-                    'timestamp': current_time,
-                    'frame_id': frame_count,
-                    'original_resolution': (w, h) 
-                }
-                
-                # Face detection frame data with 640x640 detection frame and full resolution for ROI
-                frame_data_face = {
-                    'bgr': frame_bgr,  # Full resolution for ROI extraction
-                    'rgb': rgb_full,   # Full resolution for ROI extraction
-                    'rgb_detection': rgb_detection,  # 640x640 for detection
-                    'timestamp': current_time,
-                    'frame_id': frame_count,
-                    'original_resolution': (w, h),
-                    'detection_scale_x': detection_scale_x,
-                    'detection_scale_y': detection_scale_y,
-                    'detection_offset_x': detection_offset_x,
-                    'detection_offset_y': detection_offset_y
-                }
-                
-                # Send to subscribers
-                for sub in self.subscribers:
-                    # Fusion/preview always gets GUI resolution
-                    if sub['name'] == 'fusion':
-                        data = frame_data_gui
-                    elif sub['name'] == 'face':
-                        # Face detection gets special frame data with 640x640 detection frame
-                        data = frame_data_face
-                    else:
-                        # Others get full or GUI resolution based on setting
-                        data = frame_data_full if sub['full_res'] else frame_data_gui
-                    
-                    # Always try to send latest frame
-                    try:
-                        # First try to clear old frame
-                        try:
-                            sub['queue'].get_nowait()
-                        except:
-                            pass
-                        
-                        # Then put new frame
-                        sub['queue'].put_nowait(data)
-                        
-                    except Exception as e:
-                        # Queue is busy, skip this frame
-                        pass
-                
-                frame_count += 1
-                
-                if frame_count % 240 == 0:
-                    print(f"[Frame Distributor] Distributed frame {frame_count}")
-                    print(f"  Original resolution: {w}x{h}")
-                    print(f"  Detection frame: 640x640 (scale_x={detection_scale_x:.3f}, scale_y={detection_scale_y:.3f})")
-                    print(f"  GUI frame: {bgr_gui.shape[1]}x{bgr_gui.shape[0]}")
-        
-        cap.release()
 
 def face_detection_process(detection_queue, detection_result_queue, 
                           retinaface_model_path: str, control_pipe, debug_queue=None):
-    """Face detection - LATEST FRAME ONLY"""
-    print("[FACE DETECTOR] Starting with LATEST FRAME ONLY approach")
+    """Face detection - GPU ONLY VERSION with frame ID synchronization"""
+    print("[FACE DETECTOR] Starting GPU-ONLY face detection")
     
     # Get configuration
     config = ConfigHandler()
     confidence_threshold = config.get('advanced_detection.detection_confidence', 0.3)
     nms_threshold = config.get('advanced_detection.nms_threshold', 0.4)
     
-    # Initialize detector
-    detector = RetinaFaceDetector(
-        model_path=retinaface_model_path,
-        confidence_threshold=confidence_threshold,
-        nms_threshold=nms_threshold,
-        debug_queue=debug_queue
-    )
+    # Initialize GPU detector - NO FALLBACK
+    try:
+        detector = RetinaFaceDetectorGPU(
+            model_path=retinaface_model_path,
+            confidence_threshold=confidence_threshold,
+            nms_threshold=nms_threshold,
+            debug_queue=debug_queue,
+            max_batch_size=4
+        )
+        print("[FACE DETECTOR] GPU detector initialized successfully")
+    except Exception as e:
+        print(f"[FACE DETECTOR] FATAL ERROR: GPU detector initialization failed: {e}")
+        print("[FACE DETECTOR] This version requires GPU acceleration. Please ensure:")
+        print("  1. NVIDIA GPU with CUDA support is available")
+        print("  2. TensorRT/ONNX Runtime GPU is properly installed")
+        print("  3. CUDA drivers are up to date")
+        raise RuntimeError("GPU detector initialization failed - cannot continue")
+    
     detector.start()
     
     frame_count = 0
-    detection_interval = 7
+    detection_interval = 3
+    latest_frame_id = 0  # Track the actual latest frame ID received
+    
+    # FIX: Track pending detections to match with results
+    pending_detections = {}  # frame_id -> frame_data
+    MAX_PENDING = 20  # Don't keep too many pending frames
     
     while True:
         # Check for control messages
@@ -398,92 +258,183 @@ def face_detection_process(detection_queue, detection_result_queue,
             if msg == 'stop':
                 break
         
-        # Always get LATEST frame only
+        # Get frame - try to get the most recent one by dropping old frames
         frame_data = None
-        dropped = 0
+        frames_dropped = 0
         
-        # Drain queue to get latest
+        # Drop old frames if queue has multiple items
         while True:
             try:
-                frame_data = detection_queue.get_nowait()
-                dropped += 1
+                # Try to get a frame without blocking
+                new_frame = detection_queue.get_nowait()
+                if frame_data is not None:
+                    # We already had a frame, so the previous one was old
+                    frames_dropped += 1
+                frame_data = new_frame
             except:
+                # Queue is empty, use the last frame we got (if any)
                 break
         
+        # If we still don't have a frame, wait for one
         if frame_data is None:
-            # No frame available, wait for one
             try:
                 frame_data = detection_queue.get(timeout=0.1)
             except:
-                continue
+                # No frame available, check for detection results
+                pass
         
-        if dropped > 1:
-            print(f"[FACE DETECTOR] Dropped {dropped-1} old frames")
+        if frames_dropped > 0 and frame_count % 30 == 0:
+            print(f"[FACE DETECTOR] Dropped {frames_dropped} old frames to catch up")
         
-        # Use 640x640 detection frame if available, otherwise fall back to full resolution
-        if 'rgb_detection' in frame_data:
-            rgb_detection = frame_data['rgb_detection']
-            detection_scale_x = frame_data['detection_scale_x']
-            detection_scale_y = frame_data['detection_scale_y']
-            detection_offset_x = frame_data['detection_offset_x']
-            detection_offset_y = frame_data['detection_offset_y']
-        else:
-            # Fallback for backward compatibility
-            rgb_detection = frame_data['rgb']
-            detection_scale_x = 1.0
-            detection_scale_y = 1.0
-            detection_offset_x = 0
-            detection_offset_y = 0
+        if frame_data is not None:
+            frame_count += 1
+            
+            # Extract frame ID first to track actual frame numbers
+            frame_id = frame_data['frame_id']
+            
+            # Validate frame ID to detect wraparound or reset
+            if latest_frame_id > 0 and frame_id < latest_frame_id - 1000:
+                print(f"[FACE DETECTOR] WARNING: Frame ID jumped backwards: {latest_frame_id} -> {frame_id}")
+                print(f"[FACE DETECTOR] This may indicate frame ID wraparound or reset")
+            elif frame_id > latest_frame_id + 1000:
+                print(f"[FACE DETECTOR] WARNING: Large frame ID jump: {latest_frame_id} -> {frame_id}")
+                print(f"[FACE DETECTOR] Possible frame drops or sync issue")
+            
+            latest_frame_id = frame_id  # Update latest frame ID
+            
+            # Extract all necessary data
+            if 'rgb_detection' in frame_data:
+                rgb_detection = frame_data['rgb_detection']
+                detection_scale_x = frame_data['detection_scale_x']
+                detection_scale_y = frame_data['detection_scale_y']
+                detection_offset_x = frame_data['detection_offset_x']
+                detection_offset_y = frame_data['detection_offset_y']
+            else:
+                # Use full resolution frame
+                rgb_detection = frame_data['rgb']
+                detection_scale_x = 1.0
+                detection_scale_y = 1.0
+                detection_offset_x = 0
+                detection_offset_y = 0
+            
+            timestamp = frame_data['timestamp']
+            
+            # Store frame data for later coordinate transformation
+            pending_detections[frame_id] = {
+                'timestamp': timestamp,
+                'detection_scale_x': detection_scale_x,
+                'detection_scale_y': detection_scale_y,
+                'detection_offset_x': detection_offset_x,
+                'detection_offset_y': detection_offset_y,
+                'submitted_at': time.time()
+            }
+            
+            # Clean old pending detections
+            if len(pending_detections) > MAX_PENDING:
+                oldest_ids = sorted(pending_detections.keys())[:len(pending_detections) - MAX_PENDING]
+                for old_id in oldest_ids:
+                    del pending_detections[old_id]
+                    print(f"[FACE DETECTOR] Dropped pending detection for old frame {old_id}")
+            
+            # Submit for detection at intervals
+            if frame_id % detection_interval == 0:
+                detector.submit_frame(rgb_detection, frame_id)
+                if frame_id % 60 == 0:
+                    print(f"[FACE DETECTOR] Submitted frame {frame_id} for detection: shape={rgb_detection.shape}, " +
+                          f"scale=({detection_scale_x:.3f}, {detection_scale_y:.3f})")
         
-        frame_id = frame_data['frame_id']
-        timestamp = frame_data['timestamp']
-        
-        # Submit for detection at intervals
-        if frame_id % detection_interval == 0:
-            detector.submit_frame(rgb_detection, frame_id)
-            if frame_count % 60 == 0:
-                print(f"[FACE DETECTOR] Submitted detection frame: shape={rgb_detection.shape}, " +
-                      f"scale=({detection_scale_x:.3f}, {detection_scale_y:.3f})")
-        
-        # Check for results
+        # Always check for detection results (even if no new frame)
         detection_result = detector.get_detections(timeout=0.001)
         if detection_result:
             det_frame_id, detections = detection_result
             
-            # Transform detection coordinates from 640x640 to original resolution
-            for detection in detections:
-                bbox = detection['bbox']
-                # Remove padding offset and scale to original resolution
-                bbox[0] = (bbox[0] - detection_offset_x) * detection_scale_x
-                bbox[1] = (bbox[1] - detection_offset_y) * detection_scale_y
-                bbox[2] = (bbox[2] - detection_offset_x) * detection_scale_x
-                bbox[3] = (bbox[3] - detection_offset_y) * detection_scale_y
-            
-            # Send result - drop old if queue full
-            try:
-                # Clear old result
-                try:
-                    detection_result_queue.get_nowait()
-                except:
-                    pass
-                    
-                # Put new result
-                detection_result_queue.put_nowait({
+            # Look up the pending frame data
+            if det_frame_id in pending_detections:
+                frame_info = pending_detections[det_frame_id]
+                
+                # Transform detection coordinates from detection space to original resolution
+                for detection in detections:
+                    bbox = detection['bbox']
+                    # Remove padding offset and scale to original resolution
+                    bbox[0] = (bbox[0] - frame_info['detection_offset_x']) * frame_info['detection_scale_x']
+                    bbox[1] = (bbox[1] - frame_info['detection_offset_y']) * frame_info['detection_scale_y']
+                    bbox[2] = (bbox[2] - frame_info['detection_offset_x']) * frame_info['detection_scale_x']
+                    bbox[3] = (bbox[3] - frame_info['detection_offset_y']) * frame_info['detection_scale_y']
+                
+                # Calculate detection latency
+                detection_latency = time.time() - frame_info['submitted_at']
+                
+                # Send result with proper frame ID and metadata
+                result = {
                     'frame_id': det_frame_id,
                     'detections': detections,
-                    'timestamp': timestamp
-                })
-            except:
-                pass
+                    'timestamp': frame_info['timestamp'],
+                    'detection_latency': detection_latency,
+                    'current_frame': latest_frame_id  # Use actual frame ID for debugging
+                }
+                
+                # Send to result queue - always send the latest result
+                try:
+                    # Clear old results first
+                    old_results_dropped = 0
+                    while not detection_result_queue.empty():
+                        try:
+                            old_result = detection_result_queue.get_nowait()
+                            old_results_dropped += 1
+                        except:
+                            break
+                    
+                    if old_results_dropped > 0:
+                        print(f"[FACE DETECTOR] Dropped {old_results_dropped} old detection results")
+                    
+                    detection_result_queue.put_nowait(result)
+                    
+                    print(f"[FACE DETECTOR] Sent {len(detections)} detections for frame {det_frame_id} " +
+                          f"(current frame: {latest_frame_id}, delay: {latest_frame_id - det_frame_id} frames, " +
+                          f"latency: {detection_latency*1000:.1f}ms)")
+                    
+                    # Debug info if requested
+                    if debug_queue and len(detections) > 0:
+                        debug_info = {
+                            'frame_id': det_frame_id,
+                            'raw_detections': detections,
+                            'detection_delay': latest_frame_id - det_frame_id,
+                            'detection_latency_ms': detection_latency * 1000,
+                            'current_frame': latest_frame_id
+                        }
+                        try:
+                            debug_queue.put(debug_info, timeout=0.001)
+                        except:
+                            pass
+                    
+                except queue.Full:
+                    print(f"[FACE DETECTOR] Failed to send detection result - queue full")
+                
+                # Remove from pending
+                del pending_detections[det_frame_id]
+                
+            else:
+                print(f"[FACE DETECTOR] WARNING: Received detection for unknown frame {det_frame_id} " +
+                      f"(latest frame: {latest_frame_id}, processed: {frame_count})")
         
-        frame_count += 1
+        # Periodic status update
+        if frame_count % 300 == 0 and frame_count > 0:
+            print(f"[FACE DETECTOR] Status: processed {frame_count} frames (latest frame_id: {latest_frame_id}), " +
+                  f"{len(pending_detections)} pending detections")
+            
+            # Check for stale pending detections
+            current_time = time.time()
+            for fid, info in list(pending_detections.items()):
+                age = current_time - info['submitted_at']
+                if age > 2.0:  # 2 seconds is too old
+                    print(f"[FACE DETECTOR] WARNING: Frame {fid} detection pending for {age:.1f}s")
     
     detector.stop()
-
+    print("[FACE DETECTOR] Stopped")
 
 def face_landmark_process(roi_queue, landmark_result_queue, model_path: str,
                          enable_mesh: bool, control_pipe):
-    """Face landmark extraction - fixed queue handling"""
+    """Face landmark extraction - fixed for CPU MediaPipe"""
     print("[FACE LANDMARK] Starting landmark extraction process")
     
     # Initialize MediaPipe
@@ -535,6 +486,20 @@ def face_landmark_process(roi_queue, landmark_result_queue, model_path: str,
         quality_score = roi_data.get('quality_score', 0.5)
         frame_id = roi_data.get('frame_id', -1)
         
+        # IMPORTANT: Ensure ROI is CPU array and correct format
+        if not isinstance(roi, np.ndarray):
+            print(f"[FACE LANDMARK] Warning: ROI is not numpy array: {type(roi)}")
+            continue
+        
+        # Ensure contiguous memory and uint8 dtype
+        if not roi.flags['C_CONTIGUOUS'] or roi.dtype != np.uint8:
+            roi = np.ascontiguousarray(roi, dtype=np.uint8)
+        
+        # Verify ROI shape
+        if roi.shape != (256, 256, 3):
+            print(f"[FACE LANDMARK] Warning: Unexpected ROI shape: {roi.shape}")
+            continue
+        
         # Generate timestamp
         current_time = time.time()
         timestamp_ms = int((current_time - start_time) * 1000)
@@ -562,7 +527,7 @@ def face_landmark_process(roi_queue, landmark_result_queue, model_path: str,
                     
                     # Normalize back to 0-1 range for original frame
                     x_norm = x_orig / transform.get('frame_width', 1280)
-                    y_norm = y_orig / transform.get('frame_height', 720) #Defaults for 720p
+                    y_norm = y_orig / transform.get('frame_height', 720)
                     
                     landmarks.append((x_norm, y_norm, lm.z))
                 
@@ -615,6 +580,8 @@ def face_landmark_process(roi_queue, landmark_result_queue, model_path: str,
                     
         except Exception as e:
             print(f"[FACE LANDMARK] Error processing ROI: {e}")
+            import traceback
+            traceback.print_exc()
             failed_count += 1
     
     print(f"[FACE LANDMARK] Stopping... Processed {processed_count} ROIs")
@@ -627,15 +594,19 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
                        detection_interval: int = 7,
                        downscale_resolution: tuple = (640, 480),
                        max_participants: int = 10):
-    """Face worker process - fixed ROI extraction"""
-    print(f"[FACE WORKER] Starting with max_participants={max_participants}")
+    """Face worker process - GPU-ONLY VERSION"""
+    print(f"[FACE WORKER] Starting GPU-ONLY worker with max_participants={max_participants}")
+    
+    # Verify GPU model path is provided
+    if not retinaface_model_path:
+        raise ValueError("[FACE WORKER] FATAL: retinaface_model_path is required for GPU detection")
     
     # Create internal queues with appropriate sizes
-    detection_queue = MPQueue(maxsize=10)
-    detection_result_queue = MPQueue(maxsize=10)
-    roi_queue = MPQueue(maxsize=10)
-    landmark_result_queue = MPQueue(maxsize=10)
-    debug_detection_queue = MPQueue(maxsize=10)
+    detection_queue = MPQueue(maxsize=10)  # Reasonable size
+    detection_result_queue = MPQueue(maxsize=5)  # Allow multiple results
+    roi_queue = MPQueue(maxsize=5)
+    landmark_result_queue = MPQueue(maxsize=5)
+    debug_detection_queue = MPQueue(maxsize=1)
     
     # Create control pipes for sub-processes
     detector_parent, detector_child = Pipe()
@@ -655,15 +626,15 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
     )
     landmark_proc.start()
     
-    # Initialize tracker - THIS WAS MISSING!
+    # Initialize tracker
     tracker = LightweightTracker(
-        max_age=14,
+        max_age=30,  # Increase max age
         min_hits=1,
         iou_threshold=0.4,
         detection_interval=detection_interval,
-        min_hits_in_window=3,
-        window_cycles=4,
-        max_tracks=max_participants  # Use the actual max_participants value
+        min_hits_in_window=1,  # Reduce requirement
+        window_cycles=2,  # Shorter window
+        max_tracks=max_participants
     )
     print(f"[FACE WORKER] Tracker initialized with max_tracks={max_participants}")
     
@@ -692,9 +663,8 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
         )
     
     frame_count = 0
-    latest_detections = {}
-    latest_detection_time = 0
-    latest_detection_data = []
+    detection_cache = {}  # frame_id -> (detections, timestamp)
+    MAX_CACHE_SIZE = 30  # Keep last 30 frames of detections
     
     # Track landmark results
     landmark_results_cache = {}  # track_id -> landmark_data
@@ -711,96 +681,186 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
                 landmark_parent.send(msg)
                 enable_mesh = msg[1]
         
-        # Get frame
-        try:
-            frame_data = frame_queue.get(timeout=0.1)
-        except Exception as e:
-            continue
+        # Get frame - try to get the most recent one
+        frame_data = None
+        frames_dropped = 0
+        
+        # Drop old frames if queue has multiple items
+        while True:
+            try:
+                new_frame = frame_queue.get_nowait()
+                if frame_data is not None:
+                    frames_dropped += 1
+                frame_data = new_frame
+            except:
+                break
+        
+        # If we still don't have a frame, wait for one
+        if frame_data is None:
+            try:
+                frame_data = frame_queue.get(timeout=0.1)
+            except Exception as e:
+                continue
+        
+        if frames_dropped > 0 and frame_count % 30 == 0:
+            print(f"[FACE WORKER] Dropped {frames_dropped} old frames to catch up")
         
         rgb = frame_data['rgb']
         timestamp = frame_data['timestamp']
         frame_id = frame_data.get('frame_id', frame_count)
+        frame_count += 1
         
-        # Send frame to detector
-        if not detection_queue.full():
-            try:
-                detection_queue.put_nowait(frame_data)
-            except:
-                pass
-        
-        # Check for detection results
+        # Send frame to detector - drop old frames if queue is getting full
         try:
-            det_result = detection_result_queue.get_nowait()
-            latest_detections[det_result['frame_id']] = det_result['detections']
-            latest_detection_time = time.time()
-            latest_detection_data = det_result['detections']
-            print(f"[FACE WORKER] Got {len(det_result['detections'])} detections for frame {det_result['frame_id']}")
-        except:
-            pass
+            # If queue is more than half full, drop oldest frames
+            if detection_queue.qsize() > 5:  # Half of maxsize=10
+                dropped = 0
+                while detection_queue.qsize() > 3:
+                    try:
+                        detection_queue.get_nowait()
+                        dropped += 1
+                    except:
+                        break
+                if dropped > 0:
+                    print(f"[FACE WORKER] Dropped {dropped} old frames from detection queue")
+            
+            detection_queue.put(frame_data, timeout=0.001)
+            if frame_count % 30 == 0:
+                print(f"[FACE WORKER] Sent frame {frame_id} to detector, queue size: {detection_queue.qsize()}")
+        except queue.Full:
+            # Queue is full even after dropping - skip this frame
+            if frame_count % 30 == 0:
+                print(f"[FACE WORKER] Detection queue full, skipping frame {frame_id}")
         
-        # Use most recent detections
+        # Check for detection results - get ALL available
+        results_received = 0
+        while True:
+            try:
+                det_result = detection_result_queue.get_nowait()
+                det_frame_id = det_result['frame_id']
+                
+                # Cache the detection with its frame ID
+                detection_cache[det_frame_id] = {
+                    'detections': det_result['detections'],
+                    'timestamp': det_result.get('timestamp', time.time())
+                }
+                results_received += 1
+                
+                print(f"[FACE WORKER] Cached {len(det_result['detections'])} detections for frame {det_frame_id}")
+                
+            except queue.Empty:
+                break
+        
+        if results_received > 0:
+            # Clean old entries by size and age
+            current_time = time.time()
+            expired_ids = []
+            
+            # Remove expired entries
+            for cache_id, cached in detection_cache.items():
+                if current_time - cached['timestamp'] > 1.0:  # Remove entries older than 1 second
+                    expired_ids.append(cache_id)
+            
+            for expired_id in expired_ids:
+                del detection_cache[expired_id]
+            
+            # Then clean by size if needed
+            if len(detection_cache) > MAX_CACHE_SIZE:
+                oldest_ids = sorted(detection_cache.keys())[:len(detection_cache) - MAX_CACHE_SIZE]
+                for old_id in oldest_ids:
+                    del detection_cache[old_id]
+        
+        # Use detections for the CURRENT frame if available
+        detections = []
+        detection_source = None
         current_time = time.time()
-        if latest_detection_time > 0 and current_time - latest_detection_time < 0.5 and latest_detection_data:
-            detections = latest_detection_data
+        max_cache_age = 0.5  # 500ms max age for cached detections
+
+        # First try exact match
+        if frame_id in detection_cache:
+            cached = detection_cache[frame_id]
+            # Check if cache entry is still fresh
+            if current_time - cached['timestamp'] < max_cache_age:
+                detections = cached['detections']
+                detection_source = frame_id
         else:
-            detections = []
-        
+            # Look for closest recent detection
+            best_match = None
+            min_distance = float('inf')
+            
+            for cached_id in sorted(detection_cache.keys(), reverse=True):
+                if cached_id <= frame_id:  # Only use past detections
+                    distance = frame_id - cached_id
+                    if distance < min_distance and distance <= 5:  # Max 5 frames old
+                        # Check timestamp before considering this cache entry
+                        cached = detection_cache[cached_id]
+                        if current_time - cached['timestamp'] < max_cache_age:
+                            min_distance = distance
+                            best_match = cached_id
+            
+            if best_match is not None:
+                cached = detection_cache[best_match]
+                detections = cached['detections']
+                detection_source = best_match
+
+        if detection_source is not None and len(detections) > 0:
+            print(f"[FACE WORKER] Frame {frame_id}: Using {len(detections)} detections from frame {detection_source} (age: {frame_id - detection_source})")
         # Update tracker
         tracked_objects = tracker.update(rgb, detections)
         
-        if tracked_objects and frame_count % 60 == 0:
-            print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects")
+        if frame_count % 60 == 0 or (tracked_objects and frame_count < 100):
+            print(f"[FACE WORKER] Frame {frame_id}: {len(tracked_objects)} tracked objects, "
+                  f"{len(detection_cache)} cached detections")
+            
+            for obj in tracked_objects:
+                print(f"  Track {obj['track_id']}: age={obj.get('age', -1)}, confidence={obj.get('confidence', 0):.3f}")
         
         # Extract ROIs for tracked objects
         rois_extracted = 0
-        for track_dict in tracked_objects:
-            # Skip if track is too new (not confirmed)
-            if track_dict.get('age', 0) < 2:
-                continue
-                
-            # Get ROI
-            roi_result = roi_processor.extract_roi(
-                rgb,
-                track_dict['bbox'],
-                track_dict['track_id'],
-                timestamp
-            )
-            
-            if roi_result and roi_result.get('roi') is not None:
-                rois_extracted += 1
-
-                # DEBUG: Verify ROI dimensions
-                roi_shape = roi_result['roi'].shape
-                if frame_count % 60 == 0:
-                    print(f"[FACE WORKER] ROI extracted: shape={roi_shape}, track_id={track_dict['track_id']}, "
-                        f"original_bbox={track_dict['bbox']}, quality={roi_result.get('quality_score', 0):.2f}")
-
-                # Send ROI to landmark process
-                roi_data = {
-                    'roi': roi_result['roi'],
-                    'track_id': track_dict['track_id'],
-                    'timestamp': timestamp,
-                    'transform': roi_result['transform'],
-                    'quality_score': roi_result.get('quality_score', 0.5),
-                    'frame_id': frame_id  # Add frame_id for debugging
-                }
-                
-                # Always try to send, drop old if needed
-                if roi_queue.full():
-                    try:
-                        roi_queue.get_nowait()  # Drop oldest
-                    except:
-                        pass
-                
-                try:
-                    roi_queue.put_nowait(roi_data)
-                    if frame_count % 60 == 0:
-                        print(f"[FACE WORKER] Sent ROI for track {track_dict['track_id']}")
-                except Exception as e:
-                    print(f"[FACE WORKER] Failed to send ROI: {e}")
+        rois_submitted = 0
         
-        if rois_extracted > 0 and frame_count % 60 == 0:
-            print(f"[FACE WORKER] Extracted {rois_extracted} ROIs")
+        for track_dict in tracked_objects:
+            # Get ROI
+            try:
+                roi_result = roi_processor.extract_roi(
+                    rgb,
+                    track_dict['bbox'],
+                    track_dict['track_id'],
+                    timestamp
+                )
+                
+                if roi_result and roi_result.get('roi') is not None:
+                    rois_extracted += 1
+                    
+                    # Send ROI to landmark process
+                    roi_data = {
+                        'roi': roi_result['roi'],
+                        'track_id': track_dict['track_id'],
+                        'timestamp': timestamp,
+                        'transform': roi_result['transform'],
+                        'quality_score': roi_result.get('quality_score', 0.5),
+                        'frame_id': frame_id
+                    }
+                    
+                    try:
+                        roi_queue.put(roi_data, timeout=0.001)
+                        rois_submitted += 1
+                    except queue.Full:
+                        # Try to clear old item
+                        try:
+                            roi_queue.get_nowait()
+                            roi_queue.put_nowait(roi_data)
+                            rois_submitted += 1
+                        except:
+                            pass
+                            
+            except Exception as e:
+                print(f"[FACE WORKER] Exception extracting ROI: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        if rois_extracted > 0:
+            print(f"[FACE WORKER] Frame {frame_id}: Extracted {rois_extracted} ROIs, submitted {rois_submitted}")
         
         # Collect landmark results
         landmarks_collected = 0
@@ -813,8 +873,6 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
                 track_id = landmark_result['track_id']
                 landmark_results_cache[track_id] = landmark_result
                 
-                if frame_count % 60 == 0:
-                    print(f"[FACE WORKER] Got landmarks for track {track_id}")
             except:
                 break
         
@@ -839,12 +897,6 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
                 'timestamp': timestamp
             }
             face_data.append(face_info)
-
-        if face_data and frame_count % 60 == 0:
-            for face in face_data:
-                has_landmarks = len(face.get('landmarks', [])) > 0
-                print(f"[FACE WORKER] Sending face track_id={face['track_id']}, "
-                    f"has_landmarks={has_landmarks}, centroid={face.get('centroid')}")
         
         # Get debug detections
         debug_detections = None
@@ -866,13 +918,11 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
         
         try:
             result_queue.put_nowait(result)
-            if frame_count % 60 == 0:
+            if len(face_data) > 0 and frame_count % 60 == 0:
                 print(f"[FACE WORKER] Sent {len(face_data)} faces to fusion")
         except Exception as e:
             if frame_count % 60 == 0:
                 print(f"[FACE WORKER] Failed to send result: {e}")
-        
-        frame_count += 1
     
     # Cleanup
     print("[FACE WORKER] Stopping components...")
@@ -884,11 +934,7 @@ def face_worker_process(frame_queue, result_queue, model_path: str,
     
     print("[FACE WORKER] Stopping...")
 
-
-def pose_worker_process(frame_queue,  # Can be MPQueue or RobustQueue
-                       result_queue,  # Can be MPQueue or RobustQueue
-                       model_path: str,
-                       control_pipe):
+def pose_worker_process(frame_queue, result_queue, model_path: str, control_pipe):
     """Dedicated process for pose detection"""
     print("[POSE WORKER] Starting")
     print(f"[POSE WORKER] frame_queue type: {type(frame_queue)}")
@@ -1025,21 +1071,23 @@ def fusion_process(face_result_queue, pose_result_queue, frame_queue,
                   participant_update_queue, worker_pipe, correlation_queue,
                   cam_idx: int, enable_pose: bool, resolution: tuple,
                   max_participants: int = 10):
-    """Fusion with LATEST DATA ONLY approach"""
-    print(f"[FUSION] Starting LATEST ONLY for camera {cam_idx}")
+    """Fusion with proper frame synchronization"""
+    print(f"[FUSION] Starting for camera {cam_idx}")
     
     # Initialize participant manager
     global_participant_manager = GlobalParticipantManager(max_participants=max_participants)
     
-    # State - only keep latest
+    # State
     latest_face_data = []
     latest_pose_data = []
     latest_frame_bgr = None
     latest_timestamp = 0
     frame_count = 0
-    original_resolution = resolution 
+    original_resolution = resolution
     
-
+    # Track when we last sent preview
+    last_preview_time = 0
+    min_preview_interval = 0.033  # 30 FPS max
     
     while True:
         current_time = time.time()
@@ -1053,86 +1101,78 @@ def fusion_process(face_result_queue, pose_result_queue, frame_queue,
             except:
                 pass
         
-        # Get LATEST frame
+        # Get latest frame (don't drain queue completely)
         frame_data = None
-        while True:
-            try:
-                frame_data = frame_queue.get_nowait()
-            except:
-                break
+        try:
+            frame_data = frame_queue.get(timeout=0.01)
+        except:
+            pass
         
-        if frame_data and 'bgr' in frame_data:
-            latest_frame_bgr = frame_data['bgr']
+        if frame_data:
+            latest_frame_bgr = frame_data.get('bgr')
             latest_timestamp = frame_data['timestamp']
+            frame_count += 1
         
-        # Get LATEST face result
-        face_result = None
-        while True:
-            try:
-                face_result = face_result_queue.get_nowait()
-            except:
-                break
+        # Get latest face result (don't drain queue)
+        try:
+            face_result = face_result_queue.get_nowait()
+            if face_result and face_result['type'] == 'face':
+                face_data = face_result['data']
+                tracked_faces = []
                 
-        if face_result and face_result['type'] == 'face':
-            # Process faces with participant manager
-            face_data = face_result['data']
-            tracked_faces = []
-            
-            for face in face_data:
-                # Your existing face processing logic
-                track_id = face.get('track_id', -1)
-                
-                # Calculate shape from landmarks
-                shape = None
-                if 'landmarks' in face and face['landmarks']:
-                    landmarks = np.array(face['landmarks'])
-                    if len(landmarks) > 0:
-                        shape = landmarks[:, :2]
-                
-                # Get global ID
-                global_id = global_participant_manager.update_participant(
-                    cam_idx, track_id, face['centroid'], shape=shape
-                )
-                
-                face['id'] = global_id
-                face['global_id'] = global_id
-                tracked_faces.append(face)
-            
-            latest_face_data = tracked_faces
-        
-        # Get LATEST pose result if enabled
-        if enable_pose:
-            pose_result = None
-            while True:
-                try:
-                    pose_result = pose_result_queue.get_nowait()
-                except:
-                    break
+                for face in face_data:
+                    track_id = face.get('track_id', -1)
                     
-            if pose_result and pose_result['type'] == 'pose':
-                # Process poses
-                pose_data = pose_result['data']
-                latest_pose_data = []
-                
-                for i, pose in enumerate(pose_data):
-                    # Your existing pose processing logic
+                    # Calculate shape from landmarks
                     shape = None
-                    if 'landmarks' in pose and pose['landmarks']:
-                        landmarks = np.array(pose['landmarks'])
-                        if len(landmarks) >= 33:
-                            key_points = landmarks[[0, 11, 12, 23, 24], :2]
-                            shape = key_points
+                    if 'landmarks' in face and face['landmarks']:
+                        landmarks = np.array(face['landmarks'])
+                        if len(landmarks) > 0:
+                            shape = landmarks[:, :2]
                     
+                    # Get global ID
                     global_id = global_participant_manager.update_participant(
-                        cam_idx, i, pose['centroid'], shape=shape
+                        cam_idx, track_id, face['centroid'], shape=shape
                     )
                     
-                    pose['id'] = global_id
-                    pose['global_id'] = global_id
-                    latest_pose_data.append(pose)
+                    face['id'] = global_id
+                    face['global_id'] = global_id
+                    tracked_faces.append(face)
+                
+                latest_face_data = tracked_faces
+        except:
+            pass
         
-        # Send preview - ALWAYS LATEST ONLY
-        if latest_frame_bgr is not None:
+        # Get latest pose result if enabled
+        if enable_pose:
+            try:
+                pose_result = pose_result_queue.get_nowait()
+                if pose_result and pose_result['type'] == 'pose':
+                    pose_data = pose_result['data']
+                    latest_pose_data = []
+                    
+                    for i, pose in enumerate(pose_data):
+                        shape = None
+                        if 'landmarks' in pose and pose['landmarks']:
+                            landmarks = np.array(pose['landmarks'])
+                            if len(landmarks) >= 33:
+                                key_points = landmarks[[0, 11, 12, 23, 24], :2]
+                                shape = key_points
+                        
+                        global_id = global_participant_manager.update_participant(
+                            cam_idx, i, pose['centroid'], shape=shape
+                        )
+                        
+                        pose['id'] = global_id
+                        pose['global_id'] = global_id
+                        latest_pose_data.append(pose)
+            except:
+                pass
+        
+        # Send preview at controlled rate
+        if (current_time - last_preview_time > min_preview_interval and 
+            latest_frame_bgr is not None):
+            
             preview_data = {
                 'cam_idx': cam_idx,
                 'faces': latest_face_data,
@@ -1142,58 +1182,48 @@ def fusion_process(face_result_queue, pose_result_queue, frame_queue,
                 'original_resolution': original_resolution
             }
             
-            # Drop old preview if queue full
+            # Send preview
             try:
+                preview_queue.put(preview_data, timeout=0.001)
+                last_preview_time = current_time
+            except:
+                # If queue is full, try to clear it
                 try:
                     preview_queue.get_nowait()
+                    preview_queue.put_nowait(preview_data)
+                    last_preview_time = current_time
                 except:
                     pass
-                preview_queue.put_nowait(preview_data)
-            except:
-                pass
-        
-        # Send to other outputs (simplified)
-        if latest_face_data:
-            # LSL
-            for face in latest_face_data:
-                if 'global_id' in face and 'blend' in face:
-                    lsl_data = {
-                        'type': 'participant_data',
-                        'participant_id': f"P{face['global_id']}",
-                        'global_id': face['global_id'],
-                        'blend_scores': face['blend']
-                    }
-                    try:
-                        lsl_queue.put_nowait(lsl_data)
-                    except:
-                        pass
-
-                if 'landmarks' not in face or not face['landmarks']:
-                    print(f"[FUSION] WARNING: Face {face.get('id', 'unknown')} missing landmarks")
+            
+            # Send to other outputs
+            if latest_face_data:
+                for face in latest_face_data:
+                    if 'global_id' in face and 'blend' in face:
+                        lsl_data = {
+                            'type': 'participant_data',
+                            'participant_id': f"P{face['global_id']}",
+                            'global_id': face['global_id'],
+                            'blend_scores': face['blend']
+                        }
+                        try:
+                            lsl_queue.put_nowait(lsl_data)
+                        except:
+                            pass
                 
-                # Ensure centroid is present
-                if 'centroid' not in face:
-                    if 'bbox' in face:
-                        bbox = face['bbox']
-                        face['centroid'] = ((bbox[0] + bbox[2]) / 2 / resolution[0], 
-                                        (bbox[1] + bbox[3]) / 2 / resolution[1])
-                    else:
-                        face['centroid'] = (0.5, 0.5)
-            # Update score buffer
-            for face in latest_face_data:
-                if 'global_id' in face and 'blend' in face:
-                    try:
-                        score_buffer.write(face['blend'])
-                        break  # Only write first face
-                    except:
-                        pass
-        
-        frame_count += 1
+                # Update score buffer
+                for face in latest_face_data:
+                    if 'global_id' in face and 'blend' in face:
+                        try:
+                            score_buffer.write(face['blend'])
+                            break
+                        except:
+                            pass
         
         if frame_count % 240 == 0:
             print(f"[FUSION] Frame {frame_count}: {len(latest_face_data)} faces, {len(latest_pose_data)} poses")
     
     print(f"[FUSION] Stopping for camera {cam_idx}")
+
 
 def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
                                fps, enable_mesh, enable_pose,
@@ -1207,327 +1237,93 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
                                arcface_model_path=None,
                                enable_recognition=False):
     """
-    Parallel participant worker with Frame Server (no fallbacks)
+    Parallel participant worker - GPU-ONLY VERSION
     """
     print(f"\n{'='*60}")
-    print(f"[PARALLEL WORKER] Camera {cam_idx} starting with FRAME SERVER")
+    print(f"[PARALLEL WORKER] Camera {cam_idx} starting - GPU ONLY")
+    print(f"[PARALLEL WORKER] This version requires GPU acceleration")
     print(f"{'='*60}\n")
     
-    # Import the frame server
-    from frame_server import FrameServer
+    # Check GPU model path
+    if not retinaface_model_path:
+        raise ValueError("[PARALLEL WORKER] FATAL: retinaface_model_path is required for GPU detection")
     
     # Initialize shared buffer
     score_buffer = NumpySharedBuffer(name=score_buffer_name)
     
-    # Create Frame Server
-    frame_server = FrameServer(
+    # Create frame distributor
+    frame_distributor = FrameDistributor(
         camera_index=cam_idx,
-        fps=fps,
-        capture_resolution=resolution,
-        ring_size=3
+        resolution=resolution,
+        fps=fps
     )
     
-    # Start the frame server - no fallback if it fails
-    frame_server.start()
-    print(f"[PARALLEL WORKER] Frame server started for camera {cam_idx}")
-    
-    # Create queues for compatibility with existing processes
+    # Create queues
+    face_frame_queue = MPQueue(maxsize=2)
+    pose_frame_queue = MPQueue(maxsize=2) if enable_pose else None
+    fusion_frame_queue = MPQueue(maxsize=2)
     face_result_queue = MPQueue(maxsize=1)
     pose_result_queue = MPQueue(maxsize=1) if enable_pose else None
+    
+    # Add subscribers to frame distributor
+    frame_distributor.add_subscriber({
+        'name': 'face',
+        'queue': face_frame_queue,
+        'full_res': True,
+        'include_bgr': False
+    })
+    
+    if enable_pose:
+        frame_distributor.add_subscriber({
+            'name': 'pose',
+            'queue': pose_frame_queue,
+            'full_res': False,
+            'include_bgr': False,
+            'downsample_to': (640, 480)  # Pose doesn't need full res
+        })
+    
+    frame_distributor.add_subscriber({
+        'name': 'fusion',
+        'queue': fusion_frame_queue,
+        'full_res': True,  # Fusion needs full res for preview
+        'include_bgr': True  # Fusion needs BGR for display
+    })
+    
+    # Start frame distribution
+    try:
+        frame_distributor.start()
+        print(f"[PARALLEL WORKER] Frame distributor started for camera {cam_idx}")
+    except Exception as e:
+        print(f"[PARALLEL WORKER] Failed to start frame distributor: {e}")
+        raise
     
     # Create control pipes
     face_control_parent, face_control_child = Pipe()
     pose_control_parent, pose_control_child = Pipe() if enable_pose else (None, None)
     
-    # Modified face worker that uses frame server
-    def face_worker():
-        """Face worker using frame server"""
-        # Initialize components
-        detector = RetinaFaceDetector(
-            model_path=retinaface_model_path,
-            confidence_threshold=0.3,
-            nms_threshold=0.4
-        )
-        detector.start()
-        
-        tracker = LightweightTracker(
-            max_age=14,
-            min_hits=1,
-            iou_threshold=0.4,
-            detection_interval=7,
-            max_tracks=max_participants
-        )
-        
-        # Face landmark processor
-        with open(face_model_path, 'rb') as f:
-            model_buffer = f.read()
-        base_opts = python.BaseOptions(model_asset_buffer=model_buffer)
-        face_options = vision.FaceLandmarkerOptions(
-            base_options=base_opts,
-            output_face_blendshapes=True,
-            running_mode=vision.RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        face_landmarker = vision.FaceLandmarker.create_from_options(face_options)
-        
-        frame_count = 0
-        detection_interval = 7
-        latest_detections = []
-        landmark_results_cache = {}
-        start_time = time.time()
-        
-        while True:
-            # Check control messages
-            if face_control_child.poll():
-                msg = face_control_child.recv()
-                if msg == 'stop':
-                    break
-            
-            # Get latest frame from server (native resolution for tracking)
-            frame_rgb, timestamp, frame_id = frame_server.get_latest_frame('native')
-            if frame_rgb is None or frame_rgb.size == 0:
-                time.sleep(0.01)
-                continue
-            
-            # Submit for detection at intervals using 640x640 frame
-            if frame_count % detection_interval == 0:
-                det_frame, _, _ = frame_server.get_latest_frame('640x640')
-                if det_frame is not None:
-                    detector.submit_frame(det_frame, frame_id)
-            
-            # Check for detection results
-            detection_result = detector.get_detections(timeout=0.001)
-            if detection_result:
-                det_frame_id, detections = detection_result
-                # Scale detection coordinates from 640x640 to native resolution
-                native_h, native_w = frame_rgb.shape[:2]
-                scale_x = native_w / 640.0
-                scale_y = native_h / 640.0
-                for det in detections:
-                    det['bbox'][0] *= scale_x
-                    det['bbox'][1] *= scale_y
-                    det['bbox'][2] *= scale_x
-                    det['bbox'][3] *= scale_y
-                latest_detections = detections
-            
-            # Update tracker
-            tracked_objects = tracker.update(frame_rgb, latest_detections)
-            
-            # Process tracked faces using smart ROI extraction
-            for track in tracked_objects:
-                if track.get('age', 0) < 2:
-                    continue
-                
-                # Convert bbox to normalized coordinates
-                h, w = frame_rgb.shape[:2]
-                bbox_norm = [
-                    track['bbox'][0] / w,
-                    track['bbox'][1] / h,
-                    track['bbox'][2] / w,
-                    track['bbox'][3] / h
-                ]
-                
-                # Smart ROI extraction from frame server
-                roi_result = frame_server.extract_roi_smart(
-                    bbox_norm,
-                    track['track_id'],
-                    timestamp,
-                    frame_id,
-                    original_resolution=resolution
-                )
-                
-                if roi_result:
-                    # Process with MediaPipe
-                    roi = roi_result['roi']
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi)
-                    timestamp_ms = int((time.time() - start_time) * 1000)
-                    
-                    try:
-                        face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
-                        
-                        if face_result.face_landmarks and len(face_result.face_landmarks) > 0:
-                            face_landmarks = face_result.face_landmarks[0]
-                            blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
-                            
-                            # Convert landmarks to original frame coordinates
-                            landmarks = []
-                            bbox = track['bbox']
-                            bbox_w = bbox[2] - bbox[0]
-                            bbox_h = bbox[3] - bbox[1]
-                            
-                            for lm in face_landmarks:
-                                x_norm = bbox[0] / resolution[0] + lm.x * bbox_w / resolution[0]
-                                y_norm = bbox[1] / resolution[1] + lm.y * bbox_h / resolution[1]
-                                landmarks.append((x_norm, y_norm, lm.z))
-                            
-                            # Store results
-                            landmark_results_cache[track['track_id']] = {
-                                'landmarks': landmarks,
-                                'blend': [b.score for b in blendshapes][:52],
-                                'centroid': ((bbox[0] + bbox[2]) / 2 / resolution[0],
-                                           (bbox[1] + bbox[3]) / 2 / resolution[1]),
-                                'mesh': None
-                            }
-                    except Exception as e:
-                        print(f"[Face Worker] Landmark error: {e}")
-            
-            # Build face data
-            face_data = []
-            for track in tracked_objects:
-                track_id = track['track_id']
-                landmark_data = landmark_results_cache.get(track_id, {})
-                
-                face_info = {
-                    'track_id': track_id,
-                    'bbox': track['bbox'],
-                    'confidence': track['confidence'],
-                    'landmarks': landmark_data.get('landmarks', []),
-                    'blend': landmark_data.get('blend', [0.0] * 52),
-                    'centroid': landmark_data.get('centroid',
-                               ((track['bbox'][0] + track['bbox'][2]) / 2 / resolution[0],
-                                (track['bbox'][1] + track['bbox'][3]) / 2 / resolution[1])),
-                    'mesh': landmark_data.get('mesh'),
-                    'timestamp': timestamp
-                }
-                face_data.append(face_info)
-            
-            # Send results
-            # Get frame for preview
-            frame_data = frame_server.get_frame_batch('480p')
-            if frame_data:
-                result = {
-                    'type': 'face',
-                    'data': face_data,
-                    'timestamp': timestamp,
-                    'frame_bgr': frame_data['bgr']
-                }
-                
-                try:
-                    face_result_queue.put_nowait(result)
-                except:
-                    pass
-            
-            frame_count += 1
-            
-            if frame_count % 240 == 0:
-                print(f"[Face Worker] Processed {frame_count} frames, {len(face_data)} faces")
-        
-        detector.stop()
-
-    def pose_worker():
-        """Pose worker using frame server"""
-        if not enable_pose:
-            return
-            
-        # Initialize pose landmarker
-        with open(pose_model_path, 'rb') as f:
-            model_buffer = f.read()
-        base_opts = python.BaseOptions(model_asset_buffer=model_buffer)
-        
-        pose_options = vision.PoseLandmarkerOptions(
-            base_options=base_opts,
-            running_mode=vision.RunningMode.VIDEO,
-            num_poses=5,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-            output_segmentation_masks=False
-        )
-        pose_landmarker = vision.PoseLandmarker.create_from_options(pose_options)
-        
-        frame_count = 0
-        ts_counter = 0
-        
-        while True:
-            if pose_control_child.poll():
-                msg = pose_control_child.recv()
-                if msg == 'stop':
-                    break
-            
-            # Get frame from server (use 480p for pose)
-            frame_rgb, timestamp, frame_id = frame_server.get_latest_frame('480p')
-            if frame_rgb is None:
-                time.sleep(0.01)
-                continue
-            
-            # Process with MediaPipe
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-            ts_counter += 1
-            timestamp_ms = ts_counter
-            
-            pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            
-            # Extract pose data
-            pose_data = []
-            if pose_result.pose_landmarks:
-                for pose_landmarks in pose_result.pose_landmarks:
-                    key_indices = [11, 12, 23, 24]
-                    key_points = [pose_landmarks[i] for i in key_indices if i < len(pose_landmarks)]
-                    if key_points:
-                        x_coords = [p.x for p in key_points]
-                        y_coords = [p.y for p in key_points]
-                        pose_centroid = (np.mean(x_coords), np.mean(y_coords))
-                    else:
-                        pose_centroid = (0.5, 0.5)
-                    
-                    pose_vals = []
-                    for lm in pose_landmarks:
-                        pose_vals.extend([lm.x, lm.y, lm.z, lm.visibility])
-                    
-                    pose_data.append({
-                        'landmarks': [(lm.x, lm.y, lm.z) for lm in pose_landmarks],
-                        'centroid': pose_centroid,
-                        'values': pose_vals,
-                        'timestamp': timestamp
-                    })
-            
-            # Send results
-            result = {
-                'type': 'pose',
-                'data': pose_data,
-                'timestamp': timestamp
-            }
-            
-            try:
-                pose_result_queue.put_nowait(result)
-            except:
-                pass
-            
-            frame_count += 1
-
-    # Start worker threads
-    face_thread = threading.Thread(target=face_worker, daemon=True)
-    face_thread.start()
+    # Start face worker process
+    face_proc = Process(
+        target=face_worker_process,
+        args=(face_frame_queue, face_result_queue, face_model_path,
+              enable_mesh, face_control_child,
+              retinaface_model_path, arcface_model_path, enable_recognition,
+              3, resolution, max_participants)
+    )
+    face_proc.start()
     
+    # Start pose worker process if enabled
     if enable_pose:
-        pose_thread = threading.Thread(target=pose_worker, daemon=True)
-        pose_thread.start()
+        pose_proc = Process(
+            target=pose_worker_process,
+            args=(pose_frame_queue, pose_result_queue, pose_model_path,
+                  pose_control_child)
+        )
+        pose_proc.start()
     
-    # Create fusion queue 
-    fusion_queue = MPQueue(maxsize=2)
-    
-    # Fusion process uses frame server for 480p frames
-    def get_fusion_frames():
-        """Helper to get frames for fusion"""
-        while True:
-            frame_batch = frame_server.get_frame_batch('480p')
-            if frame_batch:
-                try:
-                    fusion_queue.put_nowait(frame_batch)
-                except:
-                    pass
-            time.sleep(0.033)  # ~30 FPS
-    
-    fusion_frame_thread = threading.Thread(target=get_fusion_frames, daemon=True)
-    fusion_frame_thread.start()
-    
-    # Fusion process remains the same
+    # Start fusion process
     fusion_proc = Process(
         target=fusion_process,
-        args=(face_result_queue, pose_result_queue, fusion_queue,
+        args=(face_result_queue, pose_result_queue, fusion_frame_queue,
               preview_queue, score_buffer,
               result_pipe, recording_queue, lsl_queue, participant_update_queue,
               worker_pipe, correlation_queue, cam_idx, enable_pose, resolution, max_participants)
@@ -1537,6 +1333,9 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
     print(f"[PARALLEL WORKER] All components started for camera {cam_idx}")
     
     # Monitor loop
+    last_health_check = time.time()
+    health_check_interval = 5.0
+    
     try:
         while True:
             if result_pipe.poll():
@@ -1552,36 +1351,55 @@ def parallel_participant_worker(cam_idx, face_model_path, pose_model_path,
                         'mesh_enabled': enable_mesh
                     })
             
+            # Periodic health check
+            current_time = time.time()
+            if current_time - last_health_check > health_check_interval:
+                if not frame_distributor.is_healthy():
+                    print(f"[PARALLEL WORKER] Frame distributor unhealthy, attempting restart...")
+                    frame_distributor.stop()
+                    time.sleep(0.5)
+                    frame_distributor.start()
+                
+                # Get stats
+                stats = frame_distributor.get_stats()
+                if stats['frame_count'] % 300 == 0:  # Every ~10 seconds at 30fps
+                    print(f"[PARALLEL WORKER] Camera {cam_idx} stats: {stats['actual_fps']:.1f} FPS, "
+                          f"{stats['stats']['queue_drops']} drops")
+                
+                last_health_check = current_time
+            
             time.sleep(0.1)
     
     except KeyboardInterrupt:
         print(f"[PARALLEL WORKER] Interrupted for camera {cam_idx}")
+    except Exception as e:
+        print(f"[PARALLEL WORKER] Error in monitor loop: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Cleanup
     print(f"[PARALLEL WORKER] Stopping camera {cam_idx}...")
     
-    # Stop frame server
-    frame_server.stop()
+    # Stop frame distributor
+    frame_distributor.stop()
     
     # Send stop signals
     face_control_parent.send('stop')
     if enable_pose:
         pose_control_parent.send('stop')
     
-    # Wait for threads
-    face_thread.join(timeout=2.0)
+    # Wait for processes
+    face_proc.join(timeout=2.0)
     if enable_pose:
-        pose_thread.join(timeout=2.0)
+        pose_proc.join(timeout=2.0)
     
     # Stop fusion
+    if worker_pipe:
+        try:
+            worker_pipe.send('stop')
+        except:
+            pass
     fusion_proc.terminate()
     fusion_proc.join(timeout=2.0)
     
-    # Cleanup frame server
-    frame_server.cleanup()
-    
     print(f"[PARALLEL WORKER] Camera {cam_idx} stopped")
-# Aliases for compatibility
-ParallelWorker = parallel_participant_worker
-parallel_participant_worker_standard = parallel_participant_worker
-parallel_participant_worker_advanced = parallel_participant_worker

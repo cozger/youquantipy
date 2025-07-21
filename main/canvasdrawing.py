@@ -102,7 +102,7 @@ class CanvasDrawingManager:
                 display_w = int(frame_w * scale_factor)
                 display_h = int(frame_h * scale_factor)
                 frame_bgr = cv2.resize(frame_bgr, (display_w, display_h), interpolation=cv2.INTER_LINEAR)
-                print(f"[CanvasDrawing] Downsampled from {frame_w}x{frame_h} to {display_w}x{display_h} for display")
+                #print(f"[CanvasDrawing] Downsampled from {frame_w}x{frame_h} to {display_w}x{display_h} for display")
             else:
                 display_w, display_h = frame_w, frame_h
             
@@ -180,7 +180,7 @@ class CanvasDrawingManager:
         x2 = bbox[2] * scale_x + x_offset
         y2 = bbox[3] * scale_y + y_offset
 
-        print(f"Original bbox: {bbox}, Transformed bbox: {(x1, y1, x2, y2)}")
+        #print(f"Original bbox: {bbox}, Transformed bbox: {(x1, y1, x2, y2)}")
 
         return [x1, y1, x2, y2]
 
@@ -314,13 +314,13 @@ class CanvasDrawingManager:
                         cache['face_bboxes'] = {}
                     cache['face_bboxes'][bbox_key] = bbox_id
 
-                print("---- DEBUG INFO ----")
-                print(f"Original bbox coords: {bbox}")
-                print(f"Original frame size: {transform_data['frame_size']}")
-                print(f"Canvas video bounds: {transform_data['video_bounds']}")
-                converted_bbox = self.convert_bbox_to_canvas(bbox, transform_data)
-                print(f"Converted bbox coords: {converted_bbox}")
-                print("---------------------")
+                # print("---- DEBUG INFO ----")
+                # print(f"Original bbox coords: {bbox}")
+                # print(f"Original frame size: {transform_data['frame_size']}")
+                # print(f"Canvas video bounds: {transform_data['video_bounds']}")
+                # converted_bbox = self.convert_bbox_to_canvas(bbox, transform_data)
+                # print(f"Converted bbox coords: {converted_bbox}")
+                # print("---------------------")
 
             
             # Draw face landmarks if available (rest of the method remains the same)

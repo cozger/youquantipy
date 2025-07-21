@@ -18,6 +18,7 @@ class Track:
     time_since_update: int
     features: Optional[np.ndarray] = None
     landmarks: Optional[np.ndarray] = None
+    last_detection_frame: int = -1
     
     # Drift correction
     reference_features: Optional[np.ndarray] = None
@@ -107,6 +108,11 @@ class LightweightTracker:
             List of tracked objects with IDs
         """
         self.frame_count += 1
+
+        # Predict new locations of existing tracks
+        for track in self.tracks:
+            self._predict_track(track)
+        
         
         if self.frame_count % 240 == 0 or len(detections) > 0:
             print(f"[TRACKER] update() called: frame {self.frame_count}, {len(detections)} detections")
@@ -115,10 +121,6 @@ class LightweightTracker:
         
         # Frame distributor passes RGB frames, not BGR
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        
-        # Predict new locations of existing tracks
-        for track in self.tracks:
-            self._predict_track(track)
         
         # Apply optical flow if previous frame exists
         if self.prev_gray is not None and len(self.tracks) > 0:
@@ -139,7 +141,7 @@ class LightweightTracker:
         for i in unmatched_dets:
             # Check if we're at max tracks limit
             if self.max_tracks is not None and len(self.tracks) >= self.max_tracks:
-                print(f"[TRACKER] Cannot create new track - at max_tracks limit ({self.max_tracks})")
+                #print(f"[TRACKER] Cannot create new track - at max_tracks limit ({self.max_tracks})")
                 continue
             
             trk = self._init_track(detections[i])
@@ -241,6 +243,12 @@ class LightweightTracker:
         ])
         
         track.age += 1
+        track.time_since_update += 1
+        
+        # Debug track age
+        if self.frame_count < 50 and track.track_id == 1:
+            print(f"[TRACKER] Track {track.track_id} age incremented to {track.age}")
+        
         if track.time_since_update > 0:
             track.hit_streak = 0
     
@@ -360,6 +368,7 @@ class LightweightTracker:
         track.hit_streak += 1
         track.time_since_update = 0
         track.landmarks = detection.get('landmarks')
+        track.last_detection_frame = self.frame_count 
         
         # Record hit in history for sliding window
         track.hit_history.append(self.frame_count)

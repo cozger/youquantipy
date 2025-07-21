@@ -6,14 +6,29 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
+import cupy as cp
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    print("WARNING: CuPy not installed, GPU cropping will fall back to CPU")
+    HAS_CUPY = False
+
+try:
+    # For NVIDIA GPU acceleration with OpenCV
+    cv2.cuda.getCudaEnabledDeviceCount()
+    HAS_OPENCV_CUDA = True
+except:
+    HAS_OPENCV_CUDA = False
+    print("WARNING: OpenCV not built with CUDA support")
 
 @dataclass
 class ROIData:
     """Container for ROI data with transformation info."""
     roi_image: np.ndarray
-    original_bbox: np.ndarray  # [x1, y1, x2, y2] in original frame
-    padded_bbox: np.ndarray   # [x1, y1, x2, y2] with padding
-    transform_matrix: np.ndarray  # 3x3 transformation matrix
+    original_bbox: np.ndarray
+    padded_bbox: np.ndarray
+    transform_matrix: np.ndarray
     track_id: int
     frame_id: int
     quality_score: float
@@ -36,40 +51,81 @@ class ROIData:
         # Convert back to 2D
         return transformed[:, :2] / transformed[:, 2:3]
 
+
 class ROIProcessor:
+    """
+    GPU-accelerated ROI processor using CuPy and OpenCV CUDA.
+    Keeps frames on GPU throughout the pipeline.
+    """
+    
     def __init__(self,
                  target_size: Tuple[int, int] = (256, 256),
                  padding_ratio: float = 0.3,
                  min_quality_score: float = 0.5,
-                 max_workers: int = 4):
+                 max_workers: int = 1,  # GPU processing is typically single-threaded
+                 batch_size: int = 8,
+                 use_gpu: bool = True):
         """
-        ROI processor with coordinate transformation tracking.
+        Initialize GPU ROI processor.
         
         Args:
             target_size: Target size for ROI extraction
             padding_ratio: Padding ratio relative to bbox size
             min_quality_score: Minimum quality score for processing
-            max_workers: Number of parallel workers
+            max_workers: Number of parallel workers (usually 1 for GPU)
+            batch_size: Batch size for GPU processing
+            use_gpu: Whether to use GPU acceleration
         """
         self.target_size = target_size
         self.padding_ratio = padding_ratio
         self.min_quality_score = min_quality_score
         self.max_workers = max_workers
+        self.batch_size = batch_size
+        self.use_gpu = use_gpu and (HAS_CUPY or HAS_OPENCV_CUDA)
         
         # Processing queues
         self.input_queue = queue.Queue(maxsize=100)
         self.output_queue = queue.Queue(maxsize=100)
         
-        # Thread pool for parallel processing
+        # Thread pool
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
         # Processing thread
         self.is_running = False
         self.processing_thread = None
         
-        # Cache for transformation matrices
-        self.transform_cache = {}
+        # GPU memory pool for CuPy
+        if self.use_gpu and HAS_CUPY:
+            # Set memory pool for efficient allocation
+            mempool = cp.get_default_memory_pool()
+            mempool.set_limit(size=2 * 1024**3)  # 2GB limit
+            
+        # Pre-allocate GPU arrays for batch processing
+        if self.use_gpu:
+            self._preallocate_gpu_memory()
+            
+        # Performance tracking
+        self.gpu_time_accum = 0
+        self.cpu_time_accum = 0
+        self.roi_count = 0
         
+        print(f"[ROI Processor] Initialized with GPU: {self.use_gpu}")
+        if self.use_gpu:
+            print(f"[ROI Processor] Using: CuPy={HAS_CUPY}, OpenCV CUDA={HAS_OPENCV_CUDA}")
+    
+    def _preallocate_gpu_memory(self):
+        """Pre-allocate GPU memory for batch processing."""
+        if HAS_CUPY:
+            # Pre-allocate arrays for batch ROI extraction
+            self.gpu_batch_rois = cp.zeros(
+                (self.batch_size, self.target_size[1], self.target_size[0], 3), 
+                dtype=cp.uint8
+            )
+            self.gpu_temp_buffer = cp.zeros(
+                (self.target_size[1] * 2, self.target_size[0] * 2, 3), 
+                dtype=cp.uint8
+            )
+    
     def start(self):
         """Start the ROI processing thread."""
         if not self.is_running:
@@ -77,6 +133,7 @@ class ROIProcessor:
             self.processing_thread = threading.Thread(target=self._processing_loop)
             self.processing_thread.daemon = True
             self.processing_thread.start()
+            print("[ROI Processor] Started")
     
     def stop(self):
         """Stop the ROI processing thread."""
@@ -84,134 +141,379 @@ class ROIProcessor:
         if self.processing_thread:
             self.processing_thread.join(timeout=1.0)
         self.executor.shutdown(wait=False)
-    
-    def submit_frame_tracks(self, frame: np.ndarray, tracks: List[Dict], frame_id: int):
-        """
-        Submit frame and tracks for ROI extraction.
         
-        Args:
-            frame: Original frame
-            tracks: List of tracks from tracker
-            frame_id: Frame identifier
-        """
-        try:
-            self.input_queue.put_nowait((frame, tracks, frame_id))
-        except queue.Full:
-            pass  # Drop frame if queue is full
-    
-    def get_processed_rois(self, timeout: float = 0.001) -> Optional[List[ROIData]]:
-        """Get processed ROIs with transformation data."""
-        try:
-            return self.output_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def extract_roi(self, frame: np.ndarray, bbox: List[float], track_id: int, timestamp: float) -> Optional[Dict]:
-        """Synchronous ROI extraction with frame dimensions"""
-        track_data = {
-            'bbox': bbox,
-            'track_id': track_id
-        }
-        
-        # Use internal extraction method
-        roi_data = self._extract_roi(frame, track_data, 0)
-        
-        if roi_data is None:
-            return None
+        # Clear GPU memory
+        if self.use_gpu and HAS_CUPY:
+            mempool = cp.get_default_memory_pool()
+            mempool.free_all_blocks()
             
-        # Convert to expected format with frame dimensions
-        return {
-            'roi': roi_data.roi_image,
-            'transform': {
-                'scale': roi_data.transform_matrix[0, 0],
-                'offset_x': roi_data.transform_matrix[0, 2],
-                'offset_y': roi_data.transform_matrix[1, 2],
-                'frame_width': frame.shape[1],  # Add frame dimensions
-                'frame_height': frame.shape[0]
-            },
-            'quality_score': roi_data.quality_score,
-            'original_bbox': roi_data.original_bbox,
-            'padded_bbox': roi_data.padded_bbox
-        }    
-
-    def _processing_loop(self):
-        """Main processing loop."""
-        while self.is_running:
-            try:
-                # Get input data
-                data = self.input_queue.get(timeout=0.1)
-                if data is None:
-                    continue
-                    
-                frame, tracks, frame_id = data
-                
-                # Process tracks in parallel
-                futures = []
-                for track in tracks:
-                    future = self.executor.submit(
-                        self._extract_roi, frame, track, frame_id
-                    )
-                    futures.append(future)
-                
-                # Collect results
-                rois = []
-                for future in futures:
-                    roi_data = future.result()
-                    if roi_data is not None:
-                        rois.append(roi_data)
-                
-                # Output results
-                if rois:
-                    self.output_queue.put(rois)
-                    
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"ROI processing error: {e}")
+        print("[ROI Processor] Stopped")
+        print(f"[ROI Processor] Performance - GPU time: {self.gpu_time_accum:.2f}s, "
+              f"CPU time: {self.cpu_time_accum:.2f}s, ROIs: {self.roi_count}")
     
-    def _extract_roi(self, frame: np.ndarray, track: Dict, frame_id: int) -> Optional[ROIData]:
-        """Extract and process a single ROI."""
-        bbox = np.array(track['bbox'])
-        track_id = track['track_id']
+    def extract_roi(self, frame: np.ndarray, bbox: List[float], track_id: int, 
+                    timestamp: float) -> Optional[Dict]:
+        """
+        Synchronous ROI extraction with GPU acceleration.
+        """
+        if self.use_gpu:
+            return self._extract_roi_gpu_sync(frame, bbox, track_id, timestamp)
+        else:
+            # Fallback to CPU version
+            return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+    
+
+    def _extract_roi_gpu_sync(self, frame: np.ndarray, bbox: List[float], 
+                        track_id: int, timestamp: float) -> Optional[Dict]:
+        """GPU-accelerated ROI extraction (synchronous)."""
+        start_time = time.time()
         
-        # Calculate padded bbox
+        try:
+            # Validate inputs
+            if not isinstance(bbox, (list, np.ndarray)) or len(bbox) != 4:
+                print(f"[ROI Processor] Invalid bbox: {bbox}")
+                return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+            
+            # Ensure bbox values are valid
+            bbox = np.array(bbox, dtype=np.float32)
+            if np.any(np.isnan(bbox)) or np.any(np.isinf(bbox)):
+                print(f"[ROI Processor] Invalid bbox values: {bbox}")
+                return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+            
+            # Convert frame to GPU if needed
+            if HAS_CUPY:
+                try:
+                    # Clear any previous CUDA errors
+                    cp.cuda.runtime.getLastError()
+                except:
+                    pass
+                
+                # Ensure frame is contiguous before GPU transfer
+                if not frame.flags['C_CONTIGUOUS']:
+                    frame = np.ascontiguousarray(frame)
+                
+                try:
+                    gpu_frame = cp.asarray(frame)
+                except Exception as e:
+                    print(f"[ROI Processor] Failed to transfer frame to GPU: {e}")
+                    return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+                
+                # Calculate padded bbox
+                padded_bbox = self._calculate_padded_bbox(bbox, frame.shape)
+                
+                # Check quality
+                quality_score = self._calculate_quality_score(bbox, frame.shape)
+                if quality_score < self.min_quality_score:
+                    return None
+                
+                # Validate padded bbox
+                x1, y1, x2, y2 = padded_bbox.astype(int)
+                
+                # Ensure coordinates are within frame bounds
+                x1 = max(0, min(x1, frame.shape[1] - 1))
+                y1 = max(0, min(y1, frame.shape[0] - 1))
+                x2 = max(x1 + 1, min(x2, frame.shape[1]))
+                y2 = max(y1 + 1, min(y2, frame.shape[0]))
+                
+                if x2 <= x1 or y2 <= y1:
+                    print(f"[ROI Processor] Invalid ROI dimensions: ({x1},{y1}) to ({x2},{y2})")
+                    return None
+                
+                try:
+                    # Extract ROI with padding on GPU
+                    roi_gpu = gpu_frame[y1:y2, x1:x2]
+                    
+                    if roi_gpu.size == 0:
+                        print(f"[ROI Processor] Empty ROI")
+                        return None
+                    
+                    # Resize on GPU using CuPy
+                    roi_resized_gpu = self._resize_gpu_cupy(roi_gpu, self.target_size)
+                    
+                    # Transfer back to CPU for MediaPipe (includes implicit synchronization)
+                    roi_resized = cp.asnumpy(roi_resized_gpu)
+                    
+                    # Clear GPU memory periodically
+                    if self.roi_count % 50 == 0:
+                        mempool = cp.get_default_memory_pool()
+                        mempool.free_all_blocks()
+                    
+                except Exception as e:
+                    print(f"[ROI Processor] GPU processing failed: {e}")
+                    # Fallback to CPU
+                    return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+                
+                # Ensure proper dtype and contiguous memory for MediaPipe
+                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.uint8)
+                                
+            elif HAS_OPENCV_CUDA:
+                # Use OpenCV CUDA
+                if isinstance(frame, np.ndarray):
+                    gpu_frame = cv2.cuda_GpuMat()
+                    gpu_frame.upload(frame)
+                else:
+                    gpu_frame = frame
+                    
+                # Calculate padded bbox
+                padded_bbox = self._calculate_padded_bbox(bbox, (gpu_frame.rows, gpu_frame.cols, 3))
+                
+                # Check quality
+                quality_score = self._calculate_quality_score(bbox, (gpu_frame.rows, gpu_frame.cols))
+                if quality_score < self.min_quality_score:
+                    return None
+                
+                # Extract ROI
+                x1, y1, x2, y2 = padded_bbox.astype(int)
+                roi_gpu = cv2.cuda_GpuMat(gpu_frame, (x1, y1, x2-x1, y2-y1))
+                
+                # Resize on GPU
+                roi_resized_gpu = cv2.cuda_GpuMat()
+                cv2.cuda.resize(roi_gpu, self.target_size, roi_resized_gpu)
+                
+                # IMPORTANT: Download to CPU for MediaPipe
+                roi_resized = roi_resized_gpu.download()
+                
+                # Ensure proper format for MediaPipe
+                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.uint8)
+            
+            # Calculate transformation matrix
+            transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
+            
+            # Track performance
+            self.gpu_time_accum += time.time() - start_time
+            self.roi_count += 1
+            
+            # Return result with CPU array
+            return {
+                'roi': roi_resized,  # This is now a CPU numpy array
+                'transform': {
+                    'scale': transform_matrix[0, 0],
+                    'offset_x': transform_matrix[0, 2],
+                    'offset_y': transform_matrix[1, 2],
+                    'frame_width': frame.shape[1],
+                    'frame_height': frame.shape[0]
+                },
+                'quality_score': quality_score,
+                'original_bbox': np.array(bbox),
+                'padded_bbox': padded_bbox
+            }
+            
+        except Exception as e:
+            print(f"[ROI Processor] GPU extraction error: {e}")
+            # Fallback to CPU
+            return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+
+    def _resize_gpu_cupy(self, roi_gpu: cp.ndarray, target_size: Tuple[int, int]) -> cp.ndarray:
+        """Resize ROI on GPU using CuPy's optimized resize."""
+        try:
+            import cupyx.scipy.ndimage as ndimage
+            
+            h, w = roi_gpu.shape[:2]
+            target_h, target_w = target_size[1], target_size[0]
+            
+            # Calculate zoom factors
+            zoom_y = target_h / h
+            zoom_x = target_w / w
+            
+            # Use CuPy's optimized zoom function
+            if len(roi_gpu.shape) == 3:
+                # For RGB images, apply zoom to spatial dimensions only
+                zoom_factors = (zoom_y, zoom_x, 1)
+            else:
+                zoom_factors = (zoom_y, zoom_x)
+            
+            # Use order=1 for bilinear interpolation
+            resized = ndimage.zoom(roi_gpu, zoom_factors, order=1, prefilter=False)
+            
+            # Ensure output is uint8
+            resized = cp.clip(resized, 0, 255).astype(cp.uint8)
+            
+            return resized
+            
+        except ImportError:
+            # Fallback to OpenCV-based resize if cupyx is not available
+            # Transfer to CPU, resize, and transfer back
+            roi_cpu = cp.asnumpy(roi_gpu)
+            resized_cpu = cv2.resize(roi_cpu, target_size, interpolation=cv2.INTER_LINEAR)
+            return cp.asarray(resized_cpu)
+    
+    def _extract_roi_cpu(self, frame: np.ndarray, bbox: List[float], 
+                         track_id: int, timestamp: float) -> Optional[Dict]:
+        """CPU fallback for ROI extraction."""
+        start_time = time.time()
+        
+        # Your existing CPU implementation
         padded_bbox = self._calculate_padded_bbox(bbox, frame.shape)
-        
-        # Check quality
         quality_score = self._calculate_quality_score(bbox, frame.shape)
+        
         if quality_score < self.min_quality_score:
             return None
         
-        # Extract ROI with padding
         x1, y1, x2, y2 = padded_bbox.astype(int)
         roi = frame[y1:y2, x1:x2]
         
         if roi.size == 0:
             return None
         
-        # Calculate transformation matrix
-        transform_matrix = self._calculate_transform_matrix(
-            padded_bbox, self.target_size
-        )
-        
-        # Resize ROI to target size
         roi_resized = cv2.resize(roi, self.target_size, interpolation=cv2.INTER_LINEAR)
+        transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
         
-        # Create ROI data
-        roi_data = ROIData(
-            roi_image=roi_resized,
-            original_bbox=bbox,
-            padded_bbox=padded_bbox,
-            transform_matrix=transform_matrix,
-            track_id=track_id,
-            frame_id=frame_id,
-            quality_score=quality_score
-        )
+        self.cpu_time_accum += time.time() - start_time
+        self.roi_count += 1
         
-        return roi_data
+        return {
+            'roi': roi_resized,
+            'transform': {
+                'scale': transform_matrix[0, 0],
+                'offset_x': transform_matrix[0, 2],
+                'offset_y': transform_matrix[1, 2],
+                'frame_width': frame.shape[1],
+                'frame_height': frame.shape[0]
+            },
+            'quality_score': quality_score,
+            'original_bbox': np.array(bbox),
+            'padded_bbox': padded_bbox
+        }
+    
+    def _processing_loop(self):
+        """Main processing loop with batch GPU processing."""
+        batch_frames = []
+        batch_tracks = []
+        batch_metadata = []
+        last_batch_time = time.time()
+        batch_timeout = 0.01  # 10ms
+        
+        while self.is_running:
+            try:
+                # Collect data for batch
+                timeout = batch_timeout if not batch_frames else 0.001
+                data = self.input_queue.get(timeout=timeout)
+                
+                if data is None:
+                    continue
+                    
+                frame, tracks, frame_id = data
+                
+                # Add to batch
+                for track in tracks:
+                    batch_frames.append(frame)
+                    batch_tracks.append(track)
+                    batch_metadata.append(frame_id)
+                
+                # Process batch if full or timeout
+                current_time = time.time()
+                should_process = (
+                    len(batch_frames) >= self.batch_size or
+                    (len(batch_frames) > 0 and current_time - last_batch_time > batch_timeout)
+                )
+                
+                if should_process:
+                    # Process batch on GPU
+                    if self.use_gpu and HAS_CUPY:
+                        rois = self._process_batch_gpu(batch_frames, batch_tracks, batch_metadata)
+                    else:
+                        # Process individually on CPU
+                        rois = []
+                        for frame, track, meta in zip(batch_frames, batch_tracks, batch_metadata):
+                            roi_data = self._extract_roi_cpu(frame, track['bbox'], 
+                                                            track['track_id'], 0)
+                            if roi_data:
+                                rois.append(ROIData(
+                                    roi_image=roi_data['roi'],
+                                    original_bbox=roi_data['original_bbox'],
+                                    padded_bbox=roi_data['padded_bbox'],
+                                    transform_matrix=self._calculate_transform_matrix(
+                                        roi_data['padded_bbox'], self.target_size
+                                    ),
+                                    track_id=track['track_id'],
+                                    frame_id=meta,
+                                    quality_score=roi_data['quality_score']
+                                ))
+                    
+                    # Output results
+                    if rois:
+                        self.output_queue.put(rois)
+                    
+                    # Clear batch
+                    batch_frames.clear()
+                    batch_tracks.clear()
+                    batch_metadata.clear()
+                    last_batch_time = current_time
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[ROI Processor] Processing loop error: {e}")
+    
+    def _process_batch_gpu(self, frames: List[np.ndarray], tracks: List[Dict], 
+                          metadata: List[int]) -> List[ROIData]:
+        """Process a batch of ROIs on GPU."""
+        if not HAS_CUPY:
+            return []
+            
+        rois = []
+        
+        # Transfer all frames to GPU at once
+        gpu_frames = [cp.asarray(frame) for frame in frames]
+        
+        # Process each ROI
+        for gpu_frame, track, frame_id in zip(gpu_frames, tracks, metadata):
+            try:
+                bbox = track['bbox']
+                track_id = track['track_id']
+                
+                # Calculate padded bbox
+                padded_bbox = self._calculate_padded_bbox(bbox, gpu_frame.shape)
+                
+                # Check quality
+                quality_score = self._calculate_quality_score(bbox, gpu_frame.shape)
+                if quality_score < self.min_quality_score:
+                    continue
+                
+                # Extract ROI on GPU
+                x1, y1, x2, y2 = padded_bbox.astype(int)
+                roi_gpu = gpu_frame[y1:y2, x1:x2]
+                
+                if roi_gpu.size == 0:
+                    continue
+                
+                # Resize on GPU
+                roi_resized_gpu = self._resize_gpu_cupy(roi_gpu, self.target_size)
+                
+                # Keep on GPU if next stage supports it, otherwise transfer to CPU
+                roi_resized = cp.asnumpy(roi_resized_gpu)
+                
+                # Create ROI data
+                transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
+                
+                roi_data = ROIData(
+                    roi_image=roi_resized,
+                    original_bbox=np.array(bbox),
+                    padded_bbox=padded_bbox,
+                    transform_matrix=transform_matrix,
+                    track_id=track_id,
+                    frame_id=frame_id,
+                    quality_score=quality_score
+                )
+                
+                rois.append(roi_data)
+                
+            except Exception as e:
+                print(f"[ROI Processor] Batch GPU error: {e}")
+                continue
+
+        if self.roi_count % 100 == 0:
+            mempool = cp.get_default_memory_pool()
+            mempool.free_all_blocks()
+                
+                
+        return rois
     
     def _calculate_padded_bbox(self, bbox: np.ndarray, frame_shape: Tuple) -> np.ndarray:
         """Calculate bbox with padding."""
+        if isinstance(bbox, list):
+            bbox = np.array(bbox)
+            
         x1, y1, x2, y2 = bbox
         w = x2 - x1
         h = y2 - y1
@@ -231,12 +533,10 @@ class ROIProcessor:
         h_pad = y2_pad - y1_pad
         
         if w_pad > h_pad:
-            # Adjust height
             diff = (w_pad - h_pad) / 2
             y1_pad = max(0, y1_pad - diff)
             y2_pad = min(frame_shape[0], y2_pad + diff)
         elif h_pad > w_pad:
-            # Adjust width
             diff = (h_pad - w_pad) / 2
             x1_pad = max(0, x1_pad - diff)
             x2_pad = min(frame_shape[1], x2_pad + diff)
@@ -245,44 +545,39 @@ class ROIProcessor:
     
     def _calculate_quality_score(self, bbox: np.ndarray, frame_shape: Tuple) -> float:
         """Calculate quality score for ROI."""
+        if isinstance(bbox, list):
+            bbox = np.array(bbox)
+            
         x1, y1, x2, y2 = bbox
         w = x2 - x1
         h = y2 - y1
         
-        # Size score (prefer larger faces)
+        # Size score
         size_score = min(1.0, (w * h) / (frame_shape[0] * frame_shape[1] * 0.1))
         
-        # Aspect ratio score (prefer square-ish faces)
+        # Aspect ratio score
         aspect_ratio = w / h if h > 0 else 0
         ar_score = 1.0 - abs(1.0 - aspect_ratio) * 0.5
         
-        # Position score (prefer centered faces)
+        # Position score
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         pos_score = 1.0 - abs(cx - frame_shape[1]/2) / frame_shape[1] * 0.5
         pos_score *= 1.0 - abs(cy - frame_shape[0]/2) / frame_shape[0] * 0.5
         
-        # Boundary score (penalize faces near edges)
+        # Boundary score
         margin = min(x1, y1, frame_shape[1] - x2, frame_shape[0] - y2)
         boundary_score = min(1.0, margin / 50.0)
         
         # Combined score
-        quality_score = (size_score * 0.4 + 
-                        ar_score * 0.2 + 
-                        pos_score * 0.2 + 
-                        boundary_score * 0.2)
+        quality_score = (size_score * 0.4 + ar_score * 0.2 + 
+                        pos_score * 0.2 + boundary_score * 0.2)
         
         return quality_score
     
-    def _calculate_transform_matrix(self, 
-                                   padded_bbox: np.ndarray,
+    def _calculate_transform_matrix(self, padded_bbox: np.ndarray,
                                    target_size: Tuple[int, int]) -> np.ndarray:
-        """
-        Calculate transformation matrix from ROI to original coordinates.
-        
-        Returns:
-            3x3 transformation matrix
-        """
+        """Calculate transformation matrix from ROI to original coordinates."""
         x1, y1, x2, y2 = padded_bbox
         w = x2 - x1
         h = y2 - y1
@@ -296,7 +591,6 @@ class ROIProcessor:
         ty = y1
         
         # Build transformation matrix
-        # This transforms from ROI coordinates to original frame coordinates
         transform = np.array([
             [scale_x, 0, tx],
             [0, scale_y, ty],
@@ -305,92 +599,29 @@ class ROIProcessor:
         
         return transform
     
-    def transform_landmarks(self, 
-                           landmarks: np.ndarray,
-                           roi_data: ROIData) -> np.ndarray:
-        """
-        Transform landmarks from ROI space to original frame space.
+    def get_stats(self) -> Dict:
+        """Get performance statistics."""
+        total_time = self.gpu_time_accum + self.cpu_time_accum
         
-        Args:
-            landmarks: Landmarks in ROI coordinates
-            roi_data: ROI data with transformation info
-            
-        Returns:
-            Landmarks in original frame coordinates
-        """
-        if landmarks is None:
-            return None
-            
-        return roi_data.transform_points(landmarks)
+        return {
+            'roi_count': self.roi_count,
+            'gpu_time': self.gpu_time_accum,
+            'cpu_time': self.cpu_time_accum,
+            'gpu_percentage': (self.gpu_time_accum / total_time * 100) if total_time > 0 else 0,
+            'avg_roi_time_ms': (total_time / self.roi_count * 1000) if self.roi_count > 0 else 0,
+            'using_gpu': self.use_gpu
+        }
     
-    def get_roi_for_recognition(self, roi_data: ROIData) -> np.ndarray:
-        """
-        Get ROI prepared for face recognition.
+    def _ensure_cpu_array(self, array):
+        """Ensure array is on CPU and in correct format for MediaPipe."""
+        if HAS_CUPY and isinstance(array, cp.ndarray):
+            # Transfer from GPU to CPU
+            cpu_array = cp.asnumpy(array)
+        else:
+            cpu_array = array
         
-        Args:
-            roi_data: ROI data
-            
-        Returns:
-            Preprocessed face image for recognition
-        """
-        # Extract face region more tightly for recognition
-        roi = roi_data.roi_image
+        # Ensure contiguous memory layout and uint8 dtype
+        if not cpu_array.flags['C_CONTIGUOUS'] or cpu_array.dtype != np.uint8:
+            cpu_array = np.ascontiguousarray(cpu_array, dtype=np.uint8)
         
-        # Convert to RGB if needed
-        if len(roi.shape) == 2:
-            roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
-        elif roi.shape[2] == 4:
-            roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2RGB)
-        elif roi.shape[2] == 3:
-            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        
-        # Resize to recognition model input size (typically 112x112 for ArcFace)
-        roi_recognition = cv2.resize(roi, (112, 112), interpolation=cv2.INTER_LINEAR)
-        
-        # Normalize
-        roi_recognition = roi_recognition.astype(np.float32)
-        roi_recognition = (roi_recognition - 127.5) / 128.0
-        
-        return roi_recognition
-    
-    def visualize_roi_transforms(self, frame: np.ndarray, roi_data: ROIData) -> np.ndarray:
-        """
-        Visualize ROI and transformation for debugging.
-        
-        Args:
-            frame: Original frame
-            roi_data: ROI data with transformation
-            
-        Returns:
-            Visualization image
-        """
-        vis = frame.copy()
-        
-        # Draw original bbox
-        x1, y1, x2, y2 = roi_data.original_bbox.astype(int)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # Draw padded bbox
-        x1p, y1p, x2p, y2p = roi_data.padded_bbox.astype(int)
-        cv2.rectangle(vis, (x1p, y1p), (x2p, y2p), (255, 0, 0), 1)
-        
-        # Draw quality score
-        cv2.putText(vis, f"Q: {roi_data.quality_score:.2f}", 
-                   (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                   0.5, (255, 255, 255), 1)
-        
-        # Test transformation by drawing corners
-        corners_roi = np.array([
-            [0, 0],
-            [self.target_size[0], 0],
-            [self.target_size[0], self.target_size[1]],
-            [0, self.target_size[1]]
-        ])
-        
-        corners_frame = roi_data.transform_points(corners_roi)
-        
-        for i in range(4):
-            pt = tuple(corners_frame[i].astype(int))
-            cv2.circle(vis, pt, 3, (0, 0, 255), -1)
-        
-        return vis
+        return cpu_array
