@@ -132,12 +132,15 @@ class RetinaFaceDetector:
         
     def _preprocess_image(self, image):
         """Preprocess image for model input"""
-        # Resize to model dimensions
-        import cv2
-        resized = cv2.resize(image, (self.model_width, self.model_height))
-        
-        # Convert to float32
-        img = resized.astype(np.float32)
+        # Check if image is already the correct size (640x640)
+        if image.shape[0] == self.model_height and image.shape[1] == self.model_width:
+            # Image is already the correct size, no need to resize
+            img = image.astype(np.float32)
+        else:
+            # Resize to model dimensions if needed (backward compatibility)
+            import cv2
+            resized = cv2.resize(image, (self.model_width, self.model_height))
+            img = resized.astype(np.float32)
         
         # Apply ImageNet mean subtraction
         img -= np.array([104, 117, 123], dtype=np.float32)
@@ -272,6 +275,8 @@ class RetinaFaceDetector:
         boxes = self._decode_boxes(boxes_output, self.anchors[:len(boxes_output)])
         
         # Scale to original image size
+        # If the input was already 640x640, we'll rely on external coordinate transformation
+        # Otherwise, scale normally for backward compatibility
         scale_x = orig_width / self.model_width
         scale_y = orig_height / self.model_height
         

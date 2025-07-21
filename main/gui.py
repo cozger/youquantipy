@@ -624,7 +624,7 @@ class YouQuantiPyGUI(tk.Tk):
         for info in self.frames:
             if info.get('meta_label'):
                 fps = self.desired_fps.get()
-                info['meta_label'].config(text=f"Camera → {info['camera_index']} (Capture: {capture_res[0]}x{capture_res[1]}@{fps}fps)")
+                info['meta_label'].config(text=f"Camera → {info['camera_index']} (Capture: {res_label[0]}x{res_label[1]}@{fps}fps)")
 
     def on_closing(self):
         """Save configuration before closing"""
@@ -2642,3 +2642,4 @@ class YouQuantiPyGUI(tk.Tk):
 
 if __name__ == '__main__':
     YouQuantiPyGUI().mainloop()
+    
