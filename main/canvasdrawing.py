@@ -38,8 +38,15 @@ class CanvasDrawingManager:
         self.min_frame_interval = 0.033  # 30 FPS max per canvas
         
         # MediaPipe connections
-        self.face_connections = mp.solutions.face_mesh.FACEMESH_CONTOURS
-        self.pose_connections = mp.solutions.pose.POSE_CONNECTIONS
+        try:
+            self.face_connections = mp.solutions.face_mesh.FACEMESH_CONTOURS
+            self.pose_connections = mp.solutions.pose.POSE_CONNECTIONS
+        except Exception as e:
+            print(f"[CanvasDrawing] MediaPipe connections not available: {e}")
+            print("[CanvasDrawing] Using basic face connections fallback")
+            # Define basic face connections for key features when MediaPipe not available
+            self.face_connections = self._get_basic_face_connections()
+            self.pose_connections = None
         
         # Photo image cache to prevent garbage collection
         self._photo_images = {}
@@ -50,6 +57,56 @@ class CanvasDrawingManager:
         
         # Debug mode
         self.debug_mode = True  # Set to False to disable debug overlays
+        
+        # Face drawing modes
+        self.face_draw_mode = 'full_contours'  # Options: 'full_contours', 'jaw_only', 'mesh'
+        self.draw_jaw_overlay = True  # Draw jaw line as yellow overlay in debug mode
+    
+    def _get_basic_face_connections(self):
+        """Define basic face connections for key features when MediaPipe is not available."""
+        connections = []
+        
+        # Jaw line (indices 0-16)
+        for i in range(16):
+            connections.append((i, i+1))
+        
+        # Left eyebrow (70, 63, 105, 66, 107)
+        eyebrow_left = [70, 63, 105, 66, 107]
+        for i in range(len(eyebrow_left)-1):
+            connections.append((eyebrow_left[i], eyebrow_left[i+1]))
+        
+        # Right eyebrow (46, 53, 52, 65, 55)
+        eyebrow_right = [46, 53, 52, 65, 55]
+        for i in range(len(eyebrow_right)-1):
+            connections.append((eyebrow_right[i], eyebrow_right[i+1]))
+        
+        # Left eye (outer)
+        left_eye = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7, 33]
+        for i in range(len(left_eye)-1):
+            connections.append((left_eye[i], left_eye[i+1]))
+        
+        # Right eye (outer)
+        right_eye = [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382, 362]
+        for i in range(len(right_eye)-1):
+            connections.append((right_eye[i], right_eye[i+1]))
+        
+        # Nose bridge
+        nose_bridge = [6, 197, 196, 3, 51, 48, 115, 131, 102, 48, 64, 98, 97, 2, 326, 327, 294, 278, 344, 440, 275, 321, 320, 305, 291, 330, 347, 346, 280, 425, 295, 279, 310, 392, 308, 324, 318]
+        for i in range(0, len(nose_bridge)-1, 2):
+            if i+1 < len(nose_bridge):
+                connections.append((nose_bridge[i], nose_bridge[i+1]))
+        
+        # Lips (outer)
+        lips_outer = [61, 84, 17, 314, 405, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95, 78, 61]
+        for i in range(len(lips_outer)-1):
+            connections.append((lips_outer[i], lips_outer[i+1]))
+        
+        # Lips (inner)
+        lips_inner = [62, 96, 89, 179, 86, 15, 316, 403, 319, 325, 307, 310, 415, 308, 312, 13, 82, 81, 80, 78, 62]
+        for i in range(len(lips_inner)-1):
+            connections.append((lips_inner[i], lips_inner[i+1]))
+        
+        return connections
         
     def initialize_canvas(self, canvas: tk.Canvas, canvas_idx: int):
         """Initialize canvas with default transform and ensure proper layering"""
@@ -190,6 +247,10 @@ class CanvasDrawingManager:
                             participant_count: int = 2, participant_names: Dict = None) -> None:
         """
         Draw face overlays with proper coordinate transformation.
+        
+        Fixed: Now properly draws full face contours using MediaPipe connections
+        instead of just jaw line (first 17 landmarks). The jaw line can still
+        be shown as a debug overlay.
         """
         if not canvas.winfo_exists():
             return
@@ -340,6 +401,22 @@ class CanvasDrawingManager:
                 # Check if we have face_contour data
                 face_contour = face.get('face_contour', [])
                 
+                # Debug output for first face
+                if self.debug_mode and fid == 1 and canvas_idx == 0:
+                    if not hasattr(self, '_contour_debug_count'):
+                        self._contour_debug_count = 0
+                    self._contour_debug_count += 1
+                    
+                    if self._contour_debug_count % 60 == 0:
+                        print(f"\n[CanvasDrawing] Face Drawing Debug:")
+                        print(f"  - Total landmarks: {len(canvas_landmarks)}")
+                        print(f"  - Face contour points: {len(face_contour)}")
+                        print(f"  - MediaPipe connections: {len(list(self.face_connections))}")
+                        if canvas_landmarks:
+                            print(f"  - First landmark (canvas coords): {canvas_landmarks[0][:2]}")
+                        if face_contour:
+                            print(f"  - First jaw point (normalized): {face_contour[0]}")
+                
                 # Draw or update face contours
                 self._update_face_contours(canvas, cache, fid, canvas_landmarks, display_label, face_contour)
             
@@ -374,94 +451,93 @@ class CanvasDrawingManager:
         """Update or create face contour lines."""
         lines = cache['face_lines'].get(face_id, [])
         
-        # Ensure we have enough line objects
-        connection_list = list(self.face_connections)
-        while len(lines) < len(connection_list):
-            line_id = canvas.create_line(
-                0, 0, 0, 0,
-                fill='#40FF40', width=2,
-                tags=('overlay', f'face_{face_id}', 'face_line')
-            )
-            lines.append(line_id)
+        # Check if we have valid MediaPipe connections or need fallback
+        connection_list = list(self.face_connections) if self.face_connections else []
+        use_fallback = self.face_draw_mode == 'points'
         
-        cache['face_lines'][face_id] = lines
+        # Debug output
+        if not hasattr(self, '_connection_debug_shown'):
+            self._connection_debug_shown = True
+            print(f"[CanvasDrawing] Using {len(connection_list)} face connections")
+            print(f"[CanvasDrawing] Face draw mode: {self.face_draw_mode}")
+            print(f"[CanvasDrawing] Use fallback (points): {use_fallback}")
         
-        # Check if we have face_contour data to draw jaw line
-        if face_contour and len(face_contour) >= 2:
-            # Get transform data for this canvas
-            canvas_idx = None
-            for idx, obj in self.canvas_objects.items():
-                if obj == cache:
-                    canvas_idx = idx
-                    break
+        if use_fallback:
+            # Fallback mode: Draw landmarks as points
+            if 'face_points' not in cache:
+                cache['face_points'] = {}
             
-            if canvas_idx is not None:
-                transform_data = self.transform_cache.get(canvas_idx, {})
-                video_bounds = transform_data.get('video_bounds')
-                if video_bounds:
-                    x_offset, y_offset, video_w, video_h = video_bounds
-                    
-                    # Transform face_contour points to canvas coordinates
-                    canvas_contour = []
-                    for x, y in face_contour:
-                        canvas_x = x * video_w + x_offset
-                        canvas_y = y * video_h + y_offset
-                        canvas_contour.append((int(canvas_x), int(canvas_y)))
-                    
-                    # Draw jaw line as a polyline (connecting consecutive points)
-                    # We only need face_contour.length - 1 lines
-                    num_contour_lines = len(face_contour) - 1
-                    
-                    # Update or create lines for the contour
-                    for i in range(num_contour_lines):
-                        if i < len(canvas_contour) - 1:
-                            x1, y1 = canvas_contour[i]
-                            x2, y2 = canvas_contour[i + 1]
-                            
-                            if i < len(lines):
-                                # Update existing line
-                                try:
-                                    canvas.coords(lines[i], x1, y1, x2, y2)
-                                    canvas.itemconfig(lines[i], state='normal', fill='#00FF00', width=3)
-                                except:
-                                    pass
-                            else:
-                                # Create new line
-                                line_id = canvas.create_line(
-                                    x1, y1, x2, y2,
-                                    fill='#00FF00', width=3,
-                                    tags=('overlay', f'face_{face_id}', 'face_line')
-                                )
-                                lines.append(line_id)
-                    
-                    # Hide excess lines
-                    for i in range(num_contour_lines, len(lines)):
-                        canvas.itemconfig(lines[i], state='hidden')
-                    
-                    cache['face_lines'][face_id] = lines
-                    return
-        
-        # Fallback to using landmarks with MediaPipe connections if no face_contour
-        # Update line positions
-        for i, (start_idx, end_idx) in enumerate(connection_list):
-            if i >= len(lines):
-                break
-                
-            if start_idx < len(landmarks) and end_idx < len(landmarks):
-                x1, y1, _ = landmarks[start_idx]
-                x2, y2, _ = landmarks[end_idx]
-                
+            points = cache['face_points'].get(face_id, [])
+            
+            # Create points for each landmark (limit to first 100 for performance)
+            num_points = min(len(landmarks), 100)
+            
+            # Ensure we have enough point objects
+            while len(points) < num_points:
+                point_id = canvas.create_oval(
+                    0, 0, 0, 0,
+                    fill='#00FF00', outline='#00FF00', width=1,
+                    tags=('overlay', f'face_{face_id}', 'face_point')
+                )
+                points.append(point_id)
+            
+            cache['face_points'][face_id] = points
+            
+            # Update point positions
+            for i in range(num_points):
+                x, y, _ = landmarks[i]
+                size = 2  # Point radius
                 try:
-                    canvas.coords(lines[i], int(x1), int(y1), int(x2), int(y2))
-                    canvas.itemconfig(lines[i], state='normal')
+                    canvas.coords(points[i], int(x-size), int(y-size), int(x+size), int(y+size))
+                    canvas.itemconfig(points[i], state='normal', fill='#00FF00')
                 except:
                     pass
-            else:
+            
+            # Hide excess points
+            for i in range(num_points, len(points)):
+                canvas.itemconfig(points[i], state='hidden')
+                
+            # Hide lines in fallback mode
+            for line_id in lines:
+                canvas.itemconfig(line_id, state='hidden')
+        else:
+            # Normal mode: Use MediaPipe connections
+            # Hide points if we were in fallback mode before
+            if 'face_points' in cache and face_id in cache['face_points']:
+                for point_id in cache['face_points'][face_id]:
+                    canvas.itemconfig(point_id, state='hidden')
+            
+            # Ensure we have enough line objects for MediaPipe connections
+            while len(lines) < len(connection_list):
+                line_id = canvas.create_line(
+                    0, 0, 0, 0,
+                    fill='#40FF40', width=2,
+                    tags=('overlay', f'face_{face_id}', 'face_line')
+                )
+                lines.append(line_id)
+            
+            cache['face_lines'][face_id] = lines
+            
+            # Update line positions using MediaPipe FACEMESH_CONTOURS connections
+            for i, (start_idx, end_idx) in enumerate(connection_list):
+                if i >= len(lines):
+                    break
+                    
+                if start_idx < len(landmarks) and end_idx < len(landmarks):
+                    x1, y1, _ = landmarks[start_idx]
+                    x2, y2, _ = landmarks[end_idx]
+                    
+                    try:
+                        canvas.coords(lines[i], int(x1), int(y1), int(x2), int(y2))
+                        canvas.itemconfig(lines[i], state='normal', fill='#00FF00', width=2)
+                    except:
+                        pass
+                else:
+                    canvas.itemconfig(lines[i], state='hidden')
+            
+            # Hide excess lines
+            for i in range(len(connection_list), len(lines)):
                 canvas.itemconfig(lines[i], state='hidden')
-        
-        # Hide excess lines
-        for i in range(len(connection_list), len(lines)):
-            canvas.itemconfig(lines[i], state='hidden')
     
     def _hide_inactive_faces(self, canvas: tk.Canvas, cache: Dict, active_ids: set) -> None:
         """Hide faces that are no longer active."""
@@ -480,7 +556,7 @@ class CanvasDrawingManager:
                         except:
                             pass
                     
-                    # Hide face bboxes and labels
+                    # Hide face bboxes, labels, and debug overlays
                     for key in [f'bbox_{face_id}', f'bbox_label_{face_id}', f'centroid_{face_id}']:
                         if key in cache.get('face_bboxes', {}):
                             try:
@@ -677,6 +753,19 @@ class CanvasDrawingManager:
             stats['transform_data'] = self.transform_cache[canvas_idx]
         
         return stats
+    
+    def set_debug_mode(self, enabled: bool) -> None:
+        """Toggle debug mode for all canvases."""
+        self.debug_mode = enabled
+        print(f"[CanvasDrawing] Debug mode set to: {enabled}")
+    
+    def set_face_draw_mode(self, mode: str) -> None:
+        """Set face drawing mode: 'full_contours', 'jaw_only', 'mesh', 'points'."""
+        if mode in ['full_contours', 'jaw_only', 'mesh', 'points']:
+            self.face_draw_mode = mode
+            print(f"[CanvasDrawing] Face draw mode set to: {mode}")
+        else:
+            print(f"[CanvasDrawing] Invalid face draw mode: {mode}. Valid modes: full_contours, jaw_only, mesh, points")
 
 
 # Standalone utility function remains the same

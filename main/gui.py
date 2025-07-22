@@ -159,6 +159,13 @@ class YouQuantiPyGUI(tk.Tk):
         # get drawing manager
         self.drawingmanager = CanvasDrawingManager()
         
+        # Check if we're using TensorRT models (no MediaPipe) and set appropriate drawing mode
+        use_tensorrt = self.config.get('advanced_detection.use_tensorrt', False)
+        if use_tensorrt or self.drawingmanager.face_connections is None:
+            # Use points mode if TensorRT is enabled or MediaPipe connections not available
+            self.drawingmanager.set_face_draw_mode('points')
+            print("[GUI] Using points mode for face drawing (TensorRT/no MediaPipe)")
+        
         # DEBUG_RETINAFACE: Enable debug drawing of raw detections
         self.debug_retinaface = True  # Set to False to disable debug drawing
         # Synchrony plot correlator & face tracker
