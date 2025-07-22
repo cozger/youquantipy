@@ -337,8 +337,11 @@ class CanvasDrawingManager:
                 if fid not in cache['face_lines']:
                     cache['face_lines'][fid] = []
                 
+                # Check if we have face_contour data
+                face_contour = face.get('face_contour', [])
+                
                 # Draw or update face contours
-                self._update_face_contours(canvas, cache, fid, canvas_landmarks, display_label)
+                self._update_face_contours(canvas, cache, fid, canvas_landmarks, display_label, face_contour)
             
             # Draw centroid if available (for debugging)
             if 'centroid' in face and self.debug_mode:
@@ -367,7 +370,7 @@ class CanvasDrawingManager:
         canvas.tag_raise('overlay')
 
     def _update_face_contours(self, canvas: tk.Canvas, cache: Dict, face_id: int,
-                             landmarks: List[Tuple], label_text: str) -> None:
+                             landmarks: List[Tuple], label_text: str, face_contour: List[Tuple] = None) -> None:
         """Update or create face contour lines."""
         lines = cache['face_lines'].get(face_id, [])
         
@@ -383,6 +386,62 @@ class CanvasDrawingManager:
         
         cache['face_lines'][face_id] = lines
         
+        # Check if we have face_contour data to draw jaw line
+        if face_contour and len(face_contour) >= 2:
+            # Get transform data for this canvas
+            canvas_idx = None
+            for idx, obj in self.canvas_objects.items():
+                if obj == cache:
+                    canvas_idx = idx
+                    break
+            
+            if canvas_idx is not None:
+                transform_data = self.transform_cache.get(canvas_idx, {})
+                video_bounds = transform_data.get('video_bounds')
+                if video_bounds:
+                    x_offset, y_offset, video_w, video_h = video_bounds
+                    
+                    # Transform face_contour points to canvas coordinates
+                    canvas_contour = []
+                    for x, y in face_contour:
+                        canvas_x = x * video_w + x_offset
+                        canvas_y = y * video_h + y_offset
+                        canvas_contour.append((int(canvas_x), int(canvas_y)))
+                    
+                    # Draw jaw line as a polyline (connecting consecutive points)
+                    # We only need face_contour.length - 1 lines
+                    num_contour_lines = len(face_contour) - 1
+                    
+                    # Update or create lines for the contour
+                    for i in range(num_contour_lines):
+                        if i < len(canvas_contour) - 1:
+                            x1, y1 = canvas_contour[i]
+                            x2, y2 = canvas_contour[i + 1]
+                            
+                            if i < len(lines):
+                                # Update existing line
+                                try:
+                                    canvas.coords(lines[i], x1, y1, x2, y2)
+                                    canvas.itemconfig(lines[i], state='normal', fill='#00FF00', width=3)
+                                except:
+                                    pass
+                            else:
+                                # Create new line
+                                line_id = canvas.create_line(
+                                    x1, y1, x2, y2,
+                                    fill='#00FF00', width=3,
+                                    tags=('overlay', f'face_{face_id}', 'face_line')
+                                )
+                                lines.append(line_id)
+                    
+                    # Hide excess lines
+                    for i in range(num_contour_lines, len(lines)):
+                        canvas.itemconfig(lines[i], state='hidden')
+                    
+                    cache['face_lines'][face_id] = lines
+                    return
+        
+        # Fallback to using landmarks with MediaPipe connections if no face_contour
         # Update line positions
         for i, (start_idx, end_idx) in enumerate(connection_list):
             if i >= len(lines):

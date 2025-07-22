@@ -162,9 +162,8 @@ class ROIProcessor:
             # Fallback to CPU version
             return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
     
-
     def _extract_roi_gpu_sync(self, frame: np.ndarray, bbox: List[float], 
-                        track_id: int, timestamp: float) -> Optional[Dict]:
+                            track_id: int, timestamp: float) -> Optional[Dict]:
         """GPU-accelerated ROI extraction (synchronous)."""
         start_time = time.time()
         
@@ -188,21 +187,27 @@ class ROIProcessor:
                 except:
                     pass
                 
-                # Ensure frame is contiguous before GPU transfer
-                if not frame.flags['C_CONTIGUOUS']:
-                    frame = np.ascontiguousarray(frame)
-                
-                try:
-                    gpu_frame = cp.asarray(frame)
-                except Exception as e:
-                    print(f"[ROI Processor] Failed to transfer frame to GPU: {e}")
-                    return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+                # FIX: Keep frame on GPU if it's already there
+                if isinstance(frame, cp.ndarray):
+                    gpu_frame = frame
+                    print(f"[ROI Processor] Frame already on GPU")
+                else:
+                    # Ensure frame is contiguous before GPU transfer
+                    if not frame.flags['C_CONTIGUOUS']:
+                        frame = np.ascontiguousarray(frame)
+                    
+                    try:
+                        gpu_frame = cp.asarray(frame)
+                    except Exception as e:
+                        print(f"[ROI Processor] Failed to transfer frame to GPU: {e}")
+                        return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
                 
                 # Calculate padded bbox
-                padded_bbox = self._calculate_padded_bbox(bbox, frame.shape)
+                frame_shape = frame.shape if isinstance(frame, np.ndarray) else (gpu_frame.shape[0], gpu_frame.shape[1], gpu_frame.shape[2])
+                padded_bbox = self._calculate_padded_bbox(bbox, frame_shape)
                 
                 # Check quality
-                quality_score = self._calculate_quality_score(bbox, frame.shape)
+                quality_score = self._calculate_quality_score(bbox, frame_shape)
                 if quality_score < self.min_quality_score:
                     return None
                 
@@ -210,10 +215,10 @@ class ROIProcessor:
                 x1, y1, x2, y2 = padded_bbox.astype(int)
                 
                 # Ensure coordinates are within frame bounds
-                x1 = max(0, min(x1, frame.shape[1] - 1))
-                y1 = max(0, min(y1, frame.shape[0] - 1))
-                x2 = max(x1 + 1, min(x2, frame.shape[1]))
-                y2 = max(y1 + 1, min(y2, frame.shape[0]))
+                x1 = max(0, min(x1, frame_shape[1] - 1))
+                y1 = max(0, min(y1, frame_shape[0] - 1))
+                x2 = max(x1 + 1, min(x2, frame_shape[1]))
+                y2 = max(y1 + 1, min(y2, frame_shape[0]))
                 
                 if x2 <= x1 or y2 <= y1:
                     print(f"[ROI Processor] Invalid ROI dimensions: ({x1},{y1}) to ({x2},{y2})")
@@ -227,15 +232,26 @@ class ROIProcessor:
                         print(f"[ROI Processor] Empty ROI")
                         return None
                     
-                    # Resize on GPU using CuPy
+                    # FIX: Resize and normalize on GPU in one step
                     roi_resized_gpu = self._resize_gpu_cupy(roi_gpu, self.target_size)
                     
-                    # Transfer back to CPU for MediaPipe (includes implicit synchronization)
+                    # FIX: Transfer to CPU only because MediaPipe/TensorRT needs CPU input
+                    # The data is already normalized to [-1, 1] range
                     roi_resized = cp.asnumpy(roi_resized_gpu)
                     
-                    # Clear GPU memory periodically
+                    # Debug output
                     if self.roi_count % 50 == 0:
+                        print(f"[ROI Processor] ROI {self.roi_count}: "
+                            f"shape={roi_resized.shape}, dtype={roi_resized.dtype}, "
+                            f"range=[{roi_resized.min():.3f}, {roi_resized.max():.3f}]")
+                    
+                    # Clear GPU memory periodically
+                    if self.roi_count % 100 == 0:
                         mempool = cp.get_default_memory_pool()
+                        used_bytes = mempool.used_bytes()
+                        total_bytes = mempool.total_bytes()
+                        print(f"[ROI Processor] GPU memory: {used_bytes/1024/1024:.1f}MB used, "
+                            f"{total_bytes/1024/1024:.1f}MB total")
                         mempool.free_all_blocks()
                     
                 except Exception as e:
@@ -243,8 +259,8 @@ class ROIProcessor:
                     # Fallback to CPU
                     return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
                 
-                # Ensure proper dtype and contiguous memory for MediaPipe
-                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.uint8)
+                # Ensure proper dtype and contiguous memory for downstream processing
+                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.float32)
                                 
             elif HAS_OPENCV_CUDA:
                 # Use OpenCV CUDA
@@ -270,11 +286,15 @@ class ROIProcessor:
                 roi_resized_gpu = cv2.cuda_GpuMat()
                 cv2.cuda.resize(roi_gpu, self.target_size, roi_resized_gpu)
                 
-                # IMPORTANT: Download to CPU for MediaPipe
+                # Download to CPU
                 roi_resized = roi_resized_gpu.download()
                 
-                # Ensure proper format for MediaPipe
-                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.uint8)
+                # Convert to float32 and normalize
+                roi_resized = roi_resized.astype(np.float32)
+                roi_resized = (roi_resized - 127.5) / 127.5
+                
+                # Ensure proper format
+                roi_resized = np.ascontiguousarray(roi_resized, dtype=np.float32)
             
             # Calculate transformation matrix
             transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
@@ -283,15 +303,15 @@ class ROIProcessor:
             self.gpu_time_accum += time.time() - start_time
             self.roi_count += 1
             
-            # Return result with CPU array
+            # Return result with normalized CPU array
             return {
-                'roi': roi_resized,  # This is now a CPU numpy array
+                'roi': roi_resized,  # Normalized float32 array in [-1, 1] range
                 'transform': {
                     'scale': transform_matrix[0, 0],
                     'offset_x': transform_matrix[0, 2],
                     'offset_y': transform_matrix[1, 2],
-                    'frame_width': frame.shape[1],
-                    'frame_height': frame.shape[0]
+                    'frame_width': frame_shape[1],
+                    'frame_height': frame_shape[0]
                 },
                 'quality_score': quality_score,
                 'original_bbox': np.array(bbox),
@@ -325,8 +345,11 @@ class ROIProcessor:
             # Use order=1 for bilinear interpolation
             resized = ndimage.zoom(roi_gpu, zoom_factors, order=1, prefilter=False)
             
-            # Ensure output is uint8
-            resized = cp.clip(resized, 0, 255).astype(cp.uint8)
+            # Convert to float32 and normalize ONCE here on GPU
+            # This avoids doing it again in the landmark process
+            resized = resized.astype(cp.float32)
+            # Normalize to [-1, 1] range expected by TensorRT landmark model
+            resized = (resized - 127.5) / 127.5
             
             return resized
             
@@ -335,14 +358,18 @@ class ROIProcessor:
             # Transfer to CPU, resize, and transfer back
             roi_cpu = cp.asnumpy(roi_gpu)
             resized_cpu = cv2.resize(roi_cpu, target_size, interpolation=cv2.INTER_LINEAR)
+            # Normalize on CPU before transfer back
+            resized_cpu = resized_cpu.astype(np.float32)
+            resized_cpu = (resized_cpu - 127.5) / 127.5
             return cp.asarray(resized_cpu)
-    
+
+
     def _extract_roi_cpu(self, frame: np.ndarray, bbox: List[float], 
-                         track_id: int, timestamp: float) -> Optional[Dict]:
+                        track_id: int, timestamp: float) -> Optional[Dict]:
         """CPU fallback for ROI extraction."""
         start_time = time.time()
         
-        # Your existing CPU implementation
+        # Existing CPU implementation with normalization added
         padded_bbox = self._calculate_padded_bbox(bbox, frame.shape)
         quality_score = self._calculate_quality_score(bbox, frame.shape)
         
@@ -356,13 +383,18 @@ class ROIProcessor:
             return None
         
         roi_resized = cv2.resize(roi, self.target_size, interpolation=cv2.INTER_LINEAR)
+        
+        # FIX: Normalize CPU output to match GPU output
+        roi_resized = roi_resized.astype(np.float32)
+        roi_resized = (roi_resized - 127.5) / 127.5
+        
         transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
         
         self.cpu_time_accum += time.time() - start_time
         self.roi_count += 1
         
         return {
-            'roi': roi_resized,
+            'roi': roi_resized,  # Now normalized like GPU version
             'transform': {
                 'scale': transform_matrix[0, 0],
                 'offset_x': transform_matrix[0, 2],
@@ -374,7 +406,7 @@ class ROIProcessor:
             'original_bbox': np.array(bbox),
             'padded_bbox': padded_bbox
         }
-    
+
     def _processing_loop(self):
         """Main processing loop with batch GPU processing."""
         batch_frames = []

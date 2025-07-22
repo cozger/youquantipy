@@ -1299,21 +1299,21 @@ class YouQuantiPyGUI(tk.Tk):
                 canvas = self.frames[idx]['canvas']
 
                 self._preview_debug_counter += 1
-                if self._preview_debug_counter % 60 == 0 and idx == 0:  # Only for first camera
+                if self._preview_debug_counter % 600 == 0 and idx == 0:  # Only for first camera
                     faces = latest_msg.get('faces', [])
                     print(f"\n[GUI DIAGNOSTIC] Frame {self._preview_debug_counter}")
                     print(f"  Canvas {idx}: {len(faces)} faces in preview data")
-                    for i, face in enumerate(faces[:2]):  # First 2 faces only
-                        print(f"  Face {i}:")
-                        print(f"    ID: {face.get('id', 'NO_ID')}")
-                        print(f"    Global ID: {face.get('global_id', 'NO_GLOBAL_ID')}")
-                        print(f"    Track ID: {face.get('track_id', 'NO_TRACK_ID')}")
-                        print(f"    Has landmarks: {len(face.get('landmarks', [])) > 0}")
-                        print(f"    Landmark count: {len(face.get('landmarks', []))}")
-                        print(f"    Has centroid: {'centroid' in face}")
-                        print(f"    Has bbox: {'bbox' in face}")
-                        if 'bbox' in face:
-                            print(f"    Bbox: {face['bbox']}")
+                    # for i, face in enumerate(faces[:2]):  # First 2 faces only
+                    #     print(f"  Face {i}:")
+                    #     print(f"    ID: {face.get('id', 'NO_ID')}")
+                    #     print(f"    Global ID: {face.get('global_id', 'NO_GLOBAL_ID')}")
+                    #     print(f"    Track ID: {face.get('track_id', 'NO_TRACK_ID')}")
+                    #     print(f"    Has landmarks: {len(face.get('landmarks', [])) > 0}")
+                    #     print(f"    Landmark count: {len(face.get('landmarks', []))}")
+                    #     print(f"    Has centroid: {'centroid' in face}")
+                    #     print(f"    Has bbox: {'bbox' in face}")
+                    #     if 'bbox' in face:
+                    #         print(f"    Bbox: {face['bbox']}")
                     
                     # Check transform cache
                     transform_info = self.drawingmanager.transform_cache.get(idx, {})

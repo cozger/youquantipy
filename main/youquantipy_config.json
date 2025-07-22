@@ -24,6 +24,8 @@
         "use_gpu": true,
         "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
         "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
+        "landmark_trt_path": "D:/Projects/youquantipy/landmark.trt",
+        "blendshape_trt_path": "D:/Projects/youquantipy/blendshape.trt",
         "tile_size": 640,
         "tile_overlap": 0.2,
         "detection_confidence": 0.9,
@@ -32,6 +34,7 @@
         "landmark_worker_count": 4,
         "gpu_settings": {
             "max_batch_size": 4,
+            "landmark_batch_size": 4,
             "enable_fp16": true,
             "tensorrt_workspace_gb": 1
         },
