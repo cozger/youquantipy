@@ -7,7 +7,7 @@
     },
     "camera_settings": {
         "target_fps": 30,
-        "resolution": "720p"
+        "resolution": "1080p"
     },
     "startup_mode": {
         "multi_face": false,
@@ -23,12 +23,13 @@
     "advanced_detection": {
         "use_gpu": true,
         "retinaface_model": "D:/Projects/youquantipy/retinaface.onnx",
+        "retinaface_trt_path": "D:/Projects/youquantipy/retinaface.trt",
         "arcface_model": "D:/Projects/youquantipy/arcface.onnx",
         "landmark_trt_path": "D:/Projects/youquantipy/landmark.trt",
         "blendshape_trt_path": "D:/Projects/youquantipy/blendshape.trt",
         "tile_size": 640,
         "tile_overlap": 0.2,
-        "detection_confidence": 0.9,
+        "detection_confidence": 0.7,
         "nms_threshold": 0.4,
         "max_detection_workers": 4,
         "landmark_worker_count": 4,
@@ -36,7 +37,29 @@
             "max_batch_size": 4,
             "landmark_batch_size": 4,
             "enable_fp16": true,
-            "tensorrt_workspace_gb": 1
+            "tensorrt_workspace_gb": 1,
+            "enable_frame_caching": true,
+            "frame_cache_size_mb": 500,
+            "frame_cache_ttl_seconds": 0.5,
+            "enable_batch_roi": true,
+            "roi_batch_size": 8,
+            "enable_pinned_memory": true,
+            "enable_gpu_ipc": false,
+            "gpu_device_id": 0,
+            "pinned_memory_pools": [
+                {
+                    "size": 1228800,
+                    "count": 4
+                },
+                {
+                    "size": 196608,
+                    "count": 16
+                },
+                {
+                    "size": 6220800,
+                    "count": 2
+                }
+            ]
         },
         "tracker_settings": {
             "max_age": 30,

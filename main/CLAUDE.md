@@ -156,3 +156,4 @@ Recent modifications have introduced GPU-only versions of key components:
 - Limited error recovery in some edge cases
 - Performance varies with participant count and enabled features
 - GPU version requires NVIDIA GPU with CUDA support
+- **GPU IPC Implementation (enable_gpu_ipc: true) currently breaks face detection** - keep this disabled until fixed

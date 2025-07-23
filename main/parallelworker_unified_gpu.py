@@ -430,18 +430,15 @@ def fusion_process_gpu(face_result_queue, pose_result_queue, preview_frame_queue
                 
                 # Send to preview queue with frame
                 if not preview_queue.full() and latest_preview_frame:
-                    # Merge frame data with results for GUI
-                    preview_data = combined_result.copy()
-                    preview_data['frame_bgr'] = latest_preview_frame['frame']
-                    preview_data['original_resolution'] = latest_preview_frame.get('resolution', (1920, 1080))
-                    preview_data['preview_resolution'] = latest_preview_frame.get('preview_resolution', (960, 540))
+                    preview_data = {
+                        'frame': latest_preview_frame['frame'],
+                        'data': combined_result
+                    }
                     preview_queue.put(preview_data)
                 
-                # Send to LSL queue with type field
+                # Send to LSL queue
                 if not lsl_queue.full():
-                    lsl_data = combined_result.copy()
-                    lsl_data['type'] = 'participant_data'
-                    lsl_queue.put(lsl_data)
+                    lsl_queue.put(combined_result)
                 
                 # Send to recording queue if needed
                 if not recording_queue.full() and latest_preview_frame:
@@ -496,9 +493,9 @@ def parallel_participant_worker_gpu(cam_idx, face_model_path, pose_model_path,
     
     # Get model paths
     retinaface_onnx_path = config.get('advanced_detection.retinaface_model', retinaface_model_path)
-    retinaface_trt_path = 'd:/Projects/youquantipy/retinaface.trt'
+    retinaface_trt_path = '/mnt/d/Projects/youquantipy/retinaface.trt'
     landmark_trt_path = config.get('advanced_detection.landmark_trt_path',
-                                  'd:/Projects/youquantipy/landmark.trt')
+                                  '/mnt/d/Projects/youquantipy/landmark.trt')
     
     # Check if TRT engines exist
     if not os.path.exists(retinaface_trt_path) or not os.path.exists(landmark_trt_path):
@@ -520,13 +517,6 @@ def parallel_participant_worker_gpu(cam_idx, face_model_path, pose_model_path,
     
     # Initialize GPU components
     try:
-        # Initialize CUDA context for this process
-        import pycuda.driver as cuda
-        cuda.init()
-        cuda_device = cuda.Device(gpu_device_id)
-        cuda_context = cuda_device.make_context()
-        print(f"[GPU WORKER] Initialized CUDA context for device {gpu_device_id}")
-        
         # Create GPU frame distributor
         gpu_distributor = GPUFrameDistributor(
             camera_index=cam_idx,
@@ -704,14 +694,6 @@ def parallel_participant_worker_gpu(cam_idx, face_model_path, pose_model_path,
             pass
     fusion_proc.terminate()
     fusion_proc.join(timeout=2.0)
-    
-    # Clean up CUDA context
-    try:
-        cuda_context.pop()
-        cuda_context.detach()
-        print(f"[GPU WORKER] CUDA context cleaned up")
-    except:
-        pass
     
     print(f"[GPU WORKER] Camera {cam_idx} stopped")
 

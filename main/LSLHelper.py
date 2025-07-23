@@ -290,7 +290,11 @@ def lsl_helper_process(command_queue: MPQueue,
                 data = data_queue.get_nowait()
                 data_processed = True
                 
-                if data['type'] == 'config_update':
+                # Check if data has 'type' field
+                if 'type' not in data:
+                    # This is regular face/tracking data, not a config update
+                    pass  # Will be processed below
+                elif data['type'] == 'config_update':
                      # Handle mesh configuration updates
                     camera_index = data['camera_index']
                     mesh_enabled = data['mesh_enabled']
@@ -329,31 +333,35 @@ def lsl_helper_process(command_queue: MPQueue,
                                         helper.create_pose_stream(pid, fps)
                 
                 elif data['type'] == 'participant_data':
-                    pid = data['participant_id']
-                    
-                    # Dynamically create stream if it doesn't exist and we're streaming
-                    if streaming_active and pid not in created_streams and len(created_streams) < max_participants:
-                        # Check if mesh is enabled for any camera
-                        include_mesh = any(mesh_enabled_per_camera.values())
-                        print(f"[LSL Process] Dynamically creating stream for {pid} (mesh={'enabled' if include_mesh else 'disabled'})")
-                        helper.create_face_stream(pid, include_mesh=include_mesh)
-                        created_streams.add(pid)
-                    
-                    # Push to LSL if stream exists
-                    if pid in helper.streams:
-                        helper.push_face_data(
-                            pid,
-                            data['blend_scores'],
-                            data.get('mesh_data'),
-                        )
-                        
-                        # Store for correlation
-                        participant_scores[pid] = np.array(data['blend_scores'])
-                        
-                        # Count data for performance monitoring
-                        if pid not in data_counts:
-                            data_counts[pid] = 0
-                        data_counts[pid] += 1
+                    # Handle face data from the new GPU pipeline
+                    if 'faces' in data:
+                        # Process each face in the data
+                        for face in data['faces']:
+                            pid = face.get('participant_id', f"Camera{data.get('camera_index', 0)}_P{face.get('track_id', 0)}")
+                            
+                            # Dynamically create stream if it doesn't exist and we're streaming
+                            if streaming_active and pid not in created_streams and len(created_streams) < max_participants:
+                                # Check if mesh is enabled for any camera
+                                include_mesh = any(mesh_enabled_per_camera.values())
+                                print(f"[LSL Process] Dynamically creating stream for {pid} (mesh={'enabled' if include_mesh else 'disabled'})")
+                                helper.create_face_stream(pid, include_mesh=include_mesh)
+                                created_streams.add(pid)
+                            
+                            # Push to LSL if stream exists
+                            if pid in helper.streams and 'blend_scores' in face:
+                                helper.push_face_data(
+                                    pid,
+                                    face['blend_scores'],
+                                    face.get('mesh_data'),
+                                )
+                                
+                                # Store for correlation
+                                participant_scores[pid] = np.array(face['blend_scores'])
+                                
+                                # Count data for performance monitoring
+                                if pid not in data_counts:
+                                    data_counts[pid] = 0
+                                data_counts[pid] += 1
                     
                     # Calculate correlation if we have 2+ participants
                     if correlator_stream_active and len(participant_scores) >= 2:

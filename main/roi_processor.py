@@ -1,18 +1,29 @@
 import numpy as np
 import cv2
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
-import cupy as cp
+import logging
+
 try:
     import cupy as cp
     HAS_CUPY = True
 except ImportError:
     print("WARNING: CuPy not installed, GPU cropping will fall back to CPU")
     HAS_CUPY = False
+
+# Import GPU frame cache
+from gpu_frame_cache import get_gpu_frame_cache
+
+# Import GPU memory manager for IPC
+from gpu_memory_manager import (
+    GPUMemoryHandle, GPUMemoryClient, create_gpu_memory_client
+)
+
+logger = logging.getLogger(__name__)
 
 try:
     # For NVIDIA GPU acceleration with OpenCV
@@ -64,7 +75,9 @@ class ROIProcessor:
                  min_quality_score: float = 0.5,
                  max_workers: int = 1,  # GPU processing is typically single-threaded
                  batch_size: int = 8,
-                 use_gpu: bool = True):
+                 use_gpu: bool = True,
+                 enable_gpu_ipc: bool = False,
+                 gpu_device_id: int = 0):
         """
         Initialize GPU ROI processor.
         
@@ -75,6 +88,8 @@ class ROIProcessor:
             max_workers: Number of parallel workers (usually 1 for GPU)
             batch_size: Batch size for GPU processing
             use_gpu: Whether to use GPU acceleration
+            enable_gpu_ipc: Enable GPU memory sharing via IPC
+            gpu_device_id: GPU device ID for memory operations
         """
         self.target_size = target_size
         self.padding_ratio = padding_ratio
@@ -82,6 +97,8 @@ class ROIProcessor:
         self.max_workers = max_workers
         self.batch_size = batch_size
         self.use_gpu = use_gpu and (HAS_CUPY or HAS_OPENCV_CUDA)
+        self.enable_gpu_ipc = enable_gpu_ipc and self.use_gpu and HAS_CUPY
+        self.gpu_device_id = gpu_device_id
         
         # Processing queues
         self.input_queue = queue.Queue(maxsize=100)
@@ -99,6 +116,16 @@ class ROIProcessor:
             # Set memory pool for efficient allocation
             mempool = cp.get_default_memory_pool()
             mempool.set_limit(size=2 * 1024**3)  # 2GB limit
+            
+        # GPU memory client for IPC
+        self.gpu_memory_client = None
+        if self.enable_gpu_ipc:
+            self.gpu_memory_client = create_gpu_memory_client(gpu_device_id)
+            if self.gpu_memory_client:
+                logger.info("GPU IPC client initialized for ROI processor")
+            else:
+                logger.warning("Failed to create GPU IPC client, disabling GPU IPC")
+                self.enable_gpu_ipc = False
             
         # Pre-allocate GPU arrays for batch processing
         if self.use_gpu:
@@ -147,23 +174,131 @@ class ROIProcessor:
             mempool = cp.get_default_memory_pool()
             mempool.free_all_blocks()
             
+        # Print cache statistics
+        if self.use_gpu and HAS_CUPY:
+            cache = get_gpu_frame_cache()
+            cache_stats = cache.get_stats()
+            print(f"[ROI Processor] GPU Frame Cache Stats: "
+                  f"hits={cache_stats['hits']}, misses={cache_stats['misses']}, "
+                  f"hit_rate={cache_stats['hit_rate']:.2%}, size_mb={cache_stats['size_mb']:.1f}")
+            
         print("[ROI Processor] Stopped")
         print(f"[ROI Processor] Performance - GPU time: {self.gpu_time_accum:.2f}s, "
               f"CPU time: {self.cpu_time_accum:.2f}s, ROIs: {self.roi_count}")
     
-    def extract_roi(self, frame: np.ndarray, bbox: List[float], track_id: int, 
-                    timestamp: float) -> Optional[Dict]:
+    def extract_roi(self, frame: Union[np.ndarray, GPUMemoryHandle], bbox: List[float], track_id: int, 
+                    timestamp: float, frame_id: Optional[int] = None) -> Optional[Dict]:
         """
         Synchronous ROI extraction with GPU acceleration.
+        
+        Args:
+            frame: Input frame (numpy array or GPU memory handle)
+            bbox: Bounding box [x1, y1, x2, y2]
+            track_id: Track identifier
+            timestamp: Frame timestamp
+            frame_id: Optional frame ID for GPU cache lookup
         """
-        if self.use_gpu:
-            return self._extract_roi_gpu_sync(frame, bbox, track_id, timestamp)
+        # Check if frame is a GPU memory handle
+        if isinstance(frame, GPUMemoryHandle) and self.enable_gpu_ipc:
+            return self._extract_roi_from_gpu_handle(frame, bbox, track_id, timestamp)
+        elif self.use_gpu:
+            return self._extract_roi_gpu_sync(frame, bbox, track_id, timestamp, frame_id)
         else:
             # Fallback to CPU version
             return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
     
+    def _extract_roi_from_gpu_handle(self, gpu_handle: GPUMemoryHandle, bbox: List[float], 
+                                    track_id: int, timestamp: float) -> Optional[Dict]:
+        """Extract ROI directly from GPU memory handle without CPU transfer."""
+        if not self.gpu_memory_client:
+            return None
+            
+        try:
+            start_time = time.time()
+            
+            # Get GPU array from IPC handle
+            gpu_frame = self.gpu_memory_client.get_array(gpu_handle)
+            if gpu_frame is None:
+                logger.error("Failed to get GPU array from handle")
+                return None
+                
+            # Process directly on GPU
+            frame_shape = gpu_frame.shape
+            
+            # Validate bbox
+            if not isinstance(bbox, (list, np.ndarray)) or len(bbox) != 4:
+                logger.error(f"Invalid bbox: {bbox}")
+                return None
+            
+            bbox = np.array(bbox, dtype=np.float32)
+            if np.any(np.isnan(bbox)) or np.any(np.isinf(bbox)):
+                logger.error(f"Invalid bbox values: {bbox}")
+                return None
+            
+            # Calculate padded bbox
+            padded_bbox = self._calculate_padded_bbox(bbox, frame_shape)
+            
+            # Check quality
+            quality_score = self._calculate_quality_score(bbox, frame_shape)
+            if quality_score < self.min_quality_score:
+                return None
+            
+            # Extract and resize ROI on GPU
+            x1, y1, x2, y2 = padded_bbox.astype(int)
+            
+            # Clip coordinates
+            x1 = max(0, min(x1, frame_shape[1] - 1))
+            y1 = max(0, min(y1, frame_shape[0] - 1))
+            x2 = max(x1 + 1, min(x2, frame_shape[1]))
+            y2 = max(y1 + 1, min(y2, frame_shape[0]))
+            
+            if x2 <= x1 or y2 <= y1:
+                return None
+                
+            # Extract ROI on GPU
+            roi_gpu = gpu_frame[y1:y2, x1:x2]
+            
+            if roi_gpu.size == 0:
+                return None
+            
+            # Resize and normalize on GPU
+            roi_resized_gpu = self._resize_gpu_cupy(roi_gpu, self.target_size)
+            
+            # Keep on GPU for downstream processes that support it
+            # For now, transfer to CPU for compatibility
+            roi_resized = cp.asnumpy(roi_resized_gpu)
+            roi_resized = np.ascontiguousarray(roi_resized, dtype=np.float32)
+            
+            # Calculate transformation matrix
+            transform_matrix = self._calculate_transform_matrix(padded_bbox, self.target_size)
+            
+            # Track performance
+            self.gpu_time_accum += time.time() - start_time
+            self.roi_count += 1
+            
+            if self.roi_count % 50 == 0:
+                logger.info(f"GPU IPC ROI extraction: {self.roi_count} ROIs processed")
+            
+            return {
+                'roi': roi_resized,
+                'transform': {
+                    'scale': transform_matrix[0, 0],
+                    'offset_x': transform_matrix[0, 2],
+                    'offset_y': transform_matrix[1, 2],
+                    'frame_width': frame_shape[1],
+                    'frame_height': frame_shape[0]
+                },
+                'quality_score': quality_score,
+                'original_bbox': np.array(bbox),
+                'padded_bbox': padded_bbox
+            }
+            
+        except Exception as e:
+            logger.error(f"GPU handle extraction error: {e}")
+            return None
+    
     def _extract_roi_gpu_sync(self, frame: np.ndarray, bbox: List[float], 
-                            track_id: int, timestamp: float) -> Optional[Dict]:
+                            track_id: int, timestamp: float, frame_id: Optional[int] = None) -> Optional[Dict]:
         """GPU-accelerated ROI extraction (synchronous)."""
         start_time = time.time()
         
@@ -187,20 +322,34 @@ class ROIProcessor:
                 except:
                     pass
                 
-                # FIX: Keep frame on GPU if it's already there
-                if isinstance(frame, cp.ndarray):
-                    gpu_frame = frame
-                    print(f"[ROI Processor] Frame already on GPU")
-                else:
-                    # Ensure frame is contiguous before GPU transfer
-                    if not frame.flags['C_CONTIGUOUS']:
-                        frame = np.ascontiguousarray(frame)
-                    
-                    try:
-                        gpu_frame = cp.asarray(frame)
-                    except Exception as e:
-                        print(f"[ROI Processor] Failed to transfer frame to GPU: {e}")
-                        return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
+                # Check GPU frame cache first
+                gpu_frame = None
+                cache = get_gpu_frame_cache()
+                
+                if frame_id is not None:
+                    gpu_frame = cache.get(frame_id)
+                    if gpu_frame is not None and self.roi_count % 100 == 0:
+                        print(f"[ROI Processor] Cache hit for frame {frame_id}")
+                
+                # If not in cache or frame is already on GPU
+                if gpu_frame is None:
+                    if isinstance(frame, cp.ndarray):
+                        gpu_frame = frame
+                        if self.roi_count % 100 == 0:
+                            print(f"[ROI Processor] Frame already on GPU")
+                    else:
+                        # Ensure frame is contiguous before GPU transfer
+                        if not frame.flags['C_CONTIGUOUS']:
+                            frame = np.ascontiguousarray(frame)
+                        
+                        try:
+                            gpu_frame = cp.asarray(frame)
+                            # Add to cache for future use
+                            if frame_id is not None:
+                                cache.put(frame_id, gpu_frame)
+                        except Exception as e:
+                            print(f"[ROI Processor] Failed to transfer frame to GPU: {e}")
+                            return self._extract_roi_cpu(frame, bbox, track_id, timestamp)
                 
                 # Calculate padded bbox
                 frame_shape = frame.shape if isinstance(frame, np.ndarray) else (gpu_frame.shape[0], gpu_frame.shape[1], gpu_frame.shape[2])
@@ -235,8 +384,10 @@ class ROIProcessor:
                     # FIX: Resize and normalize on GPU in one step
                     roi_resized_gpu = self._resize_gpu_cupy(roi_gpu, self.target_size)
                     
-                    # FIX: Transfer to CPU only because MediaPipe/TensorRT needs CPU input
-                    # The data is already normalized to [-1, 1] range
+                    # Transfer to CPU for compatibility with current pipeline architecture
+                    # Note: TensorRT can work with GPU memory directly, but current multi-process
+                    # architecture uses CPU arrays for inter-process communication via queues
+                    # TODO: Future optimization - implement GPU memory sharing between processes
                     roi_resized = cp.asnumpy(roi_resized_gpu)
                     
                     # Debug output

@@ -179,6 +179,12 @@ class CanvasDrawingManager:
             self.transform_cache[canvas_idx]['video_bounds'] = (x_offset, y_offset, scaled_w, scaled_h)
             if original_resolution:
                 self.transform_cache[canvas_idx]['frame_size'] = original_resolution
+                # Debug print occasionally
+                if not hasattr(self, '_res_debug_count'):
+                    self._res_debug_count = 0
+                self._res_debug_count += 1
+                if self._res_debug_count % 100 == 0:
+                    print(f"[CanvasDrawing] Using original_resolution: {original_resolution}, frame shape: {frame_bgr.shape[:2]}")
             else:
                 print(f"[CanvasDrawing] WARNING: No original_resolution provided, using frame size {frame_w}x{frame_h}")
                 self.transform_cache[canvas_idx]['frame_size'] = (frame_w, frame_h)
@@ -224,20 +230,38 @@ class CanvasDrawingManager:
             return None
 
     def convert_bbox_to_canvas(self, bbox, transform_data):
-        frame_w, frame_h = transform_data['frame_size']   # Original frame resolution
+        # The bbox coordinates are in the original capture resolution (frame_size)
+        frame_w, frame_h = transform_data['frame_size']
         x_offset, y_offset, video_w, video_h = transform_data['video_bounds']
 
-        # Compute scaling from original frame to GUI canvas explicitly
+        # Debug print to understand the issue
+        if not hasattr(self, '_bbox_transform_debug_count'):
+            self._bbox_transform_debug_count = 0
+        self._bbox_transform_debug_count += 1
+        
+        if self._bbox_transform_debug_count % 100 == 0:
+            print(f"\n[CanvasDrawing] Bbox Transform Debug:")
+            print(f"  Frame size (capture res): {frame_w}x{frame_h}")
+            print(f"  Display size: {transform_data.get('display_size')}")
+            print(f"  Video bounds: offset=({x_offset},{y_offset}), size={video_w}x{video_h}")
+            print(f"  Canvas size: {transform_data.get('canvas_size', 'unknown')}")
+            print(f"  Original bbox: {bbox}")
+            print(f"  Max bbox values vs frame size: x_max={max(bbox[0],bbox[2]):.1f}/{frame_w}, y_max={max(bbox[1],bbox[3]):.1f}/{frame_h}")
+
+        # Compute scaling from original capture resolution to video display area
         scale_x = video_w / frame_w
         scale_y = video_h / frame_h
 
-        # Correctly transform bbox coordinates from capture to GUI
+        # Transform bbox coordinates to canvas
         x1 = bbox[0] * scale_x + x_offset
         y1 = bbox[1] * scale_y + y_offset
         x2 = bbox[2] * scale_x + x_offset
         y2 = bbox[3] * scale_y + y_offset
 
-        #print(f"Original bbox: {bbox}, Transformed bbox: {(x1, y1, x2, y2)}")
+        if self._bbox_transform_debug_count % 100 == 0:
+            print(f"  Scale: x={scale_x:.3f}, y={scale_y:.3f}")
+            print(f"  Transformed bbox: ({x1:.1f},{y1:.1f})-({x2:.1f},{y2:.1f})")
+            print(f"  Should be within video area: x=[{x_offset},{x_offset+video_w}], y=[{y_offset},{y_offset+video_h}]")
 
         return [x1, y1, x2, y2]
 
@@ -387,11 +411,37 @@ class CanvasDrawingManager:
             # Draw face landmarks if available (rest of the method remains the same)
             lm_xyz = face.get('landmarks', [])
             if lm_xyz and len(lm_xyz) > 0:
-                # Transform landmarks from normalized to canvas coordinates
+                # Get correct scaling factors
+                frame_w, frame_h = transform_data['frame_size']   # Original frame resolution
+                scale_x = video_w / frame_w
+                scale_y = video_h / frame_h
+                
+                # Transform landmarks from frame coordinates to canvas coordinates
                 canvas_landmarks = []
+                
+                # Debug: Check coordinate range of first few landmarks
+                if self.debug_mode and fid == 1 and not hasattr(self, '_landmark_coord_debug'):
+                    self._landmark_coord_debug = 0
+                self._landmark_coord_debug = getattr(self, '_landmark_coord_debug', 0) + 1
+                
+                if self._landmark_coord_debug % 100 == 0 and lm_xyz:
+                    print(f"\n[CanvasDrawing] Landmark Coordinate Debug:")
+                    print(f"  Frame size: {frame_w}x{frame_h}")
+                    print(f"  First 3 landmarks (raw): {lm_xyz[:3] if len(lm_xyz) >= 3 else lm_xyz}")
+                    max_x = max(pt[0] for pt in lm_xyz)
+                    max_y = max(pt[1] for pt in lm_xyz)
+                    min_x = min(pt[0] for pt in lm_xyz)
+                    min_y = min(pt[1] for pt in lm_xyz)
+                    print(f"  Landmark range: x=[{min_x:.2f}, {max_x:.2f}], y=[{min_y:.2f}, {max_y:.2f}]")
+                    print(f"  Appears to be: {'NORMALIZED' if max_x <= 1.0 and max_y <= 1.0 else 'PIXEL COORDS'}")
+                
                 for x, y, z in lm_xyz:
-                    canvas_x = x * video_w + x_offset
-                    canvas_y = y * video_h + y_offset
+                    # Landmarks should be in frame pixel coordinates after transformation
+                    frame_x = x
+                    frame_y = y
+                    # Scale to canvas coordinates
+                    canvas_x = frame_x * scale_x + x_offset
+                    canvas_y = frame_y * scale_y + y_offset
                     canvas_landmarks.append((canvas_x, canvas_y, z))
                 
                 # Initialize face lines if needed
@@ -422,10 +472,10 @@ class CanvasDrawingManager:
             
             # Draw centroid if available (for debugging)
             if 'centroid' in face and self.debug_mode:
-                cx_norm, cy_norm = face['centroid']
-                # Centroid is already normalized (0-1), so just scale to display
-                cx = int(cx_norm * video_w + x_offset)
-                cy = int(cy_norm * video_h + y_offset)
+                cx_frame, cy_frame = face['centroid']
+                # Centroid is in frame coordinates, transform to canvas
+                cx = int(cx_frame * scale_x + x_offset)
+                cy = int(cy_frame * scale_y + y_offset)
                 
                 centroid_key = f'centroid_{fid}'
                 if centroid_key in cache.get('face_bboxes', {}):
@@ -787,7 +837,17 @@ def draw_overlays_combined(frame_bgr: np.ndarray, faces: List[Dict] = None,
             fid = face.get("id", idx+1)
             
             if landmarks:
-                face_landmarks_px = [(int(x * w), int(y * h), z) for x, y, z in landmarks]
+                # Check if landmarks are normalized or pixel coordinates
+                if landmarks and len(landmarks) > 0:
+                    # Check first landmark to determine coordinate system
+                    if landmarks[0][0] <= 1.0 and landmarks[0][1] <= 1.0:
+                        # Normalized coordinates
+                        face_landmarks_px = [(int(x * w), int(y * h), z) for x, y, z in landmarks]
+                    else:
+                        # Already in pixel coordinates
+                        face_landmarks_px = [(int(x), int(y), z) for x, y, z in landmarks]
+                else:
+                    face_landmarks_px = []
                 
                 if face_mesh:
                     for conn in mp.solutions.face_mesh.FACEMESH_TESSELATION:
@@ -823,7 +883,14 @@ def draw_overlays_combined(frame_bgr: np.ndarray, faces: List[Dict] = None,
             
             if label_text:
                 if "centroid" in face and face["centroid"]:
-                    cx, cy = int(face["centroid"][0] * w), int(face["centroid"][1] * h) - 50
+                    # Check if centroid is normalized or pixel coordinates
+                    cx_val, cy_val = face["centroid"]
+                    if cx_val <= 1.0 and cy_val <= 1.0:
+                        # Normalized coordinates
+                        cx, cy = int(cx_val * w), int(cy_val * h) - 50
+                    else:
+                        # Already in pixel coordinates
+                        cx, cy = int(cx_val), int(cy_val) - 50
                 elif landmarks and len(face_landmarks_px) > 10:
                     cx, cy = face_landmarks_px[10][0], face_landmarks_px[10][1] - 50
                 elif 'bbox' in face:

@@ -1,15 +1,28 @@
 """
 Frame Distributor Module for YouQuantiPy
 Handles camera capture and frame distribution to multiple consumers.
+Supports GPU memory sharing via CUDA IPC when available.
 """
 
 import cv2
 import time
 import threading
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from multiprocessing import Queue as MPQueue
 import queue
+import logging
+from gpu_memory_manager import (
+    GPUMemoryPool, GPUMemoryHandle, GPUFrameQueue, 
+    create_gpu_memory_manager, CUDA_AVAILABLE
+)
+
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+
+logger = logging.getLogger(__name__)
 
 class FrameDistributor:
     """
@@ -17,7 +30,8 @@ class FrameDistributor:
     Handles different resolution requirements and format conversions.
     """
     
-    def __init__(self, camera_index: int, resolution: Tuple[int, int], fps: int):
+    def __init__(self, camera_index: int, resolution: Tuple[int, int], fps: int, 
+                 enable_gpu_sharing: bool = False, gpu_device_id: int = 0):
         """
         Initialize frame distributor.
         
@@ -25,6 +39,8 @@ class FrameDistributor:
             camera_index: Camera device index
             resolution: Target resolution (width, height)
             fps: Target frame rate
+            enable_gpu_sharing: Enable GPU memory sharing via CUDA IPC
+            gpu_device_id: GPU device ID for memory allocation
         """
         self.camera_index = camera_index
         self.resolution = resolution
@@ -37,6 +53,21 @@ class FrameDistributor:
         self.last_fps_time = time.time()
         self.actual_fps = 0
         
+        # GPU memory sharing
+        self.enable_gpu_sharing = enable_gpu_sharing and CUDA_AVAILABLE
+        self.gpu_device_id = gpu_device_id
+        self.gpu_memory_pool = None
+        
+        if self.enable_gpu_sharing:
+            self.gpu_memory_pool = create_gpu_memory_manager(
+                pool_size=100, device_id=gpu_device_id
+            )
+            if self.gpu_memory_pool:
+                logger.info(f"GPU memory sharing enabled for camera {camera_index}")
+            else:
+                logger.warning("Failed to enable GPU memory sharing, falling back to CPU")
+                self.enable_gpu_sharing = False
+        
         # Error tracking
         self.consecutive_failures = 0
         self.max_failures = 30
@@ -46,7 +77,8 @@ class FrameDistributor:
             'frames_captured': 0,
             'frames_distributed': 0,
             'queue_drops': 0,
-            'capture_failures': 0
+            'capture_failures': 0,
+            'gpu_frames_shared': 0
         }
     
     def initialize_camera(self):
@@ -107,11 +139,19 @@ class FrameDistributor:
         Args:
             subscriber_info: Dictionary containing:
                 - 'name': Subscriber identifier
-                - 'queue': MPQueue object
+                - 'queue': MPQueue or GPUFrameQueue object
                 - 'full_res': Whether to send full resolution
                 - 'include_bgr': Whether to include BGR format
                 - 'downsample_to': Optional (width, height) for downsampling
+                - 'gpu_enabled': Whether subscriber can handle GPU memory
         """
+        # Check if subscriber supports GPU memory
+        if subscriber_info.get('gpu_enabled', False) and self.enable_gpu_sharing:
+            subscriber_info['use_gpu'] = True
+            logger.info(f"[FrameDistributor] GPU-enabled subscriber: {subscriber_info['name']}")
+        else:
+            subscriber_info['use_gpu'] = False
+            
         self.subscribers.append(subscriber_info)
         print(f"[FrameDistributor] Added subscriber: {subscriber_info['name']}")
     
@@ -159,7 +199,8 @@ class FrameDistributor:
         """Main loop that captures and distributes frames"""
         frame_interval = 1.0 / self.fps
         last_frame_time = time.time()
-        
+        debug_frame_count = 0
+    
         # Detection frame size
         detection_size = (640, 640)
         
@@ -185,6 +226,14 @@ class FrameDistributor:
                     
                     time.sleep(0.1)
                     continue
+                if ret:
+                    debug_frame_count += 1
+                    
+                    # Debug GPU frame creation
+                    if self.enable_gpu_sharing and self.gpu_memory_pool:
+                        if debug_frame_count % 30 == 0:
+                            print(f"[FrameDistributor] Frame {debug_frame_count}: Creating GPU handles")
+                    
                 
                 # Reset failure counter on successful capture
                 self.consecutive_failures = 0
@@ -225,50 +274,115 @@ class FrameDistributor:
                 detection_offset_x = x_offset
                 detection_offset_y = y_offset
                 
+                # Prepare GPU frames if enabled
+                gpu_handles = {}
+                if self.enable_gpu_sharing and self.gpu_memory_pool:
+                    try:
+                        # Create unique frame ID for GPU memory
+                        gpu_frame_id = f"cam{self.camera_index}_frame{self.frame_count}"
+                        
+                        # Write full resolution RGB to GPU
+                        rgb_handle = self.gpu_memory_pool.write(
+                            f"{gpu_frame_id}_rgb", frame_rgb
+                        )
+                        if rgb_handle:
+                            gpu_handles['rgb'] = rgb_handle
+                        
+                        # Write detection frame to GPU
+                        detection_handle = self.gpu_memory_pool.write(
+                            f"{gpu_frame_id}_detection", rgb_detection
+                        )
+                        if detection_handle:
+                            gpu_handles['rgb_detection'] = detection_handle
+                            
+                        if gpu_handles:
+                            self.stats['gpu_frames_shared'] += 1
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to write GPU memory: {e}")
+                        gpu_handles = {}
+                
                 # Distribute to subscribers
                 for sub in self.subscribers:
                     if not sub['queue'].full():
-                        # Build frame data based on subscriber needs
-                        frame_data = {
-                            'frame_id': self.frame_count,
-                            'timestamp': timestamp,
-                            'camera_index': self.camera_index,
-                            'resolution': (w, h)
-                        }
-                        
-                        if sub.get('full_res', True):
-                            # Full resolution RGB
-                            frame_data['rgb'] = frame_rgb
+                        # Check if this is a GPU-enabled subscriber
+                        if sub.get('use_gpu', False) and gpu_handles:
+                            # Send GPU memory handles
+                            gpu_frame_data = {
+                                'frame_id': self.frame_count,
+                                'timestamp': timestamp,
+                                'camera_index': self.camera_index,
+                                'resolution': (w, h),
+                                'gpu_handles': gpu_handles,
+                                'detection_scale_x': detection_scale_x,
+                                'detection_scale_y': detection_scale_y,
+                                'detection_offset_x': detection_offset_x,
+                                'detection_offset_y': detection_offset_y,
+                                'is_gpu_frame': True
+                            }
                             
-                            # Add detection frame info
-                            frame_data['rgb_detection'] = rgb_detection
-                            frame_data['detection_scale_x'] = detection_scale_x
-                            frame_data['detection_scale_y'] = detection_scale_y
-                            frame_data['detection_offset_x'] = detection_offset_x
-                            frame_data['detection_offset_y'] = detection_offset_y
+                            try:
+                                sub['queue'].put_nowait(gpu_frame_data)
+                                self.stats['frames_distributed'] += 1
+                            except queue.Full:
+                                self.stats['queue_drops'] += 1
                         else:
-                            # Downsampled version
-                            downsample_to = sub.get('downsample_to', (640, 480))
-                            if downsample_to != (w, h):
-                                frame_data['rgb'] = cv2.resize(
-                                    frame_rgb, downsample_to, 
-                                    interpolation=cv2.INTER_LINEAR
-                                )
-                            else:
+                            # Standard CPU frame distribution
+                            frame_data = {
+                                'frame_id': self.frame_count,
+                                'timestamp': timestamp,
+                                'camera_index': self.camera_index,
+                                'resolution': (w, h),
+                                'is_gpu_frame': False
+                            }
+                            
+                            if sub.get('full_res', True):
+                                # Full resolution RGB
                                 frame_data['rgb'] = frame_rgb
-                        
-                        # Include BGR if requested
-                        if sub.get('include_bgr', False):
-                            frame_data['bgr'] = frame_bgr
-                        
-                        # Send to queue
-                        try:
-                            sub['queue'].put_nowait(frame_data)
-                            self.stats['frames_distributed'] += 1
-                        except queue.Full:
-                            self.stats['queue_drops'] += 1
+                                
+                                # Add detection frame info
+                                frame_data['rgb_detection'] = rgb_detection
+                                frame_data['detection_scale_x'] = detection_scale_x
+                                frame_data['detection_scale_y'] = detection_scale_y
+                                frame_data['detection_offset_x'] = detection_offset_x
+                                frame_data['detection_offset_y'] = detection_offset_y
+                            else:
+                                # Downsampled version
+                                downsample_to = sub.get('downsample_to', (640, 480))
+                                if downsample_to != (w, h):
+                                    frame_data['rgb'] = cv2.resize(
+                                        frame_rgb, downsample_to, 
+                                        interpolation=cv2.INTER_LINEAR
+                                    )
+                                else:
+                                    frame_data['rgb'] = frame_rgb
+                            
+                            # Include BGR if requested
+                            if sub.get('include_bgr', False):
+                                frame_data['bgr'] = frame_bgr
+                            
+                            # Send to queue
+                            try:
+                                sub['queue'].put_nowait(frame_data)
+                                self.stats['frames_distributed'] += 1
+                            except queue.Full:
+                                self.stats['queue_drops'] += 1
+
+                        if sub.get('use_gpu', False) and gpu_handles:
+                            if debug_frame_count % 30 == 0:
+                                print(f"[FrameDistributor] Sending GPU frame to {sub['name']}")
+                        else:
+                            if debug_frame_count % 30 == 0:
+                                print(f"[FrameDistributor] Sending CPU frame to {sub['name']}")
+
                     else:
                         self.stats['queue_drops'] += 1
+                
+                # Clean up old GPU frames (keep last 50 frames)
+                if self.enable_gpu_sharing and self.gpu_memory_pool and self.frame_count > 50:
+                    old_frame_id = f"cam{self.camera_index}_frame{self.frame_count - 50}"
+                    self.gpu_memory_pool.free(f"{old_frame_id}_rgb")
+                    self.gpu_memory_pool.free(f"{old_frame_id}_detection")
                 
                 last_frame_time = current_time
                 

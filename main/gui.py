@@ -977,6 +977,10 @@ class YouQuantiPyGUI(tk.Tk):
             retinaface_model = self.config.get('advanced_detection.retinaface_model')
             arcface_model = self.config.get('advanced_detection.arcface_model')
             
+            # Get GPU IPC settings
+            enable_gpu_ipc = self.config.get('advanced_detection.gpu_settings.enable_gpu_ipc', False)
+            gpu_device_id = self.config.get('advanced_detection.gpu_settings.gpu_device_id', 0)
+            
             proc = Process(
                 target=parallel_participant_worker,
                 args=(cam_idx, self.MODEL_PATH, self.POSE_MODEL_PATH,
@@ -989,7 +993,9 @@ class YouQuantiPyGUI(tk.Tk):
                     resolution,
                     retinaface_model,  # retinaface_model_path
                     arcface_model,     # arcface_model_path
-                    True),             # enable_recognition=True
+                    True,              # enable_recognition=True
+                    enable_gpu_ipc,    # enable_gpu_ipc
+                    gpu_device_id),    # gpu_device_id
                 daemon=False
             )
             proc.start()
