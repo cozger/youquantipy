@@ -10,7 +10,8 @@
       "Bash(rg:*)",
       "Bash(python:*)",
       "Bash(cat:*)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(awk:*)"
     ],
     "deny": []
   }

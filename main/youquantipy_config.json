@@ -38,6 +38,7 @@
             "landmark_batch_size": 4,
             "enable_fp16": true,
             "tensorrt_workspace_gb": 1,
+            "trt_workspace_size": 268435456,
             "enable_frame_caching": true,
             "frame_cache_size_mb": 500,
             "frame_cache_ttl_seconds": 0.5,

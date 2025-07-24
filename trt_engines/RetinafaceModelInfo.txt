@@ -1,0 +1,4 @@
+Retinaface trained on WiderFace dataset at resolution 640x640, when Retinaface use mobilenet0.25 as backbone net.
+
+Model				easy	medium	hard
+RetinaFace_onnx_model (608x640)	88.55%	82.17%	52.21%
